@@ -1,0 +1,11 @@
+* text=auto
+
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.cmake text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+CMakeLists.txt text eol=lf

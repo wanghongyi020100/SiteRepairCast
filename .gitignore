@@ -1,0 +1,44 @@
+# build output
+/build-*/
+/artifacts/
+/build/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.o
+*.a
+*.so
+*.d
+
+# generated binaries
+site_proxy_sender
+receiver_agent
+sender
+receiver
+
+# generated transfer/test files
+input.bin
+input-*.bin
+receiver-*.bin
+receiver-*.bin.part
+received-*/
+proxy-cache/
+*.part
+*.state
+*.state.tmp
+
+# logs
+*.log
+
+# editor/system files
+.vscode/
+.idea/
+.cache/
+.clangd/
+tempCodeRunnerFile.*
+*.swp
+.DS_Store
+Thumbs.db
