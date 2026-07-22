@@ -42,18 +42,13 @@ public:
         }
     }
 
-
     FileDescriptor(const FileDescriptor&)=delete;
     FileDescriptor&operator=(const FileDescriptor&)=delete;
-
-
 
     FileDescriptor(FileDescriptor&&other)noexcept : fd_(other.fd_)
     {
         other.fd_=-1;
     }
-
-
 
     FileDescriptor&operator=(FileDescriptor&&other)noexcept {
 
@@ -243,7 +238,6 @@ struct ReceiverConnection
     std::uint64_t receiver_id{};
     FileDescriptor control_fd;
     sockaddr_in udp_destination{};
-
 
     bool meta_ready{false};
 
@@ -735,7 +729,6 @@ void send_repair_round(
     std::uint64_t multicast_packets=0;
     std::uint64_t unicast_packets=0;
 
-
     for(std::uint32_t block_id=0;
          block_id<total_blocks;
 ++block_id)
@@ -766,8 +759,6 @@ void send_repair_round(
             payload_size,
             srcast::crc32(buffer.data(),payload_size));
 
-
-
         if(targets.size()>=kMulticastRepairThreshold)
         {
             send_udp_packet(udp_fd,multicast_destination,packet);
@@ -793,7 +784,6 @@ void send_repair_round(
     std::cout<<"repair round="<<round_id
 <<" multicast_packets="<<multicast_packets
 <<" unicast_packets="<<unicast_packets<<'\n';
-
 
     send_end_round(
         udp_fd,
@@ -991,7 +981,6 @@ void wait_for_meta_ready(
         poll_fds.reserve(receivers.size());
         indexes.reserve(receivers.size());
 
-
         for(std::size_t index=0;
              index<receivers.size();
 ++index)
@@ -1060,8 +1049,6 @@ void wait_for_meta_ready(
             auto&receiver=
                 receivers[indexes[poll_index]];
 
-
-
             const auto frame=
                 receive_control_frame(
                     receiver.control_fd.get());
@@ -1111,7 +1098,6 @@ void send_file(
     std::size_t file_index,
     std::size_t file_count)
     {
-
 
     for(auto&receiver : receivers)
     {
@@ -1166,16 +1152,12 @@ void send_file(
     const auto file_meta_frame=
         srcast::encode_file_meta(file_meta);
 
-
-
     for(auto&receiver : receivers)
     {
         send_control_frame(
             receiver.control_fd.get(),
             file_meta_frame);
     }
-
-
 
     wait_for_meta_ready(
         receivers,
@@ -1240,7 +1222,6 @@ void send_file(
         total_blocks,
         digest);
 
-
     for(int repair_round=1;
          repair_round<=max_repair_rounds &&
 !all_receivers_completed(receivers);
@@ -1287,7 +1268,6 @@ void send_file(
 <<completed_count<<'/'<<receivers.size()
 <<" after max repair rounds\n";
     }
-
 
     wait_for_receivers_ready(receivers,transfer_id);
 }
@@ -1383,15 +1363,12 @@ int main(int argc,char** argv) try {
             "destination must be an IPv4 multicast address");
     }
 
-
-
     auto listener=create_control_listener(control_port);
     auto receivers=accept_receivers(
         listener.get(),
         static_cast<std::size_t>(receiver_count));
 
     const std::size_t file_count=static_cast<std::size_t>(argc-9);
-
 
     for(int argument_index=9;
          argument_index<argc;
@@ -1418,7 +1395,6 @@ int main(int argc,char** argv) try {
                 std::chrono::milliseconds(gap_ms));
         }
     }
-
 
     const auto session_end=srcast::encode_session_end();
     for(auto&receiver : receivers)
