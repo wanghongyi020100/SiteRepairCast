@@ -1048,7 +1048,7 @@ int main(int argc,char** argv) try {
     std::uint32_t draining_round=0;
     SteadyClock::time_point hard_deadline{};
 
-    std::vector<epoll_event>ready_events(receivers.size());
+    std::vector<epoll_event>ready_events(3);
 
     while(!stop_requested)
     {
