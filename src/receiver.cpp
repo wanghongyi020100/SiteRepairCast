@@ -15,6 +15,7 @@
 #include<cerrno>
 #include<chrono>
 #include<cstdint>
+#include<cstdlib>
 #include<cstring>
 #include<filesystem>
 #include<iostream>
@@ -22,6 +23,7 @@
 #include<optional>
 #include<stdexcept>
 #include<string>
+#include<unordered_set>
 #include<vector>
 
 namespace
@@ -386,10 +388,55 @@ struct TransferState
     std::uint32_t received_count{0};
     std::uint64_t duplicate_count{0};
     std::uint64_t rejected_count{0};
+    std::uint64_t intentional_drop_count{0};
     std::optional<std::uint32_t>last_end_round;
     std::optional<std::uint32_t>last_reported_round;
     bool awaiting_complete_ack{false};
+    std::unordered_set<std::uint32_t>intentionally_dropped_blocks;
 };
+
+std::unordered_set<std::uint32_t>parse_initial_drop_blocks()
+{
+    std::unordered_set<std::uint32_t>blocks;
+    const char*raw=std::getenv("SRCAST_DROP_INITIAL_BLOCKS");
+    if(raw==nullptr||*raw=='\0')
+    {
+        return blocks;
+    }
+
+    const char*cursor=raw;
+    while(*cursor!='\0')
+    {
+        char*end=nullptr;
+        errno=0;
+        const auto value=std::strtoul(cursor,&end,10);
+        if(cursor==end||errno==ERANGE||
+            value>std::numeric_limits<std::uint32_t>::max())
+            {
+            throw std::runtime_error(
+                "invalid SRCAST_DROP_INITIAL_BLOCKS value");
+        }
+        blocks.insert(static_cast<std::uint32_t>(value));
+
+        if(*end=='\0')
+        {
+            break;
+        }
+        if(*end!=',')
+        {
+            throw std::runtime_error(
+                "SRCAST_DROP_INITIAL_BLOCKS must be a comma-separated list");
+        }
+        cursor=end+1;
+        if(*cursor=='\0')
+        {
+            throw std::runtime_error(
+                "SRCAST_DROP_INITIAL_BLOCKS has a trailing comma");
+        }
+    }
+
+    return blocks;
+}
 
 bool initialize_transfer(
     TransferState&state,
@@ -426,9 +473,11 @@ bool initialize_transfer(
     state.received_count=0;
     state.duplicate_count=0;
     state.rejected_count=0;
+    state.intentional_drop_count=0;
     state.last_end_round.reset();
     state.last_reported_round.reset();
     state.awaiting_complete_ack=false;
+    state.intentionally_dropped_blocks.clear();
 
     const int fd=::open(
         state.temporary_path.c_str(),
@@ -517,6 +566,7 @@ bool finalize_transfer(
 
     std::cout<<"COMPLETED output="<<state.output_path
 <<" duplicates="<<state.duplicate_count
+<<" intentional_drops="<<state.intentional_drop_count
 <<" rejected="<<state.rejected_count<<'\n';
     return true;
 }
@@ -609,6 +659,33 @@ void finish_drain_and_report(
     state.last_reported_round=round_id;
     state.awaiting_complete_ack=true;
     std::cout<<"completion confirmation sent; waiting for COMPLETE_ACK\n";
+}
+
+bool should_drop_initial_block_for_test(
+    TransferState&state,
+    const std::unordered_set<std::uint32_t>&configured_blocks,
+    std::uint32_t block_id)
+    {
+
+    if(configured_blocks.empty()||state.last_end_round)
+    {
+        return false;
+    }
+    if(configured_blocks.find(block_id)==configured_blocks.end())
+    {
+        return false;
+    }
+
+    const auto inserted=state.intentionally_dropped_blocks.insert(block_id);
+    if(!inserted.second)
+    {
+        return false;
+    }
+
+++state.intentional_drop_count;
+    std::cout<<"test hook dropped initial DATA block_id="
+<<block_id<<'\n';
+    return true;
 }
 
 void begin_drain_for_round(
@@ -1042,6 +1119,16 @@ int main(int argc,char** argv) try {
     std::optional<TransferState>transfer;
     std::array<std::uint8_t,srcast::kMaxPacketSize>packet_buffer{};
     ControlStreamReader control_reader;
+    const auto initial_drop_blocks=parse_initial_drop_blocks();
+    if(!initial_drop_blocks.empty())
+    {
+        std::cout<<"test hook enabled: SRCAST_DROP_INITIAL_BLOCKS";
+        for(const auto block_id : initial_drop_blocks)
+        {
+            std::cout<<' '<<block_id;
+        }
+        std::cout<<'\n';
+    }
 
     bool draining=false;
     bool stop_requested=false;
@@ -1197,6 +1284,13 @@ int main(int argc,char** argv) try {
                                 data.payload_size)!=data.crc32)
                                 {
 ++state.rejected_count;
+                            continue;
+                        }
+                        if(should_drop_initial_block_for_test(
+                                state,
+                                initial_drop_blocks,
+                                data.block_id))
+                                {
                             continue;
                         }
                         if(state.received[data.block_id]!=0)

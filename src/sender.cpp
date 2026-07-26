@@ -6,7 +6,7 @@
 #include<arpa/inet.h>
 #include<fcntl.h>
 #include<netinet/in.h>
-#include<poll.h>
+#include<sys/epoll.h>
 #include<sys/socket.h>
 #include<sys/stat.h>
 #include<unistd.h>
@@ -315,7 +315,8 @@ std::vector<ReceiverConnection>accept_receivers(
     std::unordered_set<std::uint64_t>receiver_ids;
 
     std::cout<<"waiting for "<<expected_receivers
-<<" receiver control connections\n";
+<<" receiver control connections\n"
+<<std::flush;
 
     while(receivers.size()<expected_receivers)
     {
@@ -538,6 +539,87 @@ void handle_control_frame(
 <<receiver.receiver_id<<'\n';
 }
 
+template<typename Predicate>
+std::vector<std::size_t>wait_for_receiver_events(
+    const std::vector<ReceiverConnection>&receivers,
+    Predicate should_watch,
+    int timeout_ms,
+    const std::string&operation)
+    {
+
+    FileDescriptor epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
+    if(epoll_fd.get()<0)
+    {
+        system_error("epoll_create1 "+operation);
+    }
+
+    std::size_t watched_count=0;
+    for(std::size_t index=0; index<receivers.size();++index)
+    {
+        if(!should_watch(receivers[index]))
+        {
+            continue;
+        }
+
+        epoll_event event{};
+        event.events=EPOLLIN;
+        event.data.u64=static_cast<std::uint64_t>(index);
+        if(::epoll_ctl(
+                epoll_fd.get(),
+                EPOLL_CTL_ADD,
+                receivers[index].control_fd.get(),
+                &event)!=0)
+                {
+            system_error("epoll_ctl add "+operation);
+        }
+++watched_count;
+    }
+
+    if(watched_count==0)
+    {
+        return {};
+    }
+
+    std::vector<epoll_event>events(watched_count);
+    int ready=0;
+    for(;;)
+    {
+        ready=::epoll_wait(
+            epoll_fd.get(),
+            events.data(),
+            static_cast<int>(events.size()),
+            timeout_ms);
+        if(ready>=0)
+        {
+            break;
+        }
+        if(errno==EINTR)
+        {
+            continue;
+        }
+        system_error("epoll_wait "+operation);
+    }
+
+    std::vector<std::size_t>indexes;
+    indexes.reserve(static_cast<std::size_t>(ready));
+    for(int event_index=0; event_index<ready;++event_index)
+    {
+        const auto&event=events[static_cast<std::size_t>(event_index)];
+        if((event.events & (EPOLLERR|EPOLLHUP))!=0U)
+        {
+            throw std::runtime_error(
+                "receiver control connection failed during "+operation);
+        }
+        if((event.events & EPOLLIN)==0U)
+        {
+            continue;
+        }
+        indexes.push_back(static_cast<std::size_t>(event.data.u64));
+    }
+
+    return indexes;
+}
+
 void collect_round_reports(
     std::vector<ReceiverConnection>&receivers,
     std::uint64_t transfer_id,
@@ -563,58 +645,22 @@ void collect_round_reports(
         const auto timeout_ms=static_cast<int>(
             std::max<std::int64_t>(1,remaining.count()));
 
-        std::vector<pollfd>poll_fds;
-        std::vector<std::size_t>indexes;
-        poll_fds.reserve(receivers.size());
-        indexes.reserve(receivers.size());
-
-        for(std::size_t index=0; index<receivers.size();++index)
-        {
-            if(receivers[index].completed)
+        const auto ready_indexes=wait_for_receiver_events(
+            receivers,
+            [](const ReceiverConnection&receiver)
             {
-                continue;
-            }
-            poll_fds.push_back({receivers[index].control_fd.get(),POLLIN,0});
-            indexes.push_back(index);
-        }
-
-        if(poll_fds.empty())
+                return!receiver.completed;
+            },
+            timeout_ms,
+            "receiver reports");
+        if(ready_indexes.empty())
         {
             break;
         }
 
-        const int ready=::poll(
-            poll_fds.data(),
-            static_cast<nfds_t>(poll_fds.size()),
-            timeout_ms);
-        if(ready<0)
+        for(const auto receiver_index : ready_indexes)
         {
-            if(errno==EINTR)
-            {
-                continue;
-            }
-            system_error("poll receiver reports");
-        }
-        if(ready==0)
-        {
-            break;
-        }
-
-        for(std::size_t poll_index=0;
-             poll_index<poll_fds.size();
-++poll_index)
-             {
-            const auto events=poll_fds[poll_index].revents;
-            if((events & (POLLERR|POLLHUP|POLLNVAL))!=0)
-            {
-                throw std::runtime_error("receiver control connection failed");
-            }
-            if((events & POLLIN)==0)
-            {
-                continue;
-            }
-
-            auto&receiver=receivers[indexes[poll_index]];
+            auto&receiver=receivers[receiver_index];
             const auto frame=receive_control_frame(receiver.control_fd.get());
             handle_control_frame(
                 receiver,
@@ -855,50 +901,22 @@ void wait_for_receivers_ready(
         const auto timeout_ms=static_cast<int>(
             std::max<std::int64_t>(1,remaining.count()));
 
-        std::vector<pollfd>poll_fds;
-        std::vector<std::size_t>indexes;
-        for(std::size_t index=0; index<receivers.size();++index)
-        {
-            if(!receivers[index].ready_for_next_transfer)
+        const auto ready_indexes=wait_for_receiver_events(
+            receivers,
+            [](const ReceiverConnection&receiver)
             {
-                poll_fds.push_back(
-                    {receivers[index].control_fd.get(),POLLIN,0});
-                indexes.push_back(index);
-            }
-        }
-
-        const int ready=::poll(
-            poll_fds.data(),
-            static_cast<nfds_t>(poll_fds.size()),
-            timeout_ms);
-        if(ready<0)
-        {
-            if(errno==EINTR)
-            {
-                continue;
-            }
-            system_error("poll receiver ready acknowledgements");
-        }
-        if(ready==0)
+                return!receiver.ready_for_next_transfer;
+            },
+            timeout_ms,
+            "receiver ready acknowledgements");
+        if(ready_indexes.empty())
         {
             continue;
         }
 
-        for(std::size_t poll_index=0;
-             poll_index<poll_fds.size();
-++poll_index)
-             {
-            const auto events=poll_fds[poll_index].revents;
-            if((events & (POLLERR|POLLHUP|POLLNVAL))!=0)
-            {
-                throw std::runtime_error("receiver control connection failed");
-            }
-            if((events & POLLIN)==0)
-            {
-                continue;
-            }
-
-            auto&receiver=receivers[indexes[poll_index]];
+        for(const auto receiver_index : ready_indexes)
+        {
+            auto&receiver=receivers[receiver_index];
             const auto frame=receive_control_frame(receiver.control_fd.get());
             if(srcast::peek_control_type(frame)!=
                 srcast::ControlType::ReceiverReady)
@@ -985,80 +1003,23 @@ void wait_for_meta_ready(
                     1,
                     remaining.count()));
 
-        std::vector<pollfd>poll_fds;
-        std::vector<std::size_t>indexes;
-
-        poll_fds.reserve(receivers.size());
-        indexes.reserve(receivers.size());
-
-
-        for(std::size_t index=0;
-             index<receivers.size();
-++index)
-             {
-
-            if(receivers[index].meta_ready)
+        const auto ready_indexes=wait_for_receiver_events(
+            receivers,
+            [](const ReceiverConnection&receiver)
             {
-                continue;
-            }
-
-            pollfd item{};
-            item.fd=
-                receivers[index].control_fd.get();
-            item.events=POLLIN;
-
-            poll_fds.push_back(item);
-            indexes.push_back(index);
-        }
-
-        const int ready=::poll(
-            poll_fds.data(),
-            static_cast<nfds_t>(
-                poll_fds.size()),
-            timeout_ms);
-
-        if(ready<0)
-        {
-            if(errno==EINTR)
-            {
-                continue;
-            }
-
-            system_error("poll META_READY");
-        }
-
-        if(ready==0)
+                return!receiver.meta_ready;
+            },
+            timeout_ms,
+            "META_READY");
+        if(ready_indexes.empty())
         {
             continue;
         }
 
-        for(std::size_t poll_index=0;
-             poll_index<poll_fds.size();
-++poll_index)
-             {
-
-            const auto events=
-                poll_fds[poll_index].revents;
-
-            if((events &
-                 (POLLERR|
-                  POLLHUP|
-                  POLLNVAL))!=0)
-                  {
-
-                throw std::runtime_error(
-                    "receiver control connection "
-                    "failed while waiting for "
-                    "META_READY");
-            }
-
-            if((events & POLLIN)==0)
-            {
-                continue;
-            }
-
+        for(const auto receiver_index : ready_indexes)
+        {
             auto&receiver=
-                receivers[indexes[poll_index]];
+                receivers[receiver_index];
 
 
 
