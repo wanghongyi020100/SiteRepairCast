@@ -15,7 +15,7 @@ namespace srcast
 {
 constexpr std::uint32_t kMagic=0x53524331U;
 constexpr std::uint32_t kControlMagic=0x53524343U;
-constexpr std::uint16_t kVersion=3;
+constexpr std::uint16_t kVersion=4;
 constexpr std::size_t kPayloadSize=1200;
 constexpr std::size_t kSha256Size=32;
 constexpr std::uint32_t kSingleSectionId=0;
@@ -349,6 +349,11 @@ enum class ControlType : std::uint16_t
     SessionEnd=9,
     FileMeta=10,
     MetaReady=11,
+    CentralFileMeta=12,
+    CentralData=13,
+    CentralFileEnd=14,
+    CentralStatus=15,
+    CentralSessionEnd=16,
 };
 
 enum class SectionStatusCode : std::uint16_t
@@ -361,6 +366,12 @@ enum class SectionStatusCode : std::uint16_t
 enum class TransferResultCode : std::uint16_t
 {
     Completed=1,
+    Failed=2,
+};
+
+enum class CentralStatusCode : std::uint16_t
+{
+    Cached=1,
     Failed=2,
 };
 
@@ -438,6 +449,41 @@ struct ReceiverReadyMessage
     std::uint64_t previous_transfer_id{};
 };
 
+struct CentralFileMetaMessage
+{
+    std::uint64_t transfer_id{};
+    std::uint64_t file_size{};
+    std::uint32_t block_size{};
+    std::uint32_t total_blocks{};
+    std::array<std::uint8_t,kSha256Size>sha256{};
+};
+
+struct CentralDataMessage
+{
+    std::uint64_t transfer_id{};
+    std::uint32_t section_id{};
+    std::uint32_t block_id{};
+    std::uint64_t offset{};
+    std::uint16_t payload_size{};
+    std::uint32_t crc32{};
+    std::vector<std::uint8_t>payload;
+};
+
+struct CentralFileEndMessage
+{
+    std::uint64_t transfer_id{};
+    std::uint32_t section_id{};
+    std::uint32_t total_blocks{};
+};
+
+struct CentralStatusMessage
+{
+    std::uint64_t transfer_id{};
+    CentralStatusCode status{};
+    std::uint64_t file_size{};
+    std::array<std::uint8_t,kSha256Size>sha256{};
+};
+
 inline void write_control_header(PacketWriter&writer,ControlType type)
 {
     writer.u32(kControlMagic);
@@ -460,7 +506,7 @@ inline ControlType read_control_header(PacketReader&reader)
         throw std::runtime_error("unsupported control protocol version");
     }
     if(raw_type<static_cast<std::uint16_t>(ControlType::Register)||
-        raw_type>static_cast<std::uint16_t>(ControlType::MetaReady))
+        raw_type>static_cast<std::uint16_t>(ControlType::CentralSessionEnd))
         {
         throw std::runtime_error("invalid control message type");
     }
@@ -504,6 +550,18 @@ inline RegisterMessage decode_register(const std::vector<std::uint8_t>&frame)
 inline std::vector<std::uint8_t>encode_file_meta(
     const FileMetaMessage&message)
     {
+
+
+
+
+
+
+
+
+
+
+
+
 
     PacketWriter writer(68);
 
@@ -563,6 +621,8 @@ inline FileMetaMessage decode_file_meta(
 inline std::vector<std::uint8_t>encode_meta_ready(
     const MetaReadyMessage&message)
     {
+
+
 
     PacketWriter writer(24);
 
@@ -884,6 +944,200 @@ inline void decode_session_end(const std::vector<std::uint8_t>&frame)
     if(read_control_header(reader)!=ControlType::SessionEnd)
     {
         throw std::runtime_error("control message is not SESSION_END");
+    }
+}
+
+inline std::vector<std::uint8_t>encode_central_file_meta(
+    const CentralFileMetaMessage&message)
+    {
+
+    PacketWriter writer(64);
+    write_control_header(writer,ControlType::CentralFileMeta);
+    writer.u64(message.transfer_id);
+    writer.u64(message.file_size);
+    writer.u32(message.block_size);
+    writer.u32(message.total_blocks);
+    writer.bytes(message.sha256.data(),message.sha256.size());
+    return writer.data();
+}
+
+inline CentralFileMetaMessage decode_central_file_meta(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()!=64)
+    {
+        throw std::runtime_error("invalid CENTRAL_FILE_META size");
+    }
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::CentralFileMeta)
+    {
+        throw std::runtime_error("control message is not CENTRAL_FILE_META");
+    }
+
+    CentralFileMetaMessage message;
+    message.transfer_id=reader.u64();
+    message.file_size=reader.u64();
+    message.block_size=reader.u32();
+    message.total_blocks=reader.u32();
+    reader.bytes(message.sha256.data(),message.sha256.size());
+    return message;
+}
+
+inline std::vector<std::uint8_t>encode_central_data(
+    const CentralDataMessage&message)
+    {
+
+    if(message.payload.size()>kPayloadSize||
+        message.payload.size()!=message.payload_size)
+        {
+        throw std::runtime_error("invalid CENTRAL_DATA payload size");
+    }
+
+    PacketWriter writer(40+message.payload.size());
+    write_control_header(writer,ControlType::CentralData);
+    writer.u64(message.transfer_id);
+    writer.u32(message.section_id);
+    writer.u32(message.block_id);
+    writer.u64(message.offset);
+    writer.u16(message.payload_size);
+    writer.u16(0);
+    writer.u32(message.crc32);
+    writer.bytes(message.payload.data(),message.payload.size());
+    return writer.data();
+}
+
+inline CentralDataMessage decode_central_data(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()<40)
+    {
+        throw std::runtime_error("CENTRAL_DATA is too short");
+    }
+
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::CentralData)
+    {
+        throw std::runtime_error("control message is not CENTRAL_DATA");
+    }
+
+    CentralDataMessage message;
+    message.transfer_id=reader.u64();
+    message.section_id=reader.u32();
+    message.block_id=reader.u32();
+    message.offset=reader.u64();
+    message.payload_size=reader.u16();
+    static_cast<void>(reader.u16());
+    message.crc32=reader.u32();
+
+    if(message.payload_size>kPayloadSize||
+        message.payload_size!=reader.remaining())
+        {
+        throw std::runtime_error("invalid CENTRAL_DATA payload length");
+    }
+
+    message.payload.resize(message.payload_size);
+    reader.bytes(message.payload.data(),message.payload.size());
+    return message;
+}
+
+inline std::vector<std::uint8_t>encode_central_file_end(
+    const CentralFileEndMessage&message)
+    {
+
+    PacketWriter writer(24);
+    write_control_header(writer,ControlType::CentralFileEnd);
+    writer.u64(message.transfer_id);
+    writer.u32(message.section_id);
+    writer.u32(message.total_blocks);
+    return writer.data();
+}
+
+inline CentralFileEndMessage decode_central_file_end(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()!=24)
+    {
+        throw std::runtime_error("invalid CENTRAL_FILE_END size");
+    }
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::CentralFileEnd)
+    {
+        throw std::runtime_error("control message is not CENTRAL_FILE_END");
+    }
+
+    CentralFileEndMessage message;
+    message.transfer_id=reader.u64();
+    message.section_id=reader.u32();
+    message.total_blocks=reader.u32();
+    return message;
+}
+
+inline std::vector<std::uint8_t>encode_central_status(
+    const CentralStatusMessage&message)
+    {
+
+    PacketWriter writer(60);
+    write_control_header(writer,ControlType::CentralStatus);
+    writer.u64(message.transfer_id);
+    writer.u16(static_cast<std::uint16_t>(message.status));
+    writer.u16(0);
+    writer.u64(message.file_size);
+    writer.bytes(message.sha256.data(),message.sha256.size());
+    return writer.data();
+}
+
+inline CentralStatusMessage decode_central_status(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()!=60)
+    {
+        throw std::runtime_error("invalid CENTRAL_STATUS size");
+    }
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::CentralStatus)
+    {
+        throw std::runtime_error("control message is not CENTRAL_STATUS");
+    }
+
+    CentralStatusMessage message;
+    message.transfer_id=reader.u64();
+    const auto raw_status=reader.u16();
+    static_cast<void>(reader.u16());
+    if(raw_status<static_cast<std::uint16_t>(CentralStatusCode::Cached)||
+        raw_status>static_cast<std::uint16_t>(CentralStatusCode::Failed))
+        {
+        throw std::runtime_error("invalid CENTRAL_STATUS code");
+    }
+    message.status=static_cast<CentralStatusCode>(raw_status);
+    message.file_size=reader.u64();
+    reader.bytes(message.sha256.data(),message.sha256.size());
+    return message;
+}
+
+inline std::vector<std::uint8_t>encode_central_session_end()
+{
+    PacketWriter writer(8);
+    write_control_header(writer,ControlType::CentralSessionEnd);
+    return writer.data();
+}
+
+inline void decode_central_session_end(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()!=8)
+    {
+        throw std::runtime_error("invalid CENTRAL_SESSION_END size");
+    }
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::CentralSessionEnd)
+    {
+        throw std::runtime_error(
+            "control message is not CENTRAL_SESSION_END");
     }
 }
 

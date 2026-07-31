@@ -17,6 +17,7 @@
 #include<chrono>
 #include<cstdint>
 #include<cstring>
+#include<filesystem>
 #include<iostream>
 #include<limits>
 #include<optional>
@@ -70,6 +71,15 @@ public:
     }
 
     int get()const { return fd_; }
+
+    void reset(int fd)
+    {
+        if(fd_>=0)
+        {
+            ::close(fd_);
+        }
+        fd_=fd;
+    }
 
 private:
     int fd_;
@@ -238,6 +248,46 @@ void read_block(
     payload_size=static_cast<std::uint16_t>(wanted);
 }
 
+void write_all_at(
+    int fd,
+    const std::uint8_t*data,
+    std::size_t size,
+    std::uint64_t offset)
+    {
+
+    std::size_t written=0;
+    while(written<size)
+    {
+        const auto count=::pwrite(
+            fd,
+            data+written,
+            size-written,
+            static_cast<off_t>(offset+written));
+        if(count<0)
+        {
+            if(errno==EINTR)
+            {
+                continue;
+            }
+            system_error("pwrite central cache");
+        }
+        if(count==0)
+        {
+            throw std::runtime_error("pwrite central cache made no progress");
+        }
+        written+=static_cast<std::size_t>(count);
+    }
+}
+
+struct CachedCentralFile
+{
+    std::string path;
+    std::uint64_t transfer_id{};
+    std::uint64_t file_size{};
+    std::uint32_t total_blocks{};
+    std::array<std::uint8_t,srcast::kSha256Size>sha256{};
+};
+
 struct ReceiverConnection
 {
     std::uint64_t receiver_id{};
@@ -262,6 +312,10 @@ void usage(const char*program)
 <<"<multicast_ip><udp_port><interface_ip><control_port>"
 <<"<receiver_count><pace_us><gap_ms><max_repair_rounds>"
 <<"<file1>[file2 ...]\n"
+<<"   or: "<<program
+<<"<multicast_ip><udp_port><interface_ip><control_port>"
+<<"<receiver_count><pace_us><gap_ms><max_repair_rounds>"
+<<"--central-listen<central_port><cache_dir>\n"
 <<"Example: "<<program
 <<" 239.255.42.99 5000 127.0.0.1 6000 3 200 1500 3"
 <<" input-a.bin input-b.bin\n";
@@ -958,6 +1012,220 @@ void notify_failed_receivers(
     }
 }
 
+void send_central_status(
+    int central_fd,
+    std::uint64_t transfer_id,
+    srcast::CentralStatusCode status,
+    std::uint64_t file_size,
+    const std::array<std::uint8_t,srcast::kSha256Size>&sha256)
+    {
+
+    send_control_frame(
+        central_fd,
+        srcast::encode_central_status(
+            {transfer_id,status,file_size,sha256}));
+}
+
+std::optional<CachedCentralFile>receive_cached_file_from_central(
+    int central_fd,
+    const std::string&cache_directory)
+    {
+
+    const auto first_frame=receive_control_frame(central_fd);
+    const auto first_type=srcast::peek_control_type(first_frame);
+    if(first_type==srcast::ControlType::CentralSessionEnd)
+    {
+        srcast::decode_central_session_end(first_frame);
+        return std::nullopt;
+    }
+    if(first_type!=srcast::ControlType::CentralFileMeta)
+    {
+        throw std::runtime_error(
+            "expected CENTRAL_FILE_META from central sender");
+    }
+
+    const auto meta=srcast::decode_central_file_meta(first_frame);
+    if(meta.block_size!=srcast::kPayloadSize)
+    {
+        throw std::runtime_error("unsupported central block size");
+    }
+
+    const auto expected_blocks64=
+        (meta.file_size+meta.block_size-1)/meta.block_size;
+    if(expected_blocks64>std::numeric_limits<std::uint32_t>::max()||
+        static_cast<std::uint32_t>(expected_blocks64)!=meta.total_blocks)
+        {
+        throw std::runtime_error("inconsistent central file block count");
+    }
+
+    std::error_code directory_error;
+    std::filesystem::create_directories(cache_directory,directory_error);
+    if(directory_error)
+    {
+        throw std::runtime_error(
+            "create central cache directory failed: "+
+            directory_error.message());
+    }
+
+    const auto final_path=
+        (std::filesystem::path(cache_directory)/
+         ("central-transfer-"+std::to_string(meta.transfer_id)+".bin"))
+            .string();
+    const auto temporary_path=final_path+".part";
+
+    FileDescriptor output(::open(
+        temporary_path.c_str(),
+        O_CREAT|O_TRUNC|O_RDWR|O_CLOEXEC,
+        0644));
+    if(output.get()<0)
+    {
+        system_error("open central cache temporary file");
+    }
+    if(::ftruncate(output.get(),static_cast<off_t>(meta.file_size))!=0)
+    {
+        system_error("ftruncate central cache");
+    }
+
+    std::vector<std::uint8_t>received(meta.total_blocks,0);
+    std::uint32_t received_count=0;
+    std::uint64_t duplicate_count=0;
+    std::uint64_t rejected_count=0;
+
+    std::cout<<"central transfer started transfer_id="
+<<meta.transfer_id
+<<" size="<<meta.file_size
+<<" blocks="<<meta.total_blocks<<'\n';
+
+    for(;;)
+    {
+        const auto frame=receive_control_frame(central_fd);
+        const auto type=srcast::peek_control_type(frame);
+
+        if(type==srcast::ControlType::CentralData)
+        {
+            const auto data=srcast::decode_central_data(frame);
+            if(data.transfer_id!=meta.transfer_id||
+                data.section_id!=kSectionId||
+                data.block_id>=meta.total_blocks)
+                {
+++rejected_count;
+                continue;
+            }
+
+            const auto expected_offset=
+                static_cast<std::uint64_t>(data.block_id) *
+                meta.block_size;
+            const auto expected_size=
+                static_cast<std::uint16_t>(
+                    std::min<std::uint64_t>(
+                        meta.block_size,
+                        meta.file_size-expected_offset));
+
+            if(data.offset!=expected_offset||
+                data.payload_size!=expected_size||
+                data.offset+data.payload_size>meta.file_size||
+                srcast::crc32(data.payload.data(),data.payload.size())!=
+                    data.crc32)
+                    {
+++rejected_count;
+                continue;
+            }
+            if(received[data.block_id]!=0)
+            {
+++duplicate_count;
+                continue;
+            }
+
+            write_all_at(
+                output.get(),
+                data.payload.data(),
+                data.payload.size(),
+                data.offset);
+            received[data.block_id]=1;
+++received_count;
+
+            if(received_count%1000U==0U||
+                received_count==meta.total_blocks)
+                {
+                std::cout<<"central cached "
+<<received_count<<'/'
+<<meta.total_blocks<<" blocks\n";
+            }
+            continue;
+        }
+
+        if(type!=srcast::ControlType::CentralFileEnd)
+        {
+            throw std::runtime_error(
+                "unexpected central control message during file transfer");
+        }
+
+        const auto end=srcast::decode_central_file_end(frame);
+        if(end.transfer_id!=meta.transfer_id||
+            end.section_id!=kSectionId||
+            end.total_blocks!=meta.total_blocks||
+            received_count!=meta.total_blocks||
+            rejected_count!=0)
+            {
+            send_central_status(
+                central_fd,
+                meta.transfer_id,
+                srcast::CentralStatusCode::Failed,
+                meta.file_size,
+                std::array<std::uint8_t,srcast::kSha256Size>{});
+            throw std::runtime_error(
+                "central transfer did not complete cleanly");
+        }
+
+        if(::fsync(output.get())!=0)
+        {
+            system_error("fsync central cache");
+        }
+        output.reset(-1);
+
+        const auto actual_digest=srcast::sha256_file(temporary_path);
+        if(actual_digest!=meta.sha256)
+        {
+            send_central_status(
+                central_fd,
+                meta.transfer_id,
+                srcast::CentralStatusCode::Failed,
+                meta.file_size,
+                actual_digest);
+            throw std::runtime_error("central cached file SHA-256 mismatch");
+        }
+
+        std::error_code rename_error;
+        std::filesystem::rename(
+            temporary_path,
+            final_path,
+            rename_error);
+        if(rename_error)
+        {
+            throw std::runtime_error(
+                "commit central cache failed: "+rename_error.message());
+        }
+
+        send_central_status(
+            central_fd,
+            meta.transfer_id,
+            srcast::CentralStatusCode::Cached,
+            meta.file_size,
+            actual_digest);
+
+        std::cout<<"central transfer cached path="<<final_path
+<<" duplicates="<<duplicate_count
+<<" rejected="<<rejected_count<<'\n';
+
+        return CachedCentralFile{
+            final_path,
+            meta.transfer_id,
+            meta.file_size,
+            meta.total_blocks,
+            actual_digest};
+    }
+}
+
 void wait_for_meta_ready(
     std::vector<ReceiverConnection>&receivers,
     std::uint64_t transfer_id)
@@ -1269,13 +1537,23 @@ int main(int argc,char** argv) try {
     const int pace_us=std::stoi(argv[6]);
     const int gap_ms=std::stoi(argv[7]);
     const int max_repair_rounds=std::stoi(argv[8]);
+    const bool central_mode=
+        argc==12 && std::string(argv[9])=="--central-listen";
+    const int central_port=central_mode ? std::stoi(argv[10]):0;
+    const std::string cache_directory=central_mode ? argv[11] : "";
 
     if(udp_port<1||udp_port>65535||
         control_port<1||control_port>65535||
         receiver_count<1||
-        pace_us<0||gap_ms<0||max_repair_rounds<0)
+        pace_us<0||gap_ms<0||max_repair_rounds<0||
+        (central_mode && (central_port<1||central_port>65535)))
         {
         throw std::runtime_error("invalid command-line argument");
+    }
+    if(!central_mode && std::string(argv[9])=="--central-listen")
+    {
+        usage(argv[0]);
+        return 2;
     }
 
     FileDescriptor udp_fd(::socket(
@@ -1346,36 +1624,95 @@ int main(int argc,char** argv) try {
 
 
     auto listener=create_control_listener(control_port);
+    std::optional<FileDescriptor>central_listener;
+    if(central_mode)
+    {
+        central_listener.emplace(create_control_listener(central_port));
+        std::cout<<"waiting for central sender on port "
+<<central_port<<'\n'
+<<std::flush;
+    }
+
     auto receivers=accept_receivers(
         listener.get(),
         static_cast<std::size_t>(receiver_count));
 
-    const std::size_t file_count=static_cast<std::size_t>(argc-9);
-
-
-    for(int argument_index=9;
-         argument_index<argc;
-++argument_index)
-         {
-        const std::size_t file_index=
-            static_cast<std::size_t>(argument_index-8);
-
-        send_file(
-            udp_fd.get(),
-            multicast_destination,
-            receivers,
-            argv[argument_index],
-            pace_us,
-            max_repair_rounds,
-            file_index,
-            file_count);
-
-        if(argument_index+1<argc && gap_ms>0)
+    if(central_mode)
+    {
+        sockaddr_in central_peer{};
+        socklen_t central_peer_size=sizeof(central_peer);
+        int accepted=-1;
+        for(;;)
         {
-            std::cout<<"waiting "<<gap_ms
+            accepted=::accept4(
+                central_listener->get(),
+                reinterpret_cast<sockaddr*>(&central_peer),
+                &central_peer_size,
+                SOCK_CLOEXEC);
+            if(accepted>=0)
+            {
+                break;
+            }
+            if(errno==EINTR)
+            {
+                continue;
+            }
+            system_error("accept central sender");
+        }
+
+        FileDescriptor central_fd(accepted);
+        std::size_t file_index=0;
+        for(;;)
+        {
+            auto cached=receive_cached_file_from_central(
+                central_fd.get(),
+                cache_directory);
+            if(!cached)
+            {
+                break;
+            }
+
+++file_index;
+            send_file(
+                udp_fd.get(),
+                multicast_destination,
+                receivers,
+                cached->path,
+                pace_us,
+                max_repair_rounds,
+                file_index,
+                file_index);
+        }
+    }
+    else
+    {
+        const std::size_t file_count=static_cast<std::size_t>(argc-9);
+
+
+        for(int argument_index=9;
+             argument_index<argc;
+++argument_index)
+             {
+            const std::size_t file_index=
+                static_cast<std::size_t>(argument_index-8);
+
+            send_file(
+                udp_fd.get(),
+                multicast_destination,
+                receivers,
+                argv[argument_index],
+                pace_us,
+                max_repair_rounds,
+                file_index,
+                file_count);
+
+            if(argument_index+1<argc && gap_ms>0)
+            {
+                std::cout<<"waiting "<<gap_ms
 <<"ms before the next file\n";
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(gap_ms));
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(gap_ms));
+            }
         }
     }
 

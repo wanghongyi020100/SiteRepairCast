@@ -764,7 +764,6 @@ void handle_control_message(
         const auto message=
             srcast::decode_file_meta(frame);
 
-
         if(message.section_id!=kSectionId)
         {
             throw std::runtime_error(
@@ -777,8 +776,6 @@ void handle_control_message(
             throw std::runtime_error(
                 "unsupported FILE_META block size");
         }
-
-
 
         const auto expected_blocks64=
             (message.file_size+
@@ -797,8 +794,6 @@ void handle_control_message(
                 "inconsistent FILE_META block count");
         }
 
-
-
         if(transfer)
         {
             if(transfer->meta.common.transfer_id==
@@ -815,14 +810,10 @@ void handle_control_message(
                 return;
             }
 
-
             throw std::runtime_error(
                 "FILE_META received while another "
                 "transfer is active");
         }
-
-
-
 
         srcast::MetaPacket meta;
 
@@ -838,8 +829,6 @@ void handle_control_message(
 
         transfer.emplace();
 
-
-
         if(!initialize_transfer(
                 *transfer,
                 meta,
@@ -852,7 +841,6 @@ void handle_control_message(
                 "failed to initialize FILE_META");
         }
 
-
         disarm_timer(drain_timer_fd);
 
         static_cast<void>(
@@ -860,8 +848,6 @@ void handle_control_message(
                 drain_timer_fd));
 
         draining=false;
-
-
 
         send_control_frame(
             control_fd,
@@ -876,8 +862,6 @@ void handle_control_message(
 
         return;
     }
-
-
 
     if(type==srcast::ControlType::SectionEnd)
     {
@@ -1232,10 +1216,6 @@ int main(int argc,char** argv) try {
 
                     if(common.type==srcast::PacketType::Meta)
                     {
-
-
-
-
 
                         continue;
                     }

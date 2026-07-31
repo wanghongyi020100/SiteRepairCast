@@ -19,3 +19,7 @@ target_compile_options(site_proxy_sender PRIVATE -Wall -Wextra -Wpedantic -Wconv
 add_executable(receiver_agent src/receiver.cpp)
 target_link_libraries(receiver_agent PRIVATE srcast_common)
 target_compile_options(receiver_agent PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(central_sender src/central_sender.cpp)
+target_link_libraries(central_sender PRIVATE srcast_common)
+target_compile_options(central_sender PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
