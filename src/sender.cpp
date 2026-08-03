@@ -440,10 +440,10 @@ std::vector<ReceiverConnection>accept_receivers(
 
 bool validate_missing_bitmap(
     const srcast::SectionStatusMessage&status,
-    std::uint32_t total_blocks)
+    std::uint32_t section_blocks)
     {
 
-    const auto expected_size=srcast::bitmap_size_for_blocks(total_blocks);
+    const auto expected_size=srcast::bitmap_size_for_blocks(section_blocks);
     if(status.status==srcast::SectionStatusCode::Missing)
     {
         if(status.missing_bitmap.size()!=expected_size||
@@ -453,17 +453,19 @@ bool validate_missing_bitmap(
         }
 
         std::uint32_t counted=0;
-        for(std::uint32_t block_id=0; block_id<total_blocks;++block_id)
-        {
-            if(srcast::bitmap_test(status.missing_bitmap,block_id))
+        for(std::uint32_t local_block=0;
+             local_block<section_blocks;
+++local_block)
+             {
+            if(srcast::bitmap_test(status.missing_bitmap,local_block))
             {
 ++counted;
             }
         }
 
-        if(total_blocks%8U!=0U &&!status.missing_bitmap.empty())
+        if(section_blocks%8U!=0U &&!status.missing_bitmap.empty())
         {
-            const auto used_bits=static_cast<unsigned int>(total_blocks%8U);
+            const auto used_bits=static_cast<unsigned int>(section_blocks%8U);
             const auto unused_mask=static_cast<std::uint8_t>(
                 0xffU<<used_bits);
             if((status.missing_bitmap.back() & unused_mask)!=0U)
@@ -489,7 +491,8 @@ void reset_round_state(std::vector<ReceiverConnection>&receivers)
 }
 
 bool round_responses_complete(
-    const std::vector<ReceiverConnection>&receivers)
+    const std::vector<ReceiverConnection>&receivers,
+    bool final_section)
     {
 
     for(const auto&receiver : receivers)
@@ -502,7 +505,8 @@ bool round_responses_complete(
         {
             return false;
         }
-        if(receiver.status &&
+        if(final_section &&
+            receiver.status &&
             receiver.status->status==srcast::SectionStatusCode::Complete &&
 !receiver.complete_received)
             {
@@ -516,9 +520,10 @@ void handle_control_frame(
     ReceiverConnection&receiver,
     const std::vector<std::uint8_t>&frame,
     std::uint64_t transfer_id,
+    std::uint32_t section_id,
     std::uint32_t round_id,
     std::uint64_t file_size,
-    std::uint32_t total_blocks,
+    std::uint32_t section_blocks,
     const std::array<std::uint8_t,srcast::kSha256Size>&digest)
     {
 
@@ -529,14 +534,14 @@ void handle_control_frame(
         const auto status=srcast::decode_section_status(frame);
         if(status.receiver_id!=receiver.receiver_id||
             status.transfer_id!=transfer_id||
-            status.section_id!=kSectionId||
+            status.section_id!=section_id||
             status.round_id!=round_id)
             {
             std::cerr<<"ignore stale or mismatched SECTION_STATUS from receiver_id="
 <<receiver.receiver_id<<'\n';
             return;
         }
-        if(!validate_missing_bitmap(status,total_blocks))
+        if(!validate_missing_bitmap(status,section_blocks))
         {
             std::cerr<<"reject invalid missing bitmap from receiver_id="
 <<receiver.receiver_id<<'\n';
@@ -546,7 +551,8 @@ void handle_control_frame(
         receiver.status=status;
         receiver.status_received=true;
 
-        std::cout<<"round="<<round_id
+        std::cout<<"section="<<section_id
+<<" round="<<round_id
 <<" receiver_id="<<receiver.receiver_id
 <<" status=";
         if(status.status==srcast::SectionStatusCode::Complete)
@@ -677,6 +683,7 @@ std::vector<std::size_t>wait_for_receiver_events(
 void collect_round_reports(
     std::vector<ReceiverConnection>&receivers,
     std::uint64_t transfer_id,
+    std::uint32_t section_id,
     std::uint32_t round_id,
     std::uint64_t file_size,
     std::uint32_t total_blocks,
@@ -685,8 +692,13 @@ void collect_round_reports(
 
     reset_round_state(receivers);
     const auto deadline=SteadyClock::now()+kReportTimeout;
+    const auto final_section=
+        section_id+1U==srcast::section_count_for_blocks(total_blocks);
+    const auto section_blocks=srcast::section_block_count(
+        total_blocks,
+        section_id);
 
-    while(!round_responses_complete(receivers))
+    while(!round_responses_complete(receivers,final_section))
     {
         const auto now=SteadyClock::now();
         if(now>=deadline)
@@ -720,9 +732,10 @@ void collect_round_reports(
                 receiver,
                 frame,
                 transfer_id,
+                section_id,
                 round_id,
                 file_size,
-                total_blocks,
+                section_blocks,
                 digest);
         }
     }
@@ -731,7 +744,8 @@ void collect_round_reports(
     {
         if(!receiver.completed &&!receiver.status_received)
         {
-            std::cout<<"round="<<round_id
+            std::cout<<"section="<<section_id
+<<" round="<<round_id
 <<" receiver_id="<<receiver.receiver_id
 <<" status=NO_REPORT\n";
         }
@@ -740,10 +754,14 @@ void collect_round_reports(
 
 std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
     const std::vector<ReceiverConnection>&receivers,
-    std::uint32_t total_blocks)
+    std::uint32_t total_blocks,
+    std::uint32_t section_id)
     {
 
-    std::vector<std::vector<std::size_t>>missing_by_block(total_blocks);
+    const auto section_blocks=srcast::section_block_count(
+        total_blocks,
+        section_id);
+    std::vector<std::vector<std::size_t>>missing_by_block(section_blocks);
 
     for(std::size_t receiver_index=0;
          receiver_index<receivers.size();
@@ -756,15 +774,15 @@ std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
             continue;
         }
 
-        for(std::uint32_t block_id=0;
-             block_id<total_blocks;
-++block_id)
+        for(std::uint32_t local_block=0;
+             local_block<section_blocks;
+++local_block)
              {
             if(srcast::bitmap_test(
                     receiver.status->missing_bitmap,
-                    block_id))
+                    local_block))
                     {
-                missing_by_block[block_id].push_back(receiver_index);
+                missing_by_block[local_block].push_back(receiver_index);
             }
         }
     }
@@ -777,13 +795,14 @@ void send_end_round(
     const sockaddr_in&multicast_destination,
     std::vector<ReceiverConnection>&receivers,
     std::uint64_t transfer_id,
+    std::uint32_t section_id,
     std::uint32_t round_id,
     std::uint32_t total_blocks)
     {
 
     const auto end_packet=srcast::encode_end(
         transfer_id,
-        kSectionId,
+        section_id,
         round_id,
         total_blocks);
 
@@ -794,7 +813,7 @@ void send_end_round(
     }
 
     const auto section_end=srcast::encode_section_end(
-        {transfer_id,kSectionId,round_id,total_blocks});
+        {transfer_id,section_id,round_id,total_blocks});
     for(auto&receiver : receivers)
     {
         if(!receiver.completed)
@@ -813,12 +832,13 @@ void send_repair_round(
     std::uint64_t file_size,
     std::uint64_t transfer_id,
     std::uint32_t total_blocks,
+    std::uint32_t section_id,
     std::uint32_t round_id,
     int pace_us)
     {
 
     const auto repair_begin=srcast::encode_repair_begin(
-        {transfer_id,kSectionId,round_id});
+        {transfer_id,section_id,round_id});
     for(auto&receiver : receivers)
     {
         if(!receiver.completed)
@@ -829,22 +849,28 @@ void send_repair_round(
 
     const auto missing_by_block=aggregate_missing_blocks(
         receivers,
-        total_blocks);
+        total_blocks,
+        section_id);
 
     std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
     std::uint64_t multicast_packets=0;
     std::uint64_t unicast_packets=0;
 
 
-    for(std::uint32_t block_id=0;
-         block_id<total_blocks;
-++block_id)
+    const auto first_block=srcast::section_first_block(section_id);
+    const auto section_blocks=srcast::section_block_count(
+        total_blocks,
+        section_id);
+    for(std::uint32_t local_block=0;
+         local_block<section_blocks;
+++local_block)
          {
-        const auto&targets=missing_by_block[block_id];
+        const auto&targets=missing_by_block[local_block];
         if(targets.empty())
         {
             continue;
         }
+        const auto block_id=first_block+local_block;
 
         std::uint64_t offset{};
         std::uint16_t payload_size{};
@@ -859,7 +885,7 @@ void send_repair_round(
 
         const auto packet=srcast::encode_data(
             transfer_id,
-            kSectionId,
+            section_id,
             block_id,
             offset,
             buffer.data(),
@@ -900,8 +926,146 @@ void send_repair_round(
         multicast_destination,
         receivers,
         transfer_id,
+        section_id,
         round_id,
         total_blocks);
+}
+
+bool all_receivers_completed(
+    const std::vector<ReceiverConnection>&receivers);
+
+bool distribute_section(
+    int udp_fd,
+    const sockaddr_in&multicast_destination,
+    std::vector<ReceiverConnection>&receivers,
+    int input_fd,
+    const std::string&file_path,
+    std::uint64_t file_size,
+    std::uint64_t transfer_id,
+    std::uint32_t total_blocks,
+    const std::array<std::uint8_t,srcast::kSha256Size>&digest,
+    std::uint32_t section_id,
+    int pace_us,
+    int max_repair_rounds)
+    {
+
+    std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
+    const auto first_block=srcast::section_first_block(section_id);
+    const auto section_blocks=srcast::section_block_count(
+        total_blocks,
+        section_id);
+
+    std::cout<<"sending section="<<section_id
+<<" blocks="<<section_blocks<<'\n';
+
+    for(std::uint32_t local_block=0;
+         local_block<section_blocks;
+++local_block)
+         {
+        const auto block_id=first_block+local_block;
+        std::uint64_t offset{};
+        std::uint16_t payload_size{};
+        read_block(
+            input_fd,
+            file_path,
+            file_size,
+            block_id,
+            buffer,
+            offset,
+            payload_size);
+
+        const auto packet=srcast::encode_data(
+            transfer_id,
+            section_id,
+            block_id,
+            offset,
+            buffer.data(),
+            payload_size,
+            srcast::crc32(buffer.data(),payload_size));
+
+        send_udp_packet(udp_fd,multicast_destination,packet);
+
+        if(pace_us>0)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(pace_us));
+        }
+    }
+
+    send_end_round(
+        udp_fd,
+        multicast_destination,
+        receivers,
+        transfer_id,
+        section_id,
+        0,
+        total_blocks);
+
+    std::cout<<"section="<<section_id
+<<" initial multicast finished; collecting round 0 reports\n";
+    collect_round_reports(
+        receivers,
+        transfer_id,
+        section_id,
+        0,
+        file_size,
+        total_blocks,
+        digest);
+
+    for(int repair_round=1;
+         repair_round<=max_repair_rounds &&
+!all_receivers_completed(receivers);
+++repair_round)
+         {
+
+        const bool section_done=std::all_of(
+            receivers.begin(),
+            receivers.end(),
+            [](const ReceiverConnection&receiver)
+            {
+                return receiver.completed||
+                    (receiver.status &&
+                     receiver.status->status==
+                         srcast::SectionStatusCode::Complete);
+            });
+        if(section_done)
+        {
+            return true;
+        }
+
+        send_repair_round(
+            udp_fd,
+            multicast_destination,
+            receivers,
+            input_fd,
+            file_path,
+            file_size,
+            transfer_id,
+            total_blocks,
+            section_id,
+            static_cast<std::uint32_t>(repair_round),
+            pace_us);
+
+        collect_round_reports(
+            receivers,
+            transfer_id,
+            section_id,
+            static_cast<std::uint32_t>(repair_round),
+            file_size,
+            total_blocks,
+            digest);
+    }
+
+    return std::all_of(
+        receivers.begin(),
+        receivers.end(),
+        [](const ReceiverConnection&receiver)
+        {
+            return receiver.completed||
+                (receiver.status &&
+                 receiver.status->status==
+                     srcast::SectionStatusCode::Complete);
+        });
 }
 
 bool all_receivers_completed(
@@ -1026,9 +1190,22 @@ void send_central_status(
             {transfer_id,status,file_size,sha256}));
 }
 
+void wait_for_meta_ready(
+    std::vector<ReceiverConnection>&receivers,
+    std::uint64_t transfer_id);
+
+void wait_for_receivers_ready(
+    std::vector<ReceiverConnection>&receivers,
+    std::uint64_t transfer_id);
+
 std::optional<CachedCentralFile>receive_cached_file_from_central(
     int central_fd,
-    const std::string&cache_directory)
+    const std::string&cache_directory,
+    int udp_fd,
+    const sockaddr_in&multicast_destination,
+    std::vector<ReceiverConnection>&receivers,
+    int pace_us,
+    int max_repair_rounds)
     {
 
     const auto first_frame=receive_control_frame(central_fd);
@@ -1096,6 +1273,47 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
 <<" size="<<meta.file_size
 <<" blocks="<<meta.total_blocks<<'\n';
 
+    for(auto&receiver : receivers)
+    {
+        receiver.meta_ready=false;
+        receiver.completed=false;
+        receiver.status_received=false;
+        receiver.complete_received=false;
+        receiver.ready_for_next_transfer=false;
+        receiver.status.reset();
+    }
+
+    srcast::FileMetaMessage file_meta;
+    file_meta.transfer_id=meta.transfer_id;
+    file_meta.section_id=srcast::kSingleSectionId;
+    file_meta.file_size=meta.file_size;
+    file_meta.block_size=meta.block_size;
+    file_meta.total_blocks=meta.total_blocks;
+    file_meta.sha256=meta.sha256;
+
+    const auto file_meta_frame=srcast::encode_file_meta(file_meta);
+    for(auto&receiver : receivers)
+    {
+        send_control_frame(receiver.control_fd.get(),file_meta_frame);
+    }
+    wait_for_meta_ready(receivers,meta.transfer_id);
+
+    auto fail_after_meta=[&](
+        const std::string&reason,
+        const std::array<std::uint8_t,srcast::kSha256Size>&sha256)
+        {
+        send_central_status(
+            central_fd,
+            meta.transfer_id,
+            srcast::CentralStatusCode::Failed,
+            meta.file_size,
+            sha256);
+        notify_failed_receivers(receivers,meta.transfer_id);
+        wait_for_receivers_ready(receivers,meta.transfer_id);
+        throw std::runtime_error(reason);
+    };
+
+    std::uint32_t next_section_id=0;
     for(;;)
     {
         const auto frame=receive_control_frame(central_fd);
@@ -1105,9 +1323,11 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         {
             const auto data=srcast::decode_central_data(frame);
             if(data.transfer_id!=meta.transfer_id||
-                data.section_id!=kSectionId||
-                data.block_id>=meta.total_blocks)
-                {
+                data.block_id>=meta.total_blocks||
+                data.section_id!=next_section_id||
+                data.section_id!=
+                    srcast::section_id_for_block(data.block_id))
+                    {
 ++rejected_count;
                 continue;
             }
@@ -1161,20 +1381,75 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         }
 
         const auto end=srcast::decode_central_file_end(frame);
+        const auto section_count=
+            srcast::section_count_for_blocks(meta.total_blocks);
         if(end.transfer_id!=meta.transfer_id||
-            end.section_id!=kSectionId||
             end.total_blocks!=meta.total_blocks||
-            received_count!=meta.total_blocks||
+            end.section_id!=next_section_id||
+            end.section_id>=section_count||
             rejected_count!=0)
             {
+            fail_after_meta(
+                "central transfer did not complete cleanly",
+                std::array<std::uint8_t,srcast::kSha256Size>{});
+        }
+
+        const auto first_block=srcast::section_first_block(end.section_id);
+        const auto section_blocks=srcast::section_block_count(
+            meta.total_blocks,
+            end.section_id);
+        for(std::uint32_t local_block=0;
+             local_block<section_blocks;
+++local_block)
+             {
+            if(received[first_block+local_block]==0)
+            {
+                fail_after_meta(
+                    "central section has missing blocks",
+                    std::array<std::uint8_t,srcast::kSha256Size>{});
+            }
+        }
+
+        const bool section_delivered=distribute_section(
+            udp_fd,
+            multicast_destination,
+            receivers,
+            output.get(),
+            temporary_path,
+            meta.file_size,
+            meta.transfer_id,
+            meta.total_blocks,
+            meta.sha256,
+            end.section_id,
+            pace_us,
+            max_repair_rounds);
+        if(!section_delivered)
+        {
+            fail_after_meta(
+                "receiver repair failed for central section",
+                std::array<std::uint8_t,srcast::kSha256Size>{});
+        }
+
+        const bool final_section=end.section_id+1U==section_count;
+        if(!final_section)
+        {
             send_central_status(
                 central_fd,
                 meta.transfer_id,
-                srcast::CentralStatusCode::Failed,
+                srcast::CentralStatusCode::Cached,
                 meta.file_size,
                 std::array<std::uint8_t,srcast::kSha256Size>{});
-            throw std::runtime_error(
-                "central transfer did not complete cleanly");
+            std::cout<<"central section cached section="
+<<end.section_id<<'\n';
+++next_section_id;
+            continue;
+        }
+
+        if(received_count!=meta.total_blocks)
+        {
+            fail_after_meta(
+                "central transfer missing final blocks",
+                std::array<std::uint8_t,srcast::kSha256Size>{});
         }
 
         if(::fsync(output.get())!=0)
@@ -1186,13 +1461,9 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         const auto actual_digest=srcast::sha256_file(temporary_path);
         if(actual_digest!=meta.sha256)
         {
-            send_central_status(
-                central_fd,
-                meta.transfer_id,
-                srcast::CentralStatusCode::Failed,
-                meta.file_size,
+            fail_after_meta(
+                "central cached file SHA-256 mismatch",
                 actual_digest);
-            throw std::runtime_error("central cached file SHA-256 mismatch");
         }
 
         std::error_code rename_error;
@@ -1212,6 +1483,28 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
             srcast::CentralStatusCode::Cached,
             meta.file_size,
             actual_digest);
+
+        if(all_receivers_completed(receivers))
+        {
+            std::cout<<"file completed by all receivers: "
+<<final_path<<'\n';
+        }
+        else
+        {
+            notify_failed_receivers(receivers,meta.transfer_id);
+            const auto completed_count=static_cast<std::size_t>(
+                std::count_if(
+                    receivers.begin(),
+                    receivers.end(),
+                    [](const ReceiverConnection&receiver)
+                    {
+                        return receiver.completed;
+                    }));
+            std::cout<<"file finished PARTIAL completed="
+<<completed_count<<'/'<<receivers.size()
+<<" after max repair rounds\n";
+        }
+        wait_for_receivers_ready(receivers,meta.transfer_id);
 
         std::cout<<"central transfer cached path="<<final_path
 <<" duplicates="<<duplicate_count
@@ -1410,72 +1703,12 @@ void send_file(
         receivers,
         transfer_id);
 
-    std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
-
-    for(std::uint32_t block_id=0;
-         block_id<total_blocks;
-++block_id)
+    const auto section_count=srcast::section_count_for_blocks(total_blocks);
+    for(std::uint32_t section_id=0;
+         section_id<section_count &&!all_receivers_completed(receivers);
+++section_id)
          {
-        std::uint64_t offset{};
-        std::uint16_t payload_size{};
-        read_block(
-            input.get(),
-            file_path,
-            file_size,
-            block_id,
-            buffer,
-            offset,
-            payload_size);
-
-        const auto packet=srcast::encode_data(
-            transfer_id,
-            kSectionId,
-            block_id,
-            offset,
-            buffer.data(),
-            payload_size,
-            srcast::crc32(buffer.data(),payload_size));
-
-        send_udp_packet(udp_fd,multicast_destination,packet);
-
-        if((block_id+1U)%1000U==0U)
-        {
-            std::cout<<"sent "<<(block_id+1U)<<'/'
-<<total_blocks<<" blocks\n";
-        }
-
-        if(pace_us>0)
-        {
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(pace_us));
-        }
-    }
-
-    send_end_round(
-        udp_fd,
-        multicast_destination,
-        receivers,
-        transfer_id,
-        0,
-        total_blocks);
-
-    std::cout<<"initial multicast finished; collecting round 0 reports\n";
-    collect_round_reports(
-        receivers,
-        transfer_id,
-        0,
-        file_size,
-        total_blocks,
-        digest);
-
-
-    for(int repair_round=1;
-         repair_round<=max_repair_rounds &&
-!all_receivers_completed(receivers);
-++repair_round)
-         {
-
-        send_repair_round(
+        const bool section_delivered=distribute_section(
             udp_fd,
             multicast_destination,
             receivers,
@@ -1484,16 +1717,14 @@ void send_file(
             file_size,
             transfer_id,
             total_blocks,
-            static_cast<std::uint32_t>(repair_round),
-            pace_us);
-
-        collect_round_reports(
-            receivers,
-            transfer_id,
-            static_cast<std::uint32_t>(repair_round),
-            file_size,
-            total_blocks,
-            digest);
+            digest,
+            section_id,
+            pace_us,
+            max_repair_rounds);
+        if(!section_delivered)
+        {
+            break;
+        }
     }
 
     if(all_receivers_completed(receivers))
@@ -1661,27 +1892,20 @@ int main(int argc,char** argv) try {
         }
 
         FileDescriptor central_fd(accepted);
-        std::size_t file_index=0;
         for(;;)
         {
             auto cached=receive_cached_file_from_central(
                 central_fd.get(),
-                cache_directory);
+                cache_directory,
+                udp_fd.get(),
+                multicast_destination,
+                receivers,
+                pace_us,
+                max_repair_rounds);
             if(!cached)
             {
                 break;
             }
-
-++file_index;
-            send_file(
-                udp_fd.get(),
-                multicast_destination,
-                receivers,
-                cached->path,
-                pace_us,
-                max_repair_rounds,
-                file_index,
-                file_index);
         }
     }
     else

@@ -82,7 +82,6 @@ constexpr auto kDrainQuietPeriod=std::chrono::milliseconds(200);
 constexpr auto kDrainHardTimeout=std::chrono::seconds(1);
 constexpr std::size_t kMaxUdpPacketsPerBatch=256;
 constexpr auto kUdpBatchTimeBudget=std::chrono::milliseconds(2);
-constexpr std::uint32_t kSectionId=srcast::kSingleSectionId;
 
 void write_all(int fd,const std::uint8_t*data,std::size_t size)
 {
@@ -389,6 +388,7 @@ struct TransferState
     std::uint64_t duplicate_count{0};
     std::uint64_t rejected_count{0};
     std::uint64_t intentional_drop_count{0};
+    std::optional<std::uint32_t>active_section_id;
     std::optional<std::uint32_t>last_end_round;
     std::optional<std::uint32_t>last_reported_round;
     bool awaiting_complete_ack{false};
@@ -474,6 +474,7 @@ bool initialize_transfer(
     state.duplicate_count=0;
     state.rejected_count=0;
     state.intentional_drop_count=0;
+    state.active_section_id.reset();
     state.last_end_round.reset();
     state.last_reported_round.reset();
     state.awaiting_complete_ack=false;
@@ -498,7 +499,8 @@ bool initialize_transfer(
 
     std::cout
 <<"accepted transfer_id="<<meta.common.transfer_id<<'\n'
-<<"section_id="<<kSectionId<<'\n'
+<<"sections="<<srcast::section_count_for_blocks(meta.total_blocks)
+<<'\n'
 <<"file_size="<<meta.file_size<<" bytes\n"
 <<"blocks="<<meta.total_blocks<<'\n'
 <<"expected_sha256="<<srcast::hex_digest(meta.sha256)<<'\n';
@@ -507,21 +509,27 @@ bool initialize_transfer(
 
 std::vector<std::uint8_t>make_missing_bitmap(
     const TransferState&state,
+    std::uint32_t section_id,
     std::uint32_t&missing_count)
     {
 
+    const auto first_block=srcast::section_first_block(section_id);
+    const auto section_blocks=srcast::section_block_count(
+        state.meta.total_blocks,
+        section_id);
     std::vector<std::uint8_t>bitmap(
-        srcast::bitmap_size_for_blocks(state.meta.total_blocks),
+        srcast::bitmap_size_for_blocks(section_blocks),
         0);
     missing_count=0;
 
-    for(std::uint32_t block_id=0;
-         block_id<state.meta.total_blocks;
-++block_id)
+    for(std::uint32_t local_block=0;
+         local_block<section_blocks;
+++local_block)
          {
+        const auto block_id=first_block+local_block;
         if(state.received[block_id]==0)
         {
-            srcast::bitmap_set(bitmap,block_id);
+            srcast::bitmap_set(bitmap,local_block);
 ++missing_count;
         }
     }
@@ -575,6 +583,7 @@ void send_section_status(
     int control_fd,
     std::uint64_t receiver_id,
     const TransferState&state,
+    std::uint32_t section_id,
     std::uint32_t round_id,
     srcast::SectionStatusCode status,
     std::uint32_t missing_count,
@@ -584,7 +593,7 @@ void send_section_status(
     srcast::SectionStatusMessage message;
     message.receiver_id=receiver_id;
     message.transfer_id=state.meta.common.transfer_id;
-    message.section_id=kSectionId;
+    message.section_id=section_id;
     message.round_id=round_id;
     message.status=status;
     message.missing_count=missing_count;
@@ -602,10 +611,19 @@ void finish_drain_and_report(
     std::uint32_t round_id)
     {
 
+    if(!state.active_section_id)
+    {
+        throw std::runtime_error("no active section to report");
+    }
+    const auto section_id=*state.active_section_id;
     std::uint32_t missing_count{};
-    auto missing_bitmap=make_missing_bitmap(state,missing_count);
+    auto missing_bitmap=make_missing_bitmap(
+        state,
+        section_id,
+        missing_count);
 
     std::cout<<"DATA quiet period finished; round="<<round_id
+<<" section="<<section_id
 <<" missing_blocks="<<missing_count<<'\n';
 
     if(missing_count!=0)
@@ -614,6 +632,7 @@ void finish_drain_and_report(
             control_fd,
             receiver_id,
             state,
+            section_id,
             round_id,
             srcast::SectionStatusCode::Missing,
             missing_count,
@@ -626,10 +645,27 @@ void finish_drain_and_report(
     std::array<std::uint8_t,srcast::kSha256Size>actual_digest{};
     if(!finalize_transfer(state,actual_digest))
     {
+        if(state.received_count!=state.meta.total_blocks)
+        {
+            send_section_status(
+                control_fd,
+                receiver_id,
+                state,
+                section_id,
+                round_id,
+                srcast::SectionStatusCode::Complete,
+                0,
+                {});
+            state.last_reported_round=round_id;
+            std::cout<<"section complete; waiting for next section\n";
+            return;
+        }
+
         send_section_status(
             control_fd,
             receiver_id,
             state,
+            section_id,
             round_id,
             srcast::SectionStatusCode::Failed,
             0,
@@ -642,6 +678,7 @@ void finish_drain_and_report(
         control_fd,
         receiver_id,
         state,
+        section_id,
         round_id,
         srcast::SectionStatusCode::Complete,
         0,
@@ -700,11 +737,33 @@ void begin_drain_for_round(
     {
 
     if(state.awaiting_complete_ack||
-        section_id!=kSectionId||
         total_blocks!=state.meta.total_blocks)
         {
 ++state.rejected_count;
         return;
+    }
+    try
+    {
+        static_cast<void>(
+            srcast::section_block_count(
+                state.meta.total_blocks,
+                section_id));
+    } catch(const std::exception&) {
+++state.rejected_count;
+        return;
+    }
+
+    if(!state.active_section_id||
+        section_id!=*state.active_section_id)
+        {
+        if(state.active_section_id &&
+            section_id<*state.active_section_id)
+            {
+            return;
+        }
+        state.active_section_id=section_id;
+        state.last_end_round.reset();
+        state.last_reported_round.reset();
     }
     if(state.last_reported_round &&
         round_id<=*state.last_reported_round)
@@ -728,7 +787,8 @@ void begin_drain_for_round(
     hard_deadline=SteadyClock::now()+kDrainHardTimeout;
     arm_drain_timer(drain_timer_fd,hard_deadline);
 
-    std::cout<<"SECTION_END received round="<<round_id
+    std::cout<<"SECTION_END received section="<<section_id
+<<" round="<<round_id
 <<"; waiting for 200ms DATA quiet period"
 <<" (maximum 1s)\n";
 }
@@ -764,7 +824,8 @@ void handle_control_message(
         const auto message=
             srcast::decode_file_meta(frame);
 
-        if(message.section_id!=kSectionId)
+
+        if(message.section_id!=srcast::kSingleSectionId)
         {
             throw std::runtime_error(
                 "unsupported FILE_META section_id");
@@ -776,6 +837,8 @@ void handle_control_message(
             throw std::runtime_error(
                 "unsupported FILE_META block size");
         }
+
+
 
         const auto expected_blocks64=
             (message.file_size+
@@ -794,6 +857,8 @@ void handle_control_message(
                 "inconsistent FILE_META block count");
         }
 
+
+
         if(transfer)
         {
             if(transfer->meta.common.transfer_id==
@@ -810,10 +875,14 @@ void handle_control_message(
                 return;
             }
 
+
             throw std::runtime_error(
                 "FILE_META received while another "
                 "transfer is active");
         }
+
+
+
 
         srcast::MetaPacket meta;
 
@@ -829,6 +898,8 @@ void handle_control_message(
 
         transfer.emplace();
 
+
+
         if(!initialize_transfer(
                 *transfer,
                 meta,
@@ -841,6 +912,7 @@ void handle_control_message(
                 "failed to initialize FILE_META");
         }
 
+
         disarm_timer(drain_timer_fd);
 
         static_cast<void>(
@@ -848,6 +920,8 @@ void handle_control_message(
                 drain_timer_fd));
 
         draining=false;
+
+
 
         send_control_frame(
             control_fd,
@@ -862,6 +936,8 @@ void handle_control_message(
 
         return;
     }
+
+
 
     if(type==srcast::ControlType::SectionEnd)
     {
@@ -888,12 +964,21 @@ void handle_control_message(
         const auto message=srcast::decode_repair_begin(frame);
         if(!transfer||
             transfer->meta.common.transfer_id!=message.transfer_id||
-            message.section_id!=kSectionId||
             transfer->awaiting_complete_ack)
             {
             return;
         }
-        std::cout<<"repair round "<<message.round_id<<" begins\n";
+        try
+        {
+            static_cast<void>(
+                srcast::section_block_count(
+                    transfer->meta.total_blocks,
+                    message.section_id));
+        } catch(const std::exception&) {
+            return;
+        }
+        std::cout<<"repair section "<<message.section_id
+<<" round "<<message.round_id<<" begins\n";
         return;
     }
 
@@ -1217,6 +1302,10 @@ int main(int argc,char** argv) try {
                     if(common.type==srcast::PacketType::Meta)
                     {
 
+
+
+
+
                         continue;
                     }
 
@@ -1235,9 +1324,10 @@ int main(int argc,char** argv) try {
                             static_cast<std::size_t>(packet_size));
                         auto&state=*transfer;
 
-                        if(data.section_id!=kSectionId||
-                            data.block_id>=state.meta.total_blocks)
-                            {
+                        if(data.block_id>=state.meta.total_blocks||
+                            data.section_id!=
+                                srcast::section_id_for_block(data.block_id))
+                                {
 ++state.rejected_count;
                             continue;
                         }

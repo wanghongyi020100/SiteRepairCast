@@ -2,6 +2,7 @@
 
 #include<arpa/inet.h>
 
+#include<algorithm>
 #include<array>
 #include<cstddef>
 #include<cstdint>
@@ -15,10 +16,11 @@ namespace srcast
 {
 constexpr std::uint32_t kMagic=0x53524331U;
 constexpr std::uint32_t kControlMagic=0x53524343U;
-constexpr std::uint16_t kVersion=4;
+constexpr std::uint16_t kVersion=5;
 constexpr std::size_t kPayloadSize=1200;
 constexpr std::size_t kSha256Size=32;
 constexpr std::uint32_t kSingleSectionId=0;
+constexpr std::uint32_t kSectionBlockCount=64;
 
 constexpr std::size_t kCommonHeaderSize=16;
 constexpr std::size_t kMetaPacketSize=
@@ -1172,6 +1174,38 @@ inline void bitmap_set(
 inline std::size_t bitmap_size_for_blocks(std::uint32_t total_blocks)
 {
     return (static_cast<std::size_t>(total_blocks)+7U)/8U;
+}
+
+inline std::uint32_t section_id_for_block(std::uint32_t block_id)
+{
+    return block_id/kSectionBlockCount;
+}
+
+inline std::uint32_t section_first_block(std::uint32_t section_id)
+{
+    return section_id * kSectionBlockCount;
+}
+
+inline std::uint32_t section_count_for_blocks(std::uint32_t total_blocks)
+{
+    if(total_blocks==0)
+    {
+        return 0;
+    }
+    return (total_blocks+kSectionBlockCount-1U)/kSectionBlockCount;
+}
+
+inline std::uint32_t section_block_count(
+    std::uint32_t total_blocks,
+    std::uint32_t section_id)
+    {
+
+    const auto first=section_first_block(section_id);
+    if(first>=total_blocks)
+    {
+        throw std::runtime_error("section_id out of range");
+    }
+    return std::min(kSectionBlockCount,total_blocks-first);
 }
 
 }

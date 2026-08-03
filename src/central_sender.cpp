@@ -294,60 +294,71 @@ void send_file(
         srcast::encode_central_file_meta(meta));
 
     std::vector<std::uint8_t>payload;
-    for(std::uint32_t block_id=0;
-         block_id<total_blocks;
-++block_id)
+    const auto section_count=srcast::section_count_for_blocks(total_blocks);
+    for(std::uint32_t section_id=0;
+         section_id<section_count;
+++section_id)
          {
-        std::uint64_t offset{};
-        read_block(
-            input.get(),
-            file_path,
-            file_size,
-            block_id,
-            payload,
-            offset);
+        const auto first_block=srcast::section_first_block(section_id);
+        const auto section_blocks=srcast::section_block_count(
+            total_blocks,
+            section_id);
 
-        srcast::CentralDataMessage data;
-        data.transfer_id=transfer_id;
-        data.section_id=srcast::kSingleSectionId;
-        data.block_id=block_id;
-        data.offset=offset;
-        data.payload_size=static_cast<std::uint16_t>(payload.size());
-        data.crc32=srcast::crc32(payload.data(),payload.size());
-        data.payload=payload;
+        for(std::uint32_t local_block=0;
+             local_block<section_blocks;
+++local_block)
+             {
+            const auto block_id=first_block+local_block;
+            std::uint64_t offset{};
+            read_block(
+                input.get(),
+                file_path,
+                file_size,
+                block_id,
+                payload,
+                offset);
+
+            srcast::CentralDataMessage data;
+            data.transfer_id=transfer_id;
+            data.section_id=section_id;
+            data.block_id=block_id;
+            data.offset=offset;
+            data.payload_size=static_cast<std::uint16_t>(payload.size());
+            data.crc32=srcast::crc32(payload.data(),payload.size());
+            data.payload=payload;
+
+            send_control_frame(
+                central_fd,
+                srcast::encode_central_data(data));
+
+            if(pace_us>0)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(pace_us));
+            }
+        }
 
         send_control_frame(
             central_fd,
-            srcast::encode_central_data(data));
+            srcast::encode_central_file_end(
+                {transfer_id,section_id,total_blocks}));
 
-        if((block_id+1U)%1000U==0U)
-        {
-            std::cout<<"central sent "
-<<(block_id+1U)<<'/'
-<<total_blocks<<" blocks\n";
+        const auto response=receive_control_frame(central_fd);
+        const auto result=srcast::decode_central_status(response);
+        if(result.transfer_id!=transfer_id||
+            result.status!=srcast::CentralStatusCode::Cached||
+            result.file_size!=file_size)
+            {
+            throw std::runtime_error(
+                "proxy did not confirm cached section: "+file_path);
         }
-
-        if(pace_us>0)
+        if(section_id+1U==section_count && result.sha256!=digest)
         {
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(pace_us));
+            throw std::runtime_error(
+                "proxy final digest mismatch: "+file_path);
         }
-    }
-
-    send_control_frame(
-        central_fd,
-        srcast::encode_central_file_end(
-            {transfer_id,srcast::kSingleSectionId,total_blocks}));
-
-    const auto response=receive_control_frame(central_fd);
-    const auto result=srcast::decode_central_status(response);
-    if(result.transfer_id!=transfer_id||
-        result.status!=srcast::CentralStatusCode::Cached||
-        result.file_size!=file_size||
-        result.sha256!=digest)
-        {
-        throw std::runtime_error(
-            "proxy did not confirm cached file: "+file_path);
+        std::cout<<"central confirmed section="<<section_id
+<<" transfer_id="<<transfer_id<<'\n';
     }
 
     std::cout<<"central confirmed cached transfer_id="
