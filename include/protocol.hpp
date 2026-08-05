@@ -16,7 +16,7 @@ namespace srcast
 {
 constexpr std::uint32_t kMagic=0x53524331U;
 constexpr std::uint32_t kControlMagic=0x53524343U;
-constexpr std::uint16_t kVersion=5;
+constexpr std::uint16_t kVersion=6;
 constexpr std::size_t kPayloadSize=1200;
 constexpr std::size_t kSha256Size=32;
 constexpr std::uint32_t kSingleSectionId=0;
@@ -356,6 +356,7 @@ enum class ControlType : std::uint16_t
     CentralFileEnd=14,
     CentralStatus=15,
     CentralSessionEnd=16,
+    CentralResume=17,
 };
 
 enum class SectionStatusCode : std::uint16_t
@@ -486,6 +487,15 @@ struct CentralStatusMessage
     std::array<std::uint8_t,kSha256Size>sha256{};
 };
 
+struct CentralResumeMessage
+{
+    std::uint64_t transfer_id{};
+    std::uint32_t next_section_id{};
+    std::uint32_t total_sections{};
+    std::uint64_t file_size{};
+    std::array<std::uint8_t,kSha256Size>sha256{};
+};
+
 inline void write_control_header(PacketWriter&writer,ControlType type)
 {
     writer.u32(kControlMagic);
@@ -508,7 +518,7 @@ inline ControlType read_control_header(PacketReader&reader)
         throw std::runtime_error("unsupported control protocol version");
     }
     if(raw_type<static_cast<std::uint16_t>(ControlType::Register)||
-        raw_type>static_cast<std::uint16_t>(ControlType::CentralSessionEnd))
+        raw_type>static_cast<std::uint16_t>(ControlType::CentralResume))
         {
         throw std::runtime_error("invalid control message type");
     }
@@ -1115,6 +1125,43 @@ inline CentralStatusMessage decode_central_status(
         throw std::runtime_error("invalid CENTRAL_STATUS code");
     }
     message.status=static_cast<CentralStatusCode>(raw_status);
+    message.file_size=reader.u64();
+    reader.bytes(message.sha256.data(),message.sha256.size());
+    return message;
+}
+
+inline std::vector<std::uint8_t>encode_central_resume(
+    const CentralResumeMessage&message)
+    {
+
+    PacketWriter writer(64);
+    write_control_header(writer,ControlType::CentralResume);
+    writer.u64(message.transfer_id);
+    writer.u32(message.next_section_id);
+    writer.u32(message.total_sections);
+    writer.u64(message.file_size);
+    writer.bytes(message.sha256.data(),message.sha256.size());
+    return writer.data();
+}
+
+inline CentralResumeMessage decode_central_resume(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()!=64)
+    {
+        throw std::runtime_error("invalid CENTRAL_RESUME size");
+    }
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::CentralResume)
+    {
+        throw std::runtime_error("control message is not CENTRAL_RESUME");
+    }
+
+    CentralResumeMessage message;
+    message.transfer_id=reader.u64();
+    message.next_section_id=reader.u32();
+    message.total_sections=reader.u32();
     message.file_size=reader.u64();
     reader.bytes(message.sha256.data(),message.sha256.size());
     return message;

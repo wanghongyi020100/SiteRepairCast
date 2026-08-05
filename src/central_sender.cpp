@@ -13,10 +13,10 @@
 #include<cerrno>
 #include<chrono>
 #include<cstdint>
+#include<cstdlib>
 #include<cstring>
 #include<iostream>
 #include<limits>
-#include<random>
 #include<stdexcept>
 #include<string>
 #include<thread>
@@ -186,11 +186,36 @@ FileDescriptor connect_proxy(
     }
 }
 
-std::uint64_t create_transfer_id()
+std::uint64_t create_transfer_id(
+    const std::array<std::uint8_t,srcast::kSha256Size>&digest)
+    {
+
+    std::uint64_t value=0;
+    for(std::size_t index=0; index<sizeof(value);++index)
+    {
+        value=(value<<8U)|digest[index];
+    }
+    return value;
+}
+
+std::uint32_t stop_after_sections_for_test()
 {
-    std::random_device device;
-    std::mt19937_64 engine(device());
-    return engine();
+    const char*raw=std::getenv("SRCAST_STOP_AFTER_SECTIONS");
+    if(raw==nullptr||*raw=='\0')
+    {
+        return 0;
+    }
+
+    char*end=nullptr;
+    errno=0;
+    const auto value=std::strtoul(raw,&end,10);
+    if(raw==end||*end!='\0'||errno==ERANGE||
+        value>std::numeric_limits<std::uint32_t>::max())
+        {
+        throw std::runtime_error(
+            "invalid SRCAST_STOP_AFTER_SECTIONS value");
+    }
+    return static_cast<std::uint32_t>(value);
 }
 
 void read_block(
@@ -241,7 +266,7 @@ void usage(const char*program)
 <<" 127.0.0.1 7000 0 input-a.bin input-b.bin\n";
 }
 
-void send_file(
+bool send_file(
     int central_fd,
     const std::string&file_path,
     int pace_us)
@@ -269,7 +294,7 @@ void send_file(
 
     const auto total_blocks=static_cast<std::uint32_t>(total_blocks64);
     const auto digest=srcast::sha256_file(file_path);
-    const auto transfer_id=create_transfer_id();
+    const auto transfer_id=create_transfer_id(digest);
 
     FileDescriptor input(::open(file_path.c_str(),O_RDONLY|O_CLOEXEC));
     if(input.get()<0)
@@ -293,9 +318,37 @@ void send_file(
         central_fd,
         srcast::encode_central_file_meta(meta));
 
-    std::vector<std::uint8_t>payload;
     const auto section_count=srcast::section_count_for_blocks(total_blocks);
-    for(std::uint32_t section_id=0;
+    const auto resume_frame=receive_control_frame(central_fd);
+    const auto resume=srcast::decode_central_resume(resume_frame);
+    if(resume.transfer_id!=transfer_id||
+        resume.file_size!=file_size||
+        resume.total_sections!=section_count||
+        resume.next_section_id>section_count)
+        {
+        throw std::runtime_error(
+            "invalid CENTRAL_RESUME from proxy: "+file_path);
+    }
+    if(resume.next_section_id==section_count)
+    {
+        if(resume.sha256!=digest)
+        {
+            throw std::runtime_error(
+                "proxy cached digest mismatch: "+file_path);
+        }
+        std::cout<<"central transfer already cached transfer_id="
+<<transfer_id<<'\n';
+        return true;
+    }
+
+    std::cout<<"central resume transfer_id="<<transfer_id
+<<" next_section="<<resume.next_section_id
+<<'/'<<section_count<<'\n';
+
+    std::vector<std::uint8_t>payload;
+    const auto stop_after_sections=stop_after_sections_for_test();
+    std::uint32_t confirmed_this_run=0;
+    for(std::uint32_t section_id=resume.next_section_id;
          section_id<section_count;
 ++section_id)
          {
@@ -359,10 +412,21 @@ void send_file(
         }
         std::cout<<"central confirmed section="<<section_id
 <<" transfer_id="<<transfer_id<<'\n';
+
+++confirmed_this_run;
+        if(stop_after_sections!=0 &&
+            confirmed_this_run>=stop_after_sections &&
+            section_id+1U<section_count)
+            {
+            std::cout<<"test hook closing central connection after "
+<<confirmed_this_run<<" confirmed sections\n";
+            return false;
+        }
     }
 
     std::cout<<"central confirmed cached transfer_id="
 <<transfer_id<<'\n';
+    return true;
 }
 
 }
@@ -386,7 +450,10 @@ int main(int argc,char** argv) try {
     auto central_fd=connect_proxy(proxy_ip,central_port);
     for(int index=4; index<argc;++index)
     {
-        send_file(central_fd.get(),argv[index],pace_us);
+        if(!send_file(central_fd.get(),argv[index],pace_us))
+        {
+            return 0;
+        }
     }
 
     send_control_frame(

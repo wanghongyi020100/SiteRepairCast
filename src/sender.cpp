@@ -18,10 +18,12 @@
 #include<cstdint>
 #include<cstring>
 #include<filesystem>
+#include<fstream>
 #include<iostream>
 #include<limits>
 #include<optional>
 #include<random>
+#include<sstream>
 #include<stdexcept>
 #include<string>
 #include<thread>
@@ -287,6 +289,111 @@ struct CachedCentralFile
     std::uint32_t total_blocks{};
     std::array<std::uint8_t,srcast::kSha256Size>sha256{};
 };
+
+std::string central_checkpoint_path(const std::string&final_path)
+{
+    return final_path+".state";
+}
+
+std::uint32_t load_central_checkpoint(
+    const std::string&checkpoint_path,
+    const std::string&temporary_path,
+    const srcast::CentralFileMetaMessage&meta)
+    {
+
+    if(!std::filesystem::exists(checkpoint_path)||
+!std::filesystem::exists(temporary_path))
+        {
+        return 0;
+    }
+
+    std::error_code size_error;
+    const auto temporary_size=
+        std::filesystem::file_size(temporary_path,size_error);
+    if(size_error||temporary_size!=meta.file_size)
+    {
+        return 0;
+    }
+
+    std::ifstream input(checkpoint_path);
+    if(!input)
+    {
+        return 0;
+    }
+
+    std::string magic;
+    int version=0;
+    std::uint64_t transfer_id=0;
+    std::uint64_t file_size=0;
+    std::uint32_t total_blocks=0;
+    std::uint32_t next_section_id=0;
+    std::string digest_hex;
+
+    input>>magic>>version
+>>transfer_id
+>>file_size
+>>total_blocks
+>>digest_hex
+>>next_section_id;
+
+    const auto section_count=
+        srcast::section_count_for_blocks(meta.total_blocks);
+    if(!input||
+        magic!="SRC_PROXY_CHECKPOINT"||
+        version!=1||
+        transfer_id!=meta.transfer_id||
+        file_size!=meta.file_size||
+        total_blocks!=meta.total_blocks||
+        digest_hex!=srcast::hex_digest(meta.sha256)||
+        next_section_id>=section_count)
+        {
+        return 0;
+    }
+
+    return next_section_id;
+}
+
+void save_central_checkpoint(
+    const std::string&checkpoint_path,
+    const srcast::CentralFileMetaMessage&meta,
+    std::uint32_t next_section_id)
+    {
+
+    const auto temporary_checkpoint=checkpoint_path+".tmp";
+    {
+        std::ofstream output(
+            temporary_checkpoint,
+            std::ios::trunc);
+        if(!output)
+        {
+            throw std::runtime_error(
+                "open central checkpoint failed: "+temporary_checkpoint);
+        }
+        output<<"SRC_PROXY_CHECKPOINT 1\n"
+<<meta.transfer_id<<'\n'
+<<meta.file_size<<'\n'
+<<meta.total_blocks<<'\n'
+<<srcast::hex_digest(meta.sha256)<<'\n'
+<<next_section_id<<'\n';
+        output.flush();
+        if(!output)
+        {
+            throw std::runtime_error(
+                "write central checkpoint failed: "+temporary_checkpoint);
+        }
+    }
+
+    std::error_code error;
+    std::filesystem::rename(
+        temporary_checkpoint,
+        checkpoint_path,
+        error);
+    if(error)
+    {
+        throw std::runtime_error(
+            "commit central checkpoint failed: "+error.message());
+    }
+}
 
 struct ReceiverConnection
 {
@@ -1249,10 +1356,47 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
          ("central-transfer-"+std::to_string(meta.transfer_id)+".bin"))
             .string();
     const auto temporary_path=final_path+".part";
+    const auto checkpoint_path=central_checkpoint_path(final_path);
+
+    if(std::filesystem::exists(final_path))
+    {
+        const auto actual_digest=srcast::sha256_file(final_path);
+        if(actual_digest==meta.sha256)
+        {
+            const auto section_count=
+                srcast::section_count_for_blocks(meta.total_blocks);
+            send_control_frame(
+                central_fd,
+                srcast::encode_central_resume(
+                    {meta.transfer_id,
+                     section_count,
+                     section_count,
+                     meta.file_size,
+                     actual_digest}));
+            std::cout<<"central transfer already cached path="
+<<final_path<<'\n';
+            return CachedCentralFile{
+                final_path,
+                meta.transfer_id,
+                meta.file_size,
+                meta.total_blocks,
+                actual_digest};
+        }
+    }
+
+    const auto section_count=
+        srcast::section_count_for_blocks(meta.total_blocks);
+    const auto resume_section=load_central_checkpoint(
+        checkpoint_path,
+        temporary_path,
+        meta);
 
     FileDescriptor output(::open(
         temporary_path.c_str(),
-        O_CREAT|O_TRUNC|O_RDWR|O_CLOEXEC,
+        O_CREAT|
+            (resume_section==0 ? O_TRUNC : 0)|
+            O_RDWR|
+            O_CLOEXEC,
         0644));
     if(output.get()<0)
     {
@@ -1264,14 +1408,34 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
     }
 
     std::vector<std::uint8_t>received(meta.total_blocks,0);
-    std::uint32_t received_count=0;
+    for(std::uint32_t section_id=0;
+         section_id<resume_section;
+++section_id)
+         {
+        const auto first_block=srcast::section_first_block(section_id);
+        const auto section_blocks=srcast::section_block_count(
+            meta.total_blocks,
+            section_id);
+        for(std::uint32_t local_block=0;
+             local_block<section_blocks;
+++local_block)
+             {
+            received[first_block+local_block]=1;
+        }
+    }
+    std::uint32_t received_count=
+        std::min<std::uint32_t>(
+            meta.total_blocks,
+            srcast::section_first_block(resume_section));
     std::uint64_t duplicate_count=0;
     std::uint64_t rejected_count=0;
 
     std::cout<<"central transfer started transfer_id="
 <<meta.transfer_id
 <<" size="<<meta.file_size
-<<" blocks="<<meta.total_blocks<<'\n';
+<<" blocks="<<meta.total_blocks
+<<" resume_section="<<resume_section
+<<'/'<<section_count<<'\n';
 
     for(auto&receiver : receivers)
     {
@@ -1298,6 +1462,15 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
     }
     wait_for_meta_ready(receivers,meta.transfer_id);
 
+    send_control_frame(
+        central_fd,
+        srcast::encode_central_resume(
+            {meta.transfer_id,
+             resume_section,
+             section_count,
+             meta.file_size,
+             std::array<std::uint8_t,srcast::kSha256Size>{}}));
+
     auto fail_after_meta=[&](
         const std::string&reason,
         const std::array<std::uint8_t,srcast::kSha256Size>&sha256)
@@ -1313,7 +1486,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         throw std::runtime_error(reason);
     };
 
-    std::uint32_t next_section_id=0;
+    std::uint32_t next_section_id=resume_section;
     for(;;)
     {
         const auto frame=receive_control_frame(central_fd);
@@ -1381,8 +1554,6 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         }
 
         const auto end=srcast::decode_central_file_end(frame);
-        const auto section_count=
-            srcast::section_count_for_blocks(meta.total_blocks);
         if(end.transfer_id!=meta.transfer_id||
             end.total_blocks!=meta.total_blocks||
             end.section_id!=next_section_id||
@@ -1433,6 +1604,15 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         const bool final_section=end.section_id+1U==section_count;
         if(!final_section)
         {
+            const auto completed_section=end.section_id+1U;
+            if(::fsync(output.get())!=0)
+            {
+                system_error("fsync central cache section");
+            }
+            save_central_checkpoint(
+                checkpoint_path,
+                meta,
+                completed_section);
             send_central_status(
                 central_fd,
                 meta.transfer_id,
@@ -1441,7 +1621,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
                 std::array<std::uint8_t,srcast::kSha256Size>{});
             std::cout<<"central section cached section="
 <<end.section_id<<'\n';
-++next_section_id;
+            next_section_id=completed_section;
             continue;
         }
 
@@ -1476,6 +1656,9 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
             throw std::runtime_error(
                 "commit central cache failed: "+rename_error.message());
         }
+
+        std::error_code remove_error;
+        std::filesystem::remove(checkpoint_path,remove_error);
 
         send_central_status(
             central_fd,
@@ -1870,41 +2053,55 @@ int main(int argc,char** argv) try {
 
     if(central_mode)
     {
-        sockaddr_in central_peer{};
-        socklen_t central_peer_size=sizeof(central_peer);
-        int accepted=-1;
-        for(;;)
+        bool central_session_finished=false;
+        while(!central_session_finished)
         {
-            accepted=::accept4(
-                central_listener->get(),
-                reinterpret_cast<sockaddr*>(&central_peer),
-                &central_peer_size,
-                SOCK_CLOEXEC);
-            if(accepted>=0)
+            sockaddr_in central_peer{};
+            socklen_t central_peer_size=sizeof(central_peer);
+            int accepted=-1;
+            for(;;)
             {
-                break;
+                accepted=::accept4(
+                    central_listener->get(),
+                    reinterpret_cast<sockaddr*>(&central_peer),
+                    &central_peer_size,
+                    SOCK_CLOEXEC);
+                if(accepted>=0)
+                {
+                    break;
+                }
+                if(errno==EINTR)
+                {
+                    continue;
+                }
+                system_error("accept central sender");
             }
-            if(errno==EINTR)
-            {
-                continue;
-            }
-            system_error("accept central sender");
-        }
 
-        FileDescriptor central_fd(accepted);
-        for(;;)
-        {
-            auto cached=receive_cached_file_from_central(
-                central_fd.get(),
-                cache_directory,
-                udp_fd.get(),
-                multicast_destination,
-                receivers,
-                pace_us,
-                max_repair_rounds);
-            if(!cached)
+            FileDescriptor central_fd(accepted);
+            std::cout<<"central sender connected\n";
+            for(;;)
             {
-                break;
+                try
+                {
+                    auto cached=receive_cached_file_from_central(
+                        central_fd.get(),
+                        cache_directory,
+                        udp_fd.get(),
+                        multicast_destination,
+                        receivers,
+                        pace_us,
+                        max_repair_rounds);
+                    if(!cached)
+                    {
+                        central_session_finished=true;
+                        break;
+                    }
+                } catch(const std::exception&error) {
+                    std::cerr<<"central session interrupted: "
+<<error.what()
+<<"; waiting for reconnect\n";
+                    break;
+                }
             }
         }
     }

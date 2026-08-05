@@ -18,9 +18,11 @@
 #include<cstdlib>
 #include<cstring>
 #include<filesystem>
+#include<fstream>
 #include<iostream>
 #include<limits>
 #include<optional>
+#include<sstream>
 #include<stdexcept>
 #include<string>
 #include<unordered_set>
@@ -382,6 +384,7 @@ struct TransferState
     srcast::MetaPacket meta;
     std::string temporary_path;
     std::string output_path;
+    std::string state_path;
     FileDescriptor output;
     std::vector<std::uint8_t>received;
     std::uint32_t received_count{0};
@@ -394,6 +397,171 @@ struct TransferState
     bool awaiting_complete_ack{false};
     std::unordered_set<std::uint32_t>intentionally_dropped_blocks;
 };
+
+std::string received_state_path(const std::string&output_path)
+{
+    return output_path+".state";
+}
+
+std::string hex_bytes(const std::vector<std::uint8_t>&bytes)
+{
+    static constexpr char digits[]="0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2U);
+    for(const auto byte : bytes)
+    {
+        result.push_back(digits[(byte>>4U) & 0x0fU]);
+        result.push_back(digits[byte & 0x0fU]);
+    }
+    return result;
+}
+
+std::optional<std::vector<std::uint8_t>>parse_hex_bytes(
+    const std::string&hex)
+    {
+
+    if(hex.size()%2U!=0U)
+    {
+        return std::nullopt;
+    }
+
+    auto value_of=[](char ch)->int {
+        if(ch>='0' && ch<='9')
+        {
+            return ch-'0';
+        }
+        if(ch>='a' && ch<='f')
+        {
+            return ch-'a'+10;
+        }
+        if(ch>='A' && ch<='F')
+        {
+            return ch-'A'+10;
+        }
+        return-1;
+    };
+
+    std::vector<std::uint8_t>bytes(hex.size()/2U);
+    for(std::size_t index=0; index<bytes.size();++index)
+    {
+        const auto high=value_of(hex[index * 2U]);
+        const auto low=value_of(hex[index * 2U+1U]);
+        if(high<0||low<0)
+        {
+            return std::nullopt;
+        }
+        bytes[index]=static_cast<std::uint8_t>(
+            (high<<4U)|low);
+    }
+    return bytes;
+}
+
+bool load_receiver_state(
+    TransferState&state,
+    const srcast::MetaPacket&meta)
+    {
+
+    if(!std::filesystem::exists(state.state_path)||
+!std::filesystem::exists(state.temporary_path))
+        {
+        return false;
+    }
+
+    std::error_code size_error;
+    const auto temporary_size=
+        std::filesystem::file_size(state.temporary_path,size_error);
+    if(size_error||temporary_size!=meta.file_size)
+    {
+        return false;
+    }
+
+    std::ifstream input(state.state_path);
+    if(!input)
+    {
+        return false;
+    }
+
+    std::string magic;
+    int version=0;
+    std::uint64_t transfer_id=0;
+    std::uint64_t file_size=0;
+    std::uint32_t total_blocks=0;
+    std::uint32_t received_count=0;
+    std::string digest_hex;
+    std::string received_hex;
+
+    input>>magic>>version
+>>transfer_id
+>>file_size
+>>total_blocks
+>>digest_hex
+>>received_count
+>>received_hex;
+
+    auto received=parse_hex_bytes(received_hex);
+    if(!input||
+!received||
+        magic!="SRC_RECEIVER_STATE"||
+        version!=1||
+        transfer_id!=meta.common.transfer_id||
+        file_size!=meta.file_size||
+        total_blocks!=meta.total_blocks||
+        digest_hex!=srcast::hex_digest(meta.sha256)||
+        received->size()!=meta.total_blocks)
+        {
+        return false;
+    }
+
+    const auto counted=static_cast<std::uint32_t>(
+        std::count(received->begin(),received->end(),1));
+    if(counted!=received_count)
+    {
+        return false;
+    }
+
+    state.received=std::move(*received);
+    state.received_count=received_count;
+    return true;
+}
+
+void save_receiver_state(const TransferState&state)
+{
+    const auto temporary_state_path=state.state_path+".tmp";
+    {
+        std::ofstream output(
+            temporary_state_path,
+            std::ios::trunc);
+        if(!output)
+        {
+            throw std::runtime_error(
+                "open receiver state failed: "+temporary_state_path);
+        }
+        output<<"SRC_RECEIVER_STATE 1\n"
+<<state.meta.common.transfer_id<<'\n'
+<<state.meta.file_size<<'\n'
+<<state.meta.total_blocks<<'\n'
+<<srcast::hex_digest(state.meta.sha256)<<'\n'
+<<state.received_count<<'\n'
+<<hex_bytes(state.received)<<'\n';
+        output.flush();
+        if(!output)
+        {
+            throw std::runtime_error(
+                "write receiver state failed: "+temporary_state_path);
+        }
+    }
+
+    std::error_code error;
+    std::filesystem::rename(
+        temporary_state_path,
+        state.state_path,
+        error);
+    if(error)
+    {
+        throw std::runtime_error(
+            "commit receiver state failed: "+error.message());
+    }
+}
 
 std::unordered_set<std::uint32_t>parse_initial_drop_blocks()
 {
@@ -469,6 +637,7 @@ bool initialize_transfer(
     state.output_path=
         (std::filesystem::path(output_directory)/generated_name).string();
     state.temporary_path=state.output_path+".part";
+    state.state_path=received_state_path(state.output_path);
     state.received.assign(meta.total_blocks,0);
     state.received_count=0;
     state.duplicate_count=0;
@@ -480,9 +649,13 @@ bool initialize_transfer(
     state.awaiting_complete_ack=false;
     state.intentionally_dropped_blocks.clear();
 
+    const bool loaded_state=load_receiver_state(state,meta);
     const int fd=::open(
         state.temporary_path.c_str(),
-        O_CREAT|O_TRUNC|O_RDWR|O_CLOEXEC,
+        O_CREAT|
+            (loaded_state ? 0 : O_TRUNC)|
+            O_RDWR|
+            O_CLOEXEC,
         0644);
     if(fd<0)
     {
@@ -503,6 +676,7 @@ bool initialize_transfer(
 <<'\n'
 <<"file_size="<<meta.file_size<<" bytes\n"
 <<"blocks="<<meta.total_blocks<<'\n'
+<<"recovered_blocks="<<state.received_count<<'\n'
 <<"expected_sha256="<<srcast::hex_digest(meta.sha256)<<'\n';
     return true;
 }
@@ -571,6 +745,9 @@ bool finalize_transfer(
     {
         throw std::runtime_error("rename failed: "+error.message());
     }
+
+    std::error_code remove_error;
+    std::filesystem::remove(state.state_path,remove_error);
 
     std::cout<<"COMPLETED output="<<state.output_path
 <<" duplicates="<<state.duplicate_count
@@ -1376,6 +1553,11 @@ int main(int argc,char** argv) try {
                             data.offset);
                         state.received[data.block_id]=1;
 ++state.received_count;
+                        if(::fsync(state.output.get())!=0)
+                        {
+                            system_error("fsync received block");
+                        }
+                        save_receiver_state(state);
 
                         if(draining)
                         {
