@@ -9,12 +9,14 @@
 #include<sys/epoll.h>
 #include<sys/socket.h>
 #include<sys/stat.h>
+#include<sys/statvfs.h>
 #include<unistd.h>
 
 #include<algorithm>
 #include<array>
 #include<cerrno>
 #include<chrono>
+#include<cstdlib>
 #include<cstdint>
 #include<cstring>
 #include<filesystem>
@@ -98,6 +100,50 @@ constexpr auto kMetaReadyTimeout=std::chrono::seconds(30);
 constexpr auto kReadyTimeout=std::chrono::seconds(10);
 constexpr std::uint32_t kSectionId=srcast::kSingleSectionId;
 constexpr std::size_t kMulticastRepairThreshold=2;
+constexpr std::uint32_t kDefaultSlowMissingThreshold=32;
+constexpr std::uint64_t kDiskSafetyMarginBytes=4 * 1024 * 1024;
+
+std::uint32_t slow_missing_threshold()
+{
+    const char*raw=std::getenv("SRCAST_SLOW_MISSING_THRESHOLD");
+    if(raw==nullptr||*raw=='\0')
+    {
+        return kDefaultSlowMissingThreshold;
+    }
+
+    char*end=nullptr;
+    errno=0;
+    const auto value=std::strtoul(raw,&end,10);
+    if(raw==end||*end!='\0'||errno==ERANGE||
+        value>std::numeric_limits<std::uint32_t>::max())
+        {
+        throw std::runtime_error(
+            "invalid SRCAST_SLOW_MISSING_THRESHOLD value");
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+void require_disk_space(
+    const std::string&directory,
+    std::uint64_t bytes_needed,
+    const std::string&label)
+    {
+
+    struct statvfs info {};
+    if(::statvfs(directory.c_str(),&info)!=0)
+    {
+        system_error("statvfs "+label);
+    }
+
+    const auto available=static_cast<std::uint64_t>(info.f_bavail) *
+        static_cast<std::uint64_t>(info.f_frsize);
+    const auto required=bytes_needed+kDiskSafetyMarginBytes;
+    if(available<required)
+    {
+        throw std::runtime_error(
+            label+" has insufficient disk space");
+    }
+}
 
 std::uint64_t create_transfer_id()
 {
@@ -408,6 +454,8 @@ struct ReceiverConnection
     bool complete_received{false};
     bool completed{false};
     bool ready_for_next_transfer{false};
+    bool isolated{false};
+    std::vector<std::uint32_t>backfill_blocks;
 
     std::optional<srcast::SectionStatusMessage>status;
 };
@@ -604,7 +652,7 @@ bool round_responses_complete(
 
     for(const auto&receiver : receivers)
     {
-        if(receiver.completed)
+        if(receiver.completed||receiver.isolated)
         {
             continue;
         }
@@ -822,7 +870,7 @@ void collect_round_reports(
             receivers,
             [](const ReceiverConnection&receiver)
             {
-                return!receiver.completed;
+                return!receiver.completed &&!receiver.isolated;
             },
             timeout_ms,
             "receiver reports");
@@ -849,13 +897,67 @@ void collect_round_reports(
 
     for(const auto&receiver : receivers)
     {
-        if(!receiver.completed &&!receiver.status_received)
-        {
+        if(!receiver.completed &&
+!receiver.isolated &&
+!receiver.status_received)
+            {
             std::cout<<"section="<<section_id
 <<" round="<<round_id
 <<" receiver_id="<<receiver.receiver_id
 <<" status=NO_REPORT\n";
         }
+    }
+}
+
+void isolate_slow_receivers(
+    std::vector<ReceiverConnection>&receivers,
+    std::uint32_t total_blocks,
+    std::uint32_t section_id,
+    std::uint32_t missing_threshold)
+    {
+
+    const auto first_block=srcast::section_first_block(section_id);
+    const auto section_blocks=srcast::section_block_count(
+        total_blocks,
+        section_id);
+
+    for(auto&receiver : receivers)
+    {
+        if(receiver.completed||
+            receiver.isolated||
+!receiver.status||
+            receiver.status->status!=srcast::SectionStatusCode::Missing||
+            receiver.status->missing_count<=missing_threshold)
+            {
+            continue;
+        }
+
+        for(std::uint32_t local_block=0;
+             local_block<section_blocks;
+++local_block)
+             {
+            if(srcast::bitmap_test(
+                    receiver.status->missing_bitmap,
+                    local_block))
+                    {
+                receiver.backfill_blocks.push_back(first_block+local_block);
+            }
+        }
+
+        std::sort(
+            receiver.backfill_blocks.begin(),
+            receiver.backfill_blocks.end());
+        receiver.backfill_blocks.erase(
+            std::unique(
+                receiver.backfill_blocks.begin(),
+                receiver.backfill_blocks.end()),
+            receiver.backfill_blocks.end());
+
+        receiver.isolated=true;
+        std::cout<<"receiver_id="<<receiver.receiver_id
+<<" isolated for TCP backfill missing_blocks="
+<<receiver.status->missing_count
+<<" section="<<section_id<<'\n';
     }
 }
 
@@ -875,7 +977,7 @@ std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
 ++receiver_index)
          {
         const auto&receiver=receivers[receiver_index];
-        if(receiver.completed||!receiver.status||
+        if(receiver.completed||receiver.isolated||!receiver.status||
             receiver.status->status!=srcast::SectionStatusCode::Missing)
             {
             continue;
@@ -923,7 +1025,7 @@ void send_end_round(
         {transfer_id,section_id,round_id,total_blocks});
     for(auto&receiver : receivers)
     {
-        if(!receiver.completed)
+        if(!receiver.completed &&!receiver.isolated)
         {
             send_control_frame(receiver.control_fd.get(),section_end);
         }
@@ -948,7 +1050,7 @@ void send_repair_round(
         {transfer_id,section_id,round_id});
     for(auto&receiver : receivers)
     {
-        if(!receiver.completed)
+        if(!receiver.completed &&!receiver.isolated)
         {
             send_control_frame(receiver.control_fd.get(),repair_begin);
         }
@@ -1061,6 +1163,7 @@ bool distribute_section(
     const auto section_blocks=srcast::section_block_count(
         total_blocks,
         section_id);
+    const auto missing_threshold=slow_missing_threshold();
 
     std::cout<<"sending section="<<section_id
 <<" blocks="<<section_blocks<<'\n';
@@ -1118,6 +1221,11 @@ bool distribute_section(
         file_size,
         total_blocks,
         digest);
+    isolate_slow_receivers(
+        receivers,
+        total_blocks,
+        section_id,
+        missing_threshold);
 
     for(int repair_round=1;
          repair_round<=max_repair_rounds &&
@@ -1131,6 +1239,7 @@ bool distribute_section(
             [](const ReceiverConnection&receiver)
             {
                 return receiver.completed||
+                    receiver.isolated||
                     (receiver.status &&
                      receiver.status->status==
                          srcast::SectionStatusCode::Complete);
@@ -1161,6 +1270,11 @@ bool distribute_section(
             file_size,
             total_blocks,
             digest);
+        isolate_slow_receivers(
+            receivers,
+            total_blocks,
+            section_id,
+            missing_threshold);
     }
 
     return std::all_of(
@@ -1169,6 +1283,7 @@ bool distribute_section(
         [](const ReceiverConnection&receiver)
         {
             return receiver.completed||
+                receiver.isolated||
                 (receiver.status &&
                  receiver.status->status==
                      srcast::SectionStatusCode::Complete);
@@ -1283,6 +1398,109 @@ void notify_failed_receivers(
     }
 }
 
+void backfill_isolated_receivers(
+    std::vector<ReceiverConnection>&receivers,
+    int input_fd,
+    const std::string&file_path,
+    std::uint64_t file_size,
+    std::uint64_t transfer_id,
+    std::uint32_t total_blocks,
+    const std::array<std::uint8_t,srcast::kSha256Size>&digest)
+    {
+
+    std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
+
+    for(auto&receiver : receivers)
+    {
+        if(!receiver.isolated||receiver.completed)
+        {
+            continue;
+        }
+
+        std::cout<<"TCP backfill receiver_id="
+<<receiver.receiver_id
+<<" blocks="<<receiver.backfill_blocks.size()
+<<'\n';
+
+        send_control_frame(
+            receiver.control_fd.get(),
+            srcast::encode_backfill_begin(
+                {transfer_id,total_blocks}));
+
+        for(const auto block_id : receiver.backfill_blocks)
+        {
+            std::uint64_t offset{};
+            std::uint16_t payload_size{};
+            read_block(
+                input_fd,
+                file_path,
+                file_size,
+                block_id,
+                buffer,
+                offset,
+                payload_size);
+
+            srcast::BackfillDataMessage data;
+            data.transfer_id=transfer_id;
+            data.block_id=block_id;
+            data.offset=offset;
+            data.payload_size=payload_size;
+            data.crc32=srcast::crc32(buffer.data(),payload_size);
+            data.payload.assign(
+                buffer.begin(),
+                buffer.begin()+payload_size);
+            send_control_frame(
+                receiver.control_fd.get(),
+                srcast::encode_backfill_data(data));
+        }
+
+        send_control_frame(
+            receiver.control_fd.get(),
+            srcast::encode_backfill_end(
+                {transfer_id,file_size,total_blocks,digest}));
+
+        for(;;)
+        {
+            const auto complete_frame=
+                receive_control_frame(receiver.control_fd.get());
+            const auto type=srcast::peek_control_type(complete_frame);
+            if(type==srcast::ControlType::SectionStatus)
+            {
+                std::cout<<"ignore stale SECTION_STATUS during TCP backfill"
+<<" receiver_id="<<receiver.receiver_id<<'\n';
+                continue;
+            }
+            if(type!=srcast::ControlType::ReceiverComplete)
+            {
+                throw std::runtime_error(
+                    "expected RECEIVER_COMPLETE after TCP backfill");
+            }
+
+            const auto complete=
+                srcast::decode_receiver_complete(complete_frame);
+            if(complete.receiver_id!=receiver.receiver_id||
+                complete.transfer_id!=transfer_id||
+                complete.file_size!=file_size||
+                complete.sha256!=digest)
+                {
+                throw std::runtime_error(
+                    "invalid RECEIVER_COMPLETE after TCP backfill");
+            }
+            break;
+        }
+
+        receiver.complete_received=true;
+        receiver.completed=true;
+        receiver.isolated=false;
+        send_control_frame(
+            receiver.control_fd.get(),
+            srcast::encode_complete_ack(
+                {receiver.receiver_id,transfer_id}));
+        std::cout<<"TCP backfill completed receiver_id="
+<<receiver.receiver_id<<'\n';
+    }
+}
+
 void send_central_status(
     int central_fd,
     std::uint64_t transfer_id,
@@ -1350,6 +1568,10 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
             "create central cache directory failed: "+
             directory_error.message());
     }
+    require_disk_space(
+        cache_directory,
+        meta.file_size,
+        "central cache directory");
 
     const auto final_path=
         (std::filesystem::path(cache_directory)/
@@ -1444,6 +1666,8 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         receiver.status_received=false;
         receiver.complete_received=false;
         receiver.ready_for_next_transfer=false;
+        receiver.isolated=false;
+        receiver.backfill_blocks.clear();
         receiver.status.reset();
     }
 
@@ -1660,6 +1884,21 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         std::error_code remove_error;
         std::filesystem::remove(checkpoint_path,remove_error);
 
+        FileDescriptor backfill_input(
+            ::open(final_path.c_str(),O_RDONLY|O_CLOEXEC));
+        if(backfill_input.get()<0)
+        {
+            system_error("open central cache for TCP backfill");
+        }
+        backfill_isolated_receivers(
+            receivers,
+            backfill_input.get(),
+            final_path,
+            meta.file_size,
+            meta.transfer_id,
+            meta.total_blocks,
+            actual_digest);
+
         send_central_status(
             central_fd,
             meta.transfer_id,
@@ -1859,6 +2098,18 @@ void send_file(
         system_error("open source file "+file_path);
     }
 
+    for(auto&receiver : receivers)
+    {
+        receiver.meta_ready=false;
+        receiver.completed=false;
+        receiver.status_received=false;
+        receiver.complete_received=false;
+        receiver.ready_for_next_transfer=false;
+        receiver.isolated=false;
+        receiver.backfill_blocks.clear();
+        receiver.status.reset();
+    }
+
     srcast::FileMetaMessage file_meta;
 
     file_meta.transfer_id=transfer_id;
@@ -1909,6 +2160,15 @@ void send_file(
             break;
         }
     }
+
+    backfill_isolated_receivers(
+        receivers,
+        input.get(),
+        file_path,
+        file_size,
+        transfer_id,
+        total_blocks,
+        digest);
 
     if(all_receivers_completed(receivers))
     {

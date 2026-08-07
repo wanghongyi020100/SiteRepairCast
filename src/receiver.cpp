@@ -7,6 +7,7 @@
 #include<sys/epoll.h>
 #include<sys/socket.h>
 #include<sys/stat.h>
+#include<sys/statvfs.h>
 #include<sys/timerfd.h>
 #include<unistd.h>
 
@@ -84,6 +85,29 @@ constexpr auto kDrainQuietPeriod=std::chrono::milliseconds(200);
 constexpr auto kDrainHardTimeout=std::chrono::seconds(1);
 constexpr std::size_t kMaxUdpPacketsPerBatch=256;
 constexpr auto kUdpBatchTimeBudget=std::chrono::milliseconds(2);
+constexpr std::uint64_t kDiskSafetyMarginBytes=4 * 1024 * 1024;
+
+void require_disk_space(
+    const std::string&directory,
+    std::uint64_t bytes_needed,
+    const std::string&label)
+    {
+
+    struct statvfs info {};
+    if(::statvfs(directory.c_str(),&info)!=0)
+    {
+        system_error("statvfs "+label);
+    }
+
+    const auto available=static_cast<std::uint64_t>(info.f_bavail) *
+        static_cast<std::uint64_t>(info.f_frsize);
+    const auto required=bytes_needed+kDiskSafetyMarginBytes;
+    if(available<required)
+    {
+        throw std::runtime_error(
+            label+" has insufficient disk space");
+    }
+}
 
 void write_all(int fd,const std::uint8_t*data,std::size_t size)
 {
@@ -1073,6 +1097,11 @@ void handle_control_message(
         meta.total_blocks=message.total_blocks;
         meta.sha256=message.sha256;
 
+        require_disk_space(
+            output_directory,
+            meta.file_size,
+            "receiver output directory");
+
         transfer.emplace();
 
 
@@ -1156,6 +1185,113 @@ void handle_control_message(
         }
         std::cout<<"repair section "<<message.section_id
 <<" round "<<message.round_id<<" begins\n";
+        return;
+    }
+
+    if(type==srcast::ControlType::BackfillBegin)
+    {
+        const auto message=srcast::decode_backfill_begin(frame);
+        if(!transfer||
+            transfer->meta.common.transfer_id!=message.transfer_id||
+            transfer->meta.total_blocks!=message.total_blocks||
+            transfer->awaiting_complete_ack)
+            {
+            return;
+        }
+        std::cout<<"TCP backfill begins\n";
+        return;
+    }
+
+    if(type==srcast::ControlType::BackfillData)
+    {
+        const auto message=srcast::decode_backfill_data(frame);
+        if(!transfer||
+            transfer->meta.common.transfer_id!=message.transfer_id||
+            transfer->awaiting_complete_ack||
+            message.block_id>=transfer->meta.total_blocks)
+            {
+            return;
+        }
+
+        const auto expected_offset=
+            static_cast<std::uint64_t>(message.block_id) *
+            transfer->meta.block_size;
+        const auto expected_size=
+            static_cast<std::uint16_t>(
+                std::min<std::uint64_t>(
+                    transfer->meta.block_size,
+                    transfer->meta.file_size-expected_offset));
+        if(message.offset!=expected_offset||
+            message.payload_size!=expected_size||
+            message.offset+message.payload_size>
+                transfer->meta.file_size||
+            srcast::crc32(
+                message.payload.data(),
+                message.payload.size())!=message.crc32)
+                {
+++transfer->rejected_count;
+            return;
+        }
+
+        if(transfer->received[message.block_id]==0)
+        {
+            write_all_at(
+                transfer->output.get(),
+                message.payload.data(),
+                message.payload.size(),
+                message.offset);
+            transfer->received[message.block_id]=1;
+++transfer->received_count;
+            if(::fsync(transfer->output.get())!=0)
+            {
+                system_error("fsync TCP backfill block");
+            }
+            save_receiver_state(*transfer);
+        }
+        return;
+    }
+
+    if(type==srcast::ControlType::BackfillEnd)
+    {
+        const auto message=srcast::decode_backfill_end(frame);
+        if(!transfer||
+            transfer->meta.common.transfer_id!=message.transfer_id||
+            transfer->meta.file_size!=message.file_size||
+            transfer->meta.total_blocks!=message.total_blocks||
+            transfer->meta.sha256!=message.sha256||
+            transfer->awaiting_complete_ack)
+            {
+            return;
+        }
+
+        std::array<std::uint8_t,srcast::kSha256Size>actual_digest{};
+        if(!finalize_transfer(*transfer,actual_digest))
+        {
+            send_section_status(
+                control_fd,
+                receiver_id,
+                *transfer,
+                transfer->active_section_id.value_or(0),
+                transfer->last_reported_round.value_or(0),
+                srcast::SectionStatusCode::Failed,
+                0,
+                {});
+            transfer->last_reported_round=
+                transfer->last_reported_round.value_or(0);
+            return;
+        }
+
+        srcast::ReceiverCompleteMessage complete;
+        complete.receiver_id=receiver_id;
+        complete.transfer_id=transfer->meta.common.transfer_id;
+        complete.file_size=transfer->meta.file_size;
+        complete.sha256=actual_digest;
+        send_control_frame(
+            control_fd,
+            srcast::encode_receiver_complete(complete));
+        transfer->awaiting_complete_ack=true;
+        std::cout
+<<"TCP backfill completed; waiting for COMPLETE_ACK\n";
         return;
     }
 

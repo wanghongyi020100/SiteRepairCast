@@ -16,7 +16,7 @@ namespace srcast
 {
 constexpr std::uint32_t kMagic=0x53524331U;
 constexpr std::uint32_t kControlMagic=0x53524343U;
-constexpr std::uint16_t kVersion=6;
+constexpr std::uint16_t kVersion=7;
 constexpr std::size_t kPayloadSize=1200;
 constexpr std::size_t kSha256Size=32;
 constexpr std::uint32_t kSingleSectionId=0;
@@ -357,6 +357,9 @@ enum class ControlType : std::uint16_t
     CentralStatus=15,
     CentralSessionEnd=16,
     CentralResume=17,
+    BackfillBegin=18,
+    BackfillData=19,
+    BackfillEnd=20,
 };
 
 enum class SectionStatusCode : std::uint16_t
@@ -496,6 +499,30 @@ struct CentralResumeMessage
     std::array<std::uint8_t,kSha256Size>sha256{};
 };
 
+struct BackfillBeginMessage
+{
+    std::uint64_t transfer_id{};
+    std::uint32_t total_blocks{};
+};
+
+struct BackfillDataMessage
+{
+    std::uint64_t transfer_id{};
+    std::uint32_t block_id{};
+    std::uint64_t offset{};
+    std::uint16_t payload_size{};
+    std::uint32_t crc32{};
+    std::vector<std::uint8_t>payload;
+};
+
+struct BackfillEndMessage
+{
+    std::uint64_t transfer_id{};
+    std::uint64_t file_size{};
+    std::uint32_t total_blocks{};
+    std::array<std::uint8_t,kSha256Size>sha256{};
+};
+
 inline void write_control_header(PacketWriter&writer,ControlType type)
 {
     writer.u32(kControlMagic);
@@ -518,7 +545,7 @@ inline ControlType read_control_header(PacketReader&reader)
         throw std::runtime_error("unsupported control protocol version");
     }
     if(raw_type<static_cast<std::uint16_t>(ControlType::Register)||
-        raw_type>static_cast<std::uint16_t>(ControlType::CentralResume))
+        raw_type>static_cast<std::uint16_t>(ControlType::BackfillEnd))
         {
         throw std::runtime_error("invalid control message type");
     }
@@ -1163,6 +1190,126 @@ inline CentralResumeMessage decode_central_resume(
     message.next_section_id=reader.u32();
     message.total_sections=reader.u32();
     message.file_size=reader.u64();
+    reader.bytes(message.sha256.data(),message.sha256.size());
+    return message;
+}
+
+inline std::vector<std::uint8_t>encode_backfill_begin(
+    const BackfillBeginMessage&message)
+    {
+
+    PacketWriter writer(20);
+    write_control_header(writer,ControlType::BackfillBegin);
+    writer.u64(message.transfer_id);
+    writer.u32(message.total_blocks);
+    return writer.data();
+}
+
+inline BackfillBeginMessage decode_backfill_begin(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()!=20)
+    {
+        throw std::runtime_error("invalid BACKFILL_BEGIN size");
+    }
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::BackfillBegin)
+    {
+        throw std::runtime_error("control message is not BACKFILL_BEGIN");
+    }
+
+    BackfillBeginMessage message;
+    message.transfer_id=reader.u64();
+    message.total_blocks=reader.u32();
+    return message;
+}
+
+inline std::vector<std::uint8_t>encode_backfill_data(
+    const BackfillDataMessage&message)
+    {
+
+    if(message.payload.size()>kPayloadSize||
+        message.payload.size()!=message.payload_size)
+        {
+        throw std::runtime_error("invalid BACKFILL_DATA payload size");
+    }
+
+    PacketWriter writer(36+message.payload.size());
+    write_control_header(writer,ControlType::BackfillData);
+    writer.u64(message.transfer_id);
+    writer.u32(message.block_id);
+    writer.u64(message.offset);
+    writer.u16(message.payload_size);
+    writer.u16(0);
+    writer.u32(message.crc32);
+    writer.bytes(message.payload.data(),message.payload.size());
+    return writer.data();
+}
+
+inline BackfillDataMessage decode_backfill_data(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()<36)
+    {
+        throw std::runtime_error("BACKFILL_DATA is too short");
+    }
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::BackfillData)
+    {
+        throw std::runtime_error("control message is not BACKFILL_DATA");
+    }
+
+    BackfillDataMessage message;
+    message.transfer_id=reader.u64();
+    message.block_id=reader.u32();
+    message.offset=reader.u64();
+    message.payload_size=reader.u16();
+    static_cast<void>(reader.u16());
+    message.crc32=reader.u32();
+    if(message.payload_size>kPayloadSize||
+        message.payload_size!=reader.remaining())
+        {
+        throw std::runtime_error("invalid BACKFILL_DATA payload length");
+    }
+
+    message.payload.resize(message.payload_size);
+    reader.bytes(message.payload.data(),message.payload.size());
+    return message;
+}
+
+inline std::vector<std::uint8_t>encode_backfill_end(
+    const BackfillEndMessage&message)
+    {
+
+    PacketWriter writer(60);
+    write_control_header(writer,ControlType::BackfillEnd);
+    writer.u64(message.transfer_id);
+    writer.u64(message.file_size);
+    writer.u32(message.total_blocks);
+    writer.bytes(message.sha256.data(),message.sha256.size());
+    return writer.data();
+}
+
+inline BackfillEndMessage decode_backfill_end(
+    const std::vector<std::uint8_t>&frame)
+    {
+
+    if(frame.size()!=60)
+    {
+        throw std::runtime_error("invalid BACKFILL_END size");
+    }
+    PacketReader reader(frame.data(),frame.size());
+    if(read_control_header(reader)!=ControlType::BackfillEnd)
+    {
+        throw std::runtime_error("control message is not BACKFILL_END");
+    }
+
+    BackfillEndMessage message;
+    message.transfer_id=reader.u64();
+    message.file_size=reader.u64();
+    message.total_blocks=reader.u32();
     reader.bytes(message.sha256.data(),message.sha256.size());
     return message;
 }
