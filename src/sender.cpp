@@ -123,6 +123,58 @@ std::uint32_t slow_missing_threshold()
     return static_cast<std::uint32_t>(value);
 }
 
+std::unordered_set<std::uint32_t>parse_block_set_env(
+    const char*name)
+    {
+
+    std::unordered_set<std::uint32_t>blocks;
+    const char*raw=std::getenv(name);
+    if(raw==nullptr||*raw=='\0')
+    {
+        return blocks;
+    }
+
+    const char*cursor=raw;
+    while(*cursor!='\0')
+    {
+        char*end=nullptr;
+        errno=0;
+        const auto value=std::strtoul(cursor,&end,10);
+        if(cursor==end||errno==ERANGE||
+            value>std::numeric_limits<std::uint32_t>::max())
+            {
+            throw std::runtime_error(std::string("invalid ")+name+" value");
+        }
+        blocks.insert(static_cast<std::uint32_t>(value));
+
+        if(*end=='\0')
+        {
+            break;
+        }
+        if(*end!=',')
+        {
+            throw std::runtime_error(
+                std::string(name)+" must be a comma-separated list");
+        }
+        cursor=end+1;
+        if(*cursor=='\0')
+        {
+            throw std::runtime_error(
+                std::string(name)+" has a trailing comma");
+        }
+    }
+
+    return blocks;
+}
+
+bool env_flag_enabled(const char*name)
+{
+    const char*raw=std::getenv(name);
+    return raw!=nullptr &&
+        *raw!='\0' &&
+        std::string(raw)!="0";
+}
+
 void require_disk_space(
     const std::string&directory,
     std::uint64_t bytes_needed,
@@ -514,6 +566,22 @@ FileDescriptor create_control_listener(int control_port)
     return listener;
 }
 
+void set_receive_timeout(int fd,std::chrono::seconds timeout)
+{
+    timeval value{};
+    value.tv_sec=timeout.count();
+    value.tv_usec=0;
+    if(::setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &value,
+            sizeof(value))!=0)
+            {
+        system_error("setsockopt SO_RCVTIMEO");
+    }
+}
+
 std::vector<ReceiverConnection>accept_receivers(
     int listener_fd,
     std::size_t expected_receivers)
@@ -548,8 +616,10 @@ std::vector<ReceiverConnection>accept_receivers(
         try
         {
             FileDescriptor control_fd(accepted);
+            set_receive_timeout(control_fd.get(),std::chrono::seconds(2));
             const auto frame=receive_control_frame(control_fd.get());
             const auto registration=srcast::decode_register(frame);
+            set_receive_timeout(control_fd.get(),std::chrono::seconds(0));
 
             if(registration.receiver_id==0)
             {
@@ -585,8 +655,9 @@ std::vector<ReceiverConnection>accept_receivers(
 <<" address="<<address<<':'
 <<registration.udp_port<<'\n';
             receivers.push_back(std::move(receiver));
-        } catch(...) {
-            throw;
+        } catch(const std::exception&error) {
+            std::cerr<<"rejected receiver registration: "
+<<error.what()<<'\n';
         }
     }
 
@@ -1164,14 +1235,37 @@ bool distribute_section(
         total_blocks,
         section_id);
     const auto missing_threshold=slow_missing_threshold();
+    const auto duplicate_blocks=
+        parse_block_set_env("SRCAST_DUPLICATE_DATA_BLOCKS");
+    const auto corrupt_blocks=
+        parse_block_set_env("SRCAST_CORRUPT_DATA_BLOCKS");
+    const bool reverse_initial_data=
+        env_flag_enabled("SRCAST_REVERSE_INITIAL_DATA");
 
     std::cout<<"sending section="<<section_id
 <<" blocks="<<section_blocks<<'\n';
 
+    if(reverse_initial_data)
+    {
+        std::cout<<"fault injection reversed DATA section="
+<<section_id<<'\n';
+    }
+
+    std::vector<std::uint32_t>local_blocks;
+    local_blocks.reserve(section_blocks);
     for(std::uint32_t local_block=0;
          local_block<section_blocks;
 ++local_block)
          {
+        local_blocks.push_back(local_block);
+    }
+    if(reverse_initial_data)
+    {
+        std::reverse(local_blocks.begin(),local_blocks.end());
+    }
+
+    for(const auto local_block : local_blocks)
+    {
         const auto block_id=first_block+local_block;
         std::uint64_t offset{};
         std::uint16_t payload_size{};
@@ -1193,7 +1287,26 @@ bool distribute_section(
             payload_size,
             srcast::crc32(buffer.data(),payload_size));
 
-        send_udp_packet(udp_fd,multicast_destination,packet);
+        if(corrupt_blocks.find(block_id)!=corrupt_blocks.end() &&
+!packet.empty())
+            {
+            auto corrupted=packet;
+            corrupted.back()^=0xffU;
+            send_udp_packet(udp_fd,multicast_destination,corrupted);
+            std::cout<<"fault injection corrupted DATA block_id="
+<<block_id<<'\n';
+        }
+        else
+        {
+            send_udp_packet(udp_fd,multicast_destination,packet);
+        }
+
+        if(duplicate_blocks.find(block_id)!=duplicate_blocks.end())
+        {
+            send_udp_packet(udp_fd,multicast_destination,packet);
+            std::cout<<"fault injection duplicated DATA block_id="
+<<block_id<<'\n';
+        }
 
         if(pace_us>0)
         {
@@ -2197,6 +2310,9 @@ void send_file(
 }
 
 int main(int argc,char** argv) try {
+    std::cout<<std::unitbuf;
+    std::cerr<<std::unitbuf;
+
     if(argc<10)
     {
         usage(argv[0]);

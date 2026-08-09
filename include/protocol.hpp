@@ -590,18 +590,6 @@ inline std::vector<std::uint8_t>encode_file_meta(
     const FileMetaMessage&message)
     {
 
-
-
-
-
-
-
-
-
-
-
-
-
     PacketWriter writer(68);
 
     write_control_header(
@@ -660,8 +648,6 @@ inline FileMetaMessage decode_file_meta(
 inline std::vector<std::uint8_t>encode_meta_ready(
     const MetaReadyMessage&message)
     {
-
-
 
     PacketWriter writer(24);
 
