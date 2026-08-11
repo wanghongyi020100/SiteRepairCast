@@ -10,7 +10,6 @@
 #include<sys/statvfs.h>
 #include<sys/timerfd.h>
 #include<unistd.h>
-
 #include<algorithm>
 #include<array>
 #include<cerrno>
@@ -28,13 +27,12 @@
 #include<string>
 #include<unordered_set>
 #include<vector>
-
 namespace
 {
 class FileDescriptor
 {
 public:
-    explicit FileDescriptor(int fd=-1):fd_(fd) {}
+    explicit FileDescriptor(int fd=-1):fd_(fd){}
     ~FileDescriptor()
     {
         if(fd_>=0)
@@ -45,13 +43,13 @@ public:
 
     FileDescriptor(const FileDescriptor&)=delete;
     FileDescriptor&operator=(const FileDescriptor&)=delete;
-
-    FileDescriptor(FileDescriptor&&other)noexcept : fd_(other.fd_)
+    FileDescriptor(FileDescriptor&&other)noexcept:fd_(other.fd_)
     {
         other.fd_=-1;
     }
 
-    FileDescriptor&operator=(FileDescriptor&&other)noexcept {
+    FileDescriptor&operator=(FileDescriptor&&other)noexcept
+    {
         if(this!=&other)
         {
             reset(other.fd_);
@@ -60,7 +58,7 @@ public:
         return *this;
     }
 
-    int get()const { return fd_; }
+    int get()const{return fd_;}
 
     void reset(int fd)
     {
@@ -74,38 +72,91 @@ public:
 private:
     int fd_;
 };
-
 [[noreturn]] void system_error(const std::string&operation)
 {
     throw std::runtime_error(operation+": "+std::strerror(errno));
 }
 
-using SteadyClock=std::chrono::steady_clock;
-constexpr auto kDrainQuietPeriod=std::chrono::milliseconds(200);
-constexpr auto kDrainHardTimeout=std::chrono::seconds(1);
-constexpr std::size_t kMaxUdpPacketsPerBatch=256;
-constexpr auto kUdpBatchTimeBudget=std::chrono::milliseconds(2);
-constexpr std::uint64_t kDiskSafetyMarginBytes=4 * 1024 * 1024;
-
+using SteadyClock=std::chrono::steady_clock;constexpr auto kDrainQuietPeriod=std::chrono::milliseconds(200);constexpr auto kDrainHardTimeout=std::chrono::seconds(1);constexpr std::size_t kMaxUdpPacketsPerBatch=256;constexpr auto kUdpBatchTimeBudget=std::chrono::milliseconds(2);constexpr std::uint64_t kDiskSafetyMarginBytes=4*1024*1024;
 void require_disk_space(
     const std::string&directory,
     std::uint64_t bytes_needed,
     const std::string&label)
     {
 
-    struct statvfs info {};
-    if(::statvfs(directory.c_str(),&info)!=0)
-    {
-        system_error("statvfs "+label);
-    }
+    struct statvfs info {};    if(::statvfs(directory.c_str(),&info)!=0)
+    {system_error("statvfs "+label);}
 
-    const auto available=static_cast<std::uint64_t>(info.f_bavail) *
-        static_cast<std::uint64_t>(info.f_frsize);
+    const auto available=static_cast<std::uint64_t>(info.f_bavail)*static_cast<std::uint64_t>(info.f_frsize);
     const auto required=bytes_needed+kDiskSafetyMarginBytes;
     if(available<required)
     {
         throw std::runtime_error(
             label+" has insufficient disk space");
+    }
+}
+
+std::uint64_t storage_limit(const char*name)
+{
+    const char*raw=std::getenv(name);
+    if(raw==nullptr||*raw=='\0')
+    {return 0;}
+
+    char*end=nullptr;
+    errno=0;
+    const auto value=std::strtoull(raw,&end,10);
+    if(raw==end||*end!='\0'||errno==ERANGE)
+    {
+        throw std::runtime_error(std::string("invalid ")+name+" value");
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
+std::uint64_t directory_usage(const std::string&directory)
+{
+    std::uint64_t total=0;
+    std::error_code error;
+    for(const auto&entry:
+        std::filesystem::recursive_directory_iterator(directory,error))
+    {
+        if(error)
+        {
+            throw std::runtime_error(
+                "scan storage directory failed: "+error.message());
+        }
+        if(!entry.is_regular_file(error))
+        {
+            if(error)
+            {throw std::runtime_error("stat storage file failed: "+error.message());}
+            continue;
+        }
+        const auto size=entry.file_size(error);
+        if(error||size>std::numeric_limits<std::uint64_t>::max()-total)
+        {
+            throw std::runtime_error("storage usage is too large");
+        }
+        total+=size;
+    }
+    if(error)
+    {throw std::runtime_error("scan storage directory failed: "+error.message());}
+    return total;
+}
+
+void require_storage_limit(
+    const std::string&directory,
+    std::uint64_t additional,
+    const char*limit_name,
+    const std::string&label)
+{
+    const auto limit=storage_limit(limit_name);
+    if(limit==0)
+    {return;}
+
+    const auto used=directory_usage(directory);
+    if(used>limit||additional>limit-used)
+    {
+        throw std::runtime_error(
+            label+" exceeds "+limit_name);
     }
 }
 
@@ -187,7 +238,6 @@ public:
 
         std::vector<std::vector<std::uint8_t>>frames;
         std::size_t consumed=0;
-
         while(buffer_.size()-consumed>=sizeof(std::uint32_t))
         {
             std::uint32_t network_size{};
@@ -226,13 +276,12 @@ public:
         return frames;
     }
 
-    [[nodiscard]] bool peer_closed()const { return peer_closed_; }
+    [[nodiscard]] bool peer_closed()const{return peer_closed_;}
 
 private:
     std::vector<std::uint8_t>buffer_;
     bool peer_closed_{false};
 };
-
 void arm_timer_after(int timer_fd,SteadyClock::duration delay)
 {
     auto remaining=std::chrono::duration_cast<std::chrono::nanoseconds>(delay);
@@ -246,15 +295,11 @@ void arm_timer_after(int timer_fd,SteadyClock::duration delay)
     const auto nanoseconds=
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             remaining-seconds);
-
     itimerspec specification{};
     specification.it_value.tv_sec=static_cast<time_t>(seconds.count());
     specification.it_value.tv_nsec=static_cast<long>(nanoseconds.count());
-
     if(::timerfd_settime(timer_fd,0,&specification,nullptr)!=0)
-    {
-        system_error("timerfd_settime");
-    }
+    {system_error("timerfd_settime");}
 }
 
 void arm_drain_timer(int timer_fd,SteadyClock::time_point hard_deadline)
@@ -270,7 +315,6 @@ void arm_drain_timer(int timer_fd,SteadyClock::time_point hard_deadline)
 bool consume_timer_expiration(int timer_fd)
 {
     std::uint64_t expirations{};
-
     for(;;)
     {
         const auto count=::read(
@@ -278,21 +322,15 @@ bool consume_timer_expiration(int timer_fd)
             &expirations,
             sizeof(expirations));
         if(count==static_cast<ssize_t>(sizeof(expirations)))
-        {
-            return true;
-        }
-        if(count<0 && errno==EINTR)
+        {return true;}
+        if(count<0&&errno==EINTR)
         {
             continue;
         }
-        if(count<0 && errno==EAGAIN)
-        {
-            return false;
-        }
+        if(count<0&&errno==EAGAIN)
+        {return false;}
         if(count<0)
-        {
-            system_error("read timerfd");
-        }
+        {system_error("read timerfd");}
         throw std::runtime_error("short timerfd read");
     }
 }
@@ -301,9 +339,7 @@ void disarm_timer(int timer_fd)
 {
     itimerspec specification{};
     if(::timerfd_settime(timer_fd,0,&specification,nullptr)!=0)
-    {
-        system_error("timerfd_settime disarm");
-    }
+    {system_error("timerfd_settime disarm");}
 }
 
 void add_epoll_interest(int epoll_fd,int fd)
@@ -311,11 +347,8 @@ void add_epoll_interest(int epoll_fd,int fd)
     epoll_event event{};
     event.events=EPOLLIN;
     event.data.fd=fd;
-
     if(::epoll_ctl(epoll_fd,EPOLL_CTL_ADD,fd,&event)!=0)
-    {
-        system_error("epoll_ctl EPOLL_CTL_ADD");
-    }
+    {system_error("epoll_ctl EPOLL_CTL_ADD");}
 }
 
 void write_all_at(
@@ -369,9 +402,7 @@ FileDescriptor connect_control(
         SOCK_STREAM|SOCK_CLOEXEC,
         0));
     if(control_fd.get()<0)
-    {
-        system_error("socket TCP control");
-    }
+    {system_error("socket TCP control");}
 
     sockaddr_in proxy{};
     proxy.sin_family=AF_INET;
@@ -423,19 +454,17 @@ struct TransferState
 };
 
 std::string received_state_path(const std::string&output_path)
-{
-    return output_path+".state";
-}
+{return output_path+".state";}
 
 std::string hex_bytes(const std::vector<std::uint8_t>&bytes)
 {
     static constexpr char digits[]="0123456789abcdef";
     std::string result;
-    result.reserve(bytes.size() * 2U);
-    for(const auto byte : bytes)
+    result.reserve(bytes.size()*2U);
+    for(const auto byte:bytes)
     {
-        result.push_back(digits[(byte>>4U) & 0x0fU]);
-        result.push_back(digits[byte & 0x0fU]);
+        result.push_back(digits[(byte>>4U)&0x0fU]);
+        result.push_back(digits[byte&0x0fU]);
     }
     return result;
 }
@@ -445,35 +474,24 @@ std::optional<std::vector<std::uint8_t>>parse_hex_bytes(
     {
 
     if(hex.size()%2U!=0U)
-    {
-        return std::nullopt;
-    }
+    {return std::nullopt;}
 
     auto value_of=[](char ch)->int {
-        if(ch>='0' && ch<='9')
-        {
-            return ch-'0';
-        }
-        if(ch>='a' && ch<='f')
-        {
-            return ch-'a'+10;
-        }
-        if(ch>='A' && ch<='F')
-        {
-            return ch-'A'+10;
-        }
+        if(ch>='0'&&ch<='9')
+        {return ch-'0';}
+        if(ch>='a'&&ch<='f')
+        {return ch-'a'+10;}
+        if(ch>='A'&&ch<='F')
+        {return ch-'A'+10;}
         return-1;
     };
-
     std::vector<std::uint8_t>bytes(hex.size()/2U);
-    for(std::size_t index=0; index<bytes.size();++index)
+    for(std::size_t index=0;index<bytes.size();index++)
     {
-        const auto high=value_of(hex[index * 2U]);
-        const auto low=value_of(hex[index * 2U+1U]);
+        const auto high=value_of(hex[index*2U]);
+        const auto low=value_of(hex[index*2U+1U]);
         if(high<0||low<0)
-        {
-            return std::nullopt;
-        }
+        {return std::nullopt;}
         bytes[index]=static_cast<std::uint8_t>(
             (high<<4U)|low);
     }
@@ -485,25 +503,18 @@ bool load_receiver_state(
     const srcast::MetaPacket&meta)
     {
 
-    if(!std::filesystem::exists(state.state_path)||
-!std::filesystem::exists(state.temporary_path))
-        {
-        return false;
-    }
+    if(!std::filesystem::exists(state.state_path)||!std::filesystem::exists(state.temporary_path))
+        {return false;}
 
     std::error_code size_error;
     const auto temporary_size=
         std::filesystem::file_size(state.temporary_path,size_error);
     if(size_error||temporary_size!=meta.file_size)
-    {
-        return false;
-    }
+    {return false;}
 
     std::ifstream input(state.state_path);
     if(!input)
-    {
-        return false;
-    }
+    {return false;}
 
     std::string magic;
     int version=0;
@@ -513,7 +524,6 @@ bool load_receiver_state(
     std::uint32_t received_count=0;
     std::string digest_hex;
     std::string received_hex;
-
     input>>magic>>version
 >>transfer_id
 >>file_size
@@ -521,27 +531,15 @@ bool load_receiver_state(
 >>digest_hex
 >>received_count
 >>received_hex;
-
     auto received=parse_hex_bytes(received_hex);
-    if(!input||
-!received||
-        magic!="SRC_RECEIVER_STATE"||
-        version!=1||
-        transfer_id!=meta.common.transfer_id||
-        file_size!=meta.file_size||
-        total_blocks!=meta.total_blocks||
-        digest_hex!=srcast::hex_digest(meta.sha256)||
-        received->size()!=meta.total_blocks)
-        {
-        return false;
-    }
+    if(!input||!received||magic!="SRC_RECEIVER_STATE"||
+        version!=1||transfer_id!=meta.common.transfer_id||file_size!=meta.file_size||total_blocks!=meta.total_blocks||digest_hex!=srcast::hex_digest(meta.sha256)||received->size()!=meta.total_blocks)
+        {return false;}
 
     const auto counted=static_cast<std::uint32_t>(
         std::count(received->begin(),received->end(),1));
     if(counted!=received_count)
-    {
-        return false;
-    }
+    {return false;}
 
     state.received=std::move(*received);
     state.received_count=received_count;
@@ -592,9 +590,7 @@ std::unordered_set<std::uint32_t>parse_initial_drop_blocks()
     std::unordered_set<std::uint32_t>blocks;
     const char*raw=std::getenv("SRCAST_DROP_INITIAL_BLOCKS");
     if(raw==nullptr||*raw=='\0')
-    {
-        return blocks;
-    }
+    {return blocks;}
 
     const char*cursor=raw;
     while(*cursor!='\0')
@@ -602,14 +598,12 @@ std::unordered_set<std::uint32_t>parse_initial_drop_blocks()
         char*end=nullptr;
         errno=0;
         const auto value=std::strtoul(cursor,&end,10);
-        if(cursor==end||errno==ERANGE||
-            value>std::numeric_limits<std::uint32_t>::max())
+        if(cursor==end||errno==ERANGE||value>std::numeric_limits<std::uint32_t>::max())
             {
             throw std::runtime_error(
                 "invalid SRCAST_DROP_INITIAL_BLOCKS value");
         }
         blocks.insert(static_cast<std::uint32_t>(value));
-
         if(*end=='\0')
         {
             break;
@@ -644,20 +638,15 @@ bool initialize_transfer(
 
     const auto expected_blocks64=
         (meta.file_size+meta.block_size-1)/meta.block_size;
-    if(expected_blocks64>std::numeric_limits<std::uint32_t>::max()||
-        static_cast<std::uint32_t>(expected_blocks64)!=meta.total_blocks)
+    if(expected_blocks64>std::numeric_limits<std::uint32_t>::max()||static_cast<std::uint32_t>(expected_blocks64)!=meta.total_blocks)
         {
         std::cerr<<"reject META: inconsistent file size and block count\n";
         return false;
     }
 
     state.meta=meta;
-
     const auto generated_name=
-        std::string("transfer-")+
-        std::to_string(meta.common.transfer_id)+
-        ".bin";
-
+        std::string("transfer-")+std::to_string(meta.common.transfer_id)+".bin";
     state.output_path=
         (std::filesystem::path(output_directory)/generated_name).string();
     state.temporary_path=state.output_path+".part";
@@ -672,27 +661,18 @@ bool initialize_transfer(
     state.last_reported_round.reset();
     state.awaiting_complete_ack=false;
     state.intentionally_dropped_blocks.clear();
-
     const bool loaded_state=load_receiver_state(state,meta);
     const int fd=::open(
         state.temporary_path.c_str(),
-        O_CREAT|
-            (loaded_state ? 0 : O_TRUNC)|
-            O_RDWR|
-            O_CLOEXEC,
+        O_CREAT|(loaded_state?0:O_TRUNC)|O_RDWR|O_CLOEXEC,
         0644);
     if(fd<0)
-    {
-        system_error("open temporary output");
-    }
+    {system_error("open temporary output");}
     state.output.reset(fd);
-
     if(::ftruncate(
             state.output.get(),
             static_cast<off_t>(meta.file_size))!=0)
-            {
-        system_error("ftruncate");
-    }
+            {system_error("ftruncate");}
 
     std::cout
 <<"accepted transfer_id="<<meta.common.transfer_id<<'\n'
@@ -719,16 +699,15 @@ std::vector<std::uint8_t>make_missing_bitmap(
         srcast::bitmap_size_for_blocks(section_blocks),
         0);
     missing_count=0;
-
     for(std::uint32_t local_block=0;
          local_block<section_blocks;
-++local_block)
+         local_block++)
          {
         const auto block_id=first_block+local_block;
         if(state.received[block_id]==0)
         {
             srcast::bitmap_set(bitmap,local_block);
-++missing_count;
+            missing_count++;
         }
     }
     return bitmap;
@@ -740,18 +719,13 @@ bool finalize_transfer(
     {
 
     if(state.received_count!=state.meta.total_blocks)
-    {
-        return false;
-    }
+    {return false;}
     if(::fsync(state.output.get())!=0)
-    {
-        system_error("fsync temporary output");
-    }
+    {system_error("fsync temporary output");}
 
     actual_digest=srcast::sha256_file(state.temporary_path);
     std::cout<<"actual_sha256="
 <<srcast::hex_digest(actual_digest)<<'\n';
-
     if(actual_digest!=state.meta.sha256)
     {
         std::cerr<<"final SHA-256 mismatch; temporary file retained at "
@@ -772,7 +746,6 @@ bool finalize_transfer(
 
     std::error_code remove_error;
     std::filesystem::remove(state.state_path,remove_error);
-
     std::cout<<"COMPLETED output="<<state.output_path
 <<" duplicates="<<state.duplicate_count
 <<" intentional_drops="<<state.intentional_drop_count
@@ -799,7 +772,6 @@ void send_section_status(
     message.status=status;
     message.missing_count=missing_count;
     message.missing_bitmap=std::move(missing_bitmap);
-
     send_control_frame(
         control_fd,
         srcast::encode_section_status(message));
@@ -822,11 +794,9 @@ void finish_drain_and_report(
         state,
         section_id,
         missing_count);
-
     std::cout<<"DATA quiet period finished; round="<<round_id
 <<" section="<<section_id
 <<" missing_blocks="<<missing_count<<'\n';
-
     if(missing_count!=0)
     {
         send_section_status(
@@ -884,7 +854,6 @@ void finish_drain_and_report(
         srcast::SectionStatusCode::Complete,
         0,
         {});
-
     srcast::ReceiverCompleteMessage complete;
     complete.receiver_id=receiver_id;
     complete.transfer_id=state.meta.common.transfer_id;
@@ -893,7 +862,6 @@ void finish_drain_and_report(
     send_control_frame(
         control_fd,
         srcast::encode_receiver_complete(complete));
-
     state.last_reported_round=round_id;
     state.awaiting_complete_ack=true;
     std::cout<<"completion confirmation sent; waiting for COMPLETE_ACK\n";
@@ -906,21 +874,15 @@ bool should_drop_initial_block_for_test(
     {
 
     if(configured_blocks.empty()||state.last_end_round)
-    {
-        return false;
-    }
+    {return false;}
     if(configured_blocks.find(block_id)==configured_blocks.end())
-    {
-        return false;
-    }
+    {return false;}
 
     const auto inserted=state.intentionally_dropped_blocks.insert(block_id);
     if(!inserted.second)
-    {
-        return false;
-    }
+    {return false;}
 
-++state.intentional_drop_count;
+    state.intentional_drop_count++;
     std::cout<<"test hook dropped initial DATA block_id="
 <<block_id<<'\n';
     return true;
@@ -937,10 +899,9 @@ void begin_drain_for_round(
     SteadyClock::time_point&hard_deadline)
     {
 
-    if(state.awaiting_complete_ack||
-        total_blocks!=state.meta.total_blocks)
+    if(state.awaiting_complete_ack||total_blocks!=state.meta.total_blocks)
         {
-++state.rejected_count;
+        state.rejected_count++;
         return;
     }
     try
@@ -949,16 +910,15 @@ void begin_drain_for_round(
             srcast::section_block_count(
                 state.meta.total_blocks,
                 section_id));
-    } catch(const std::exception&) {
-++state.rejected_count;
+    }catch(const std::exception&)
+    {
+        state.rejected_count++;
         return;
     }
 
-    if(!state.active_section_id||
-        section_id!=*state.active_section_id)
+    if(!state.active_section_id||section_id!=*state.active_section_id)
         {
-        if(state.active_section_id &&
-            section_id<*state.active_section_id)
+        if(state.active_section_id&&section_id<*state.active_section_id)
             {
             return;
         }
@@ -966,18 +926,15 @@ void begin_drain_for_round(
         state.last_end_round.reset();
         state.last_reported_round.reset();
     }
-    if(state.last_reported_round &&
-        round_id<=*state.last_reported_round)
+    if(state.last_reported_round&&round_id<=*state.last_reported_round)
         {
         return;
     }
-    if(state.last_end_round &&
-        round_id<*state.last_end_round)
+    if(state.last_end_round&&round_id<*state.last_end_round)
         {
         return;
     }
-    if(state.last_end_round &&
-        round_id==*state.last_end_round && draining)
+    if(state.last_end_round&&round_id==*state.last_end_round&&draining)
         {
         return;
     }
@@ -987,7 +944,6 @@ void begin_drain_for_round(
     draining=true;
     hard_deadline=SteadyClock::now()+kDrainHardTimeout;
     arm_drain_timer(drain_timer_fd,hard_deadline);
-
     std::cout<<"SECTION_END received section="<<section_id
 <<" round="<<round_id
 <<"; waiting for 200ms DATA quiet period"
@@ -1008,7 +964,6 @@ void handle_control_message(
     {
 
     const auto type=srcast::peek_control_type(frame);
-
     if(type==srcast::ControlType::SessionEnd)
     {
         srcast::decode_session_end(frame);
@@ -1031,24 +986,16 @@ void handle_control_message(
                 "unsupported FILE_META section_id");
         }
 
-        if(message.block_size!=
-            srcast::kPayloadSize)
+        if(message.block_size!=srcast::kPayloadSize)
             {
             throw std::runtime_error(
                 "unsupported FILE_META block size");
         }
 
         const auto expected_blocks64=
-            (message.file_size+
-            message.block_size-1)/
-            message.block_size;
-
-        if(expected_blocks64>
-                std::numeric_limits<
-                    std::uint32_t>::max()||
-            static_cast<std::uint32_t>(
-                expected_blocks64)!=
-                message.total_blocks)
+            (message.file_size+message.block_size-1)/message.block_size;
+        if(expected_blocks64>std::numeric_limits<std::uint32_t>::max()||static_cast<std::uint32_t>(
+                expected_blocks64)!=message.total_blocks)
                 {
 
             throw std::runtime_error(
@@ -1057,8 +1004,7 @@ void handle_control_message(
 
         if(transfer)
         {
-            if(transfer->meta.common.transfer_id==
-                message.transfer_id)
+            if(transfer->meta.common.transfer_id==message.transfer_id)
                 {
 
                 send_control_frame(
@@ -1067,7 +1013,6 @@ void handle_control_message(
                         receiver_id,
                         message.transfer_id
                     }));
-
                 return;
             }
 
@@ -1077,68 +1022,78 @@ void handle_control_message(
         }
 
         srcast::MetaPacket meta;
-
         meta.common={
             srcast::PacketType::Meta,
             message.transfer_id
         };
-
         meta.file_size=message.file_size;
         meta.block_size=message.block_size;
         meta.total_blocks=message.total_blocks;
         meta.sha256=message.sha256;
-
+        const auto output_name=(std::filesystem::path(output_directory)/
+            ("transfer-"+std::to_string(meta.common.transfer_id)+".bin")).string();
+        std::uint64_t existing_size=0;
+        std::error_code existing_error;
+        const auto temporary_name=output_name+".part";
+        if(std::filesystem::exists(temporary_name,existing_error))
+        {
+            existing_size=std::filesystem::file_size(temporary_name,existing_error);
+        }
+        if(existing_error)
+        {
+            throw std::runtime_error(
+                "stat receiver temporary file failed: "+existing_error.message());
+        }
+        const auto additional=existing_size<meta.file_size?
+            meta.file_size-existing_size:0;
+        require_storage_limit(
+            output_directory,
+            additional,
+            "SRCAST_OUTPUT_LIMIT_BYTES",
+            "receiver output directory");
         require_disk_space(
             output_directory,
             meta.file_size,
             "receiver output directory");
-
         transfer.emplace();
-
         if(!initialize_transfer(
-                *transfer,
+*transfer,
                 meta,
                 output_directory))
                 {
 
             transfer.reset();
-
             throw std::runtime_error(
                 "failed to initialize FILE_META");
         }
 
         disarm_timer(drain_timer_fd);
-
         static_cast<void>(
             consume_timer_expiration(
                 drain_timer_fd));
-
         draining=false;
-
         send_control_frame(
             control_fd,
             srcast::encode_meta_ready({
                 receiver_id,
                 message.transfer_id
             }));
-
         std::cout
-<<"FILE_META accepted; "
+<<"FILE_META accepted;"
 <<"META_READY sent\n";
-
         return;
     }
 
     if(type==srcast::ControlType::SectionEnd)
     {
+
         const auto message=srcast::decode_section_end(frame);
-        if(!transfer||
-            transfer->meta.common.transfer_id!=message.transfer_id)
+        if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id)
             {
             return;
         }
         begin_drain_for_round(
-            *transfer,
+*transfer,
             message.section_id,
             message.round_id,
             message.total_blocks,
@@ -1151,10 +1106,9 @@ void handle_control_message(
 
     if(type==srcast::ControlType::RepairBegin)
     {
+
         const auto message=srcast::decode_repair_begin(frame);
-        if(!transfer||
-            transfer->meta.common.transfer_id!=message.transfer_id||
-            transfer->awaiting_complete_ack)
+        if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||transfer->awaiting_complete_ack)
             {
             return;
         }
@@ -1164,7 +1118,8 @@ void handle_control_message(
                 srcast::section_block_count(
                     transfer->meta.total_blocks,
                     message.section_id));
-        } catch(const std::exception&) {
+        }catch(const std::exception&)
+        {
             return;
         }
         std::cout<<"repair section "<<message.section_id
@@ -1174,11 +1129,9 @@ void handle_control_message(
 
     if(type==srcast::ControlType::BackfillBegin)
     {
+
         const auto message=srcast::decode_backfill_begin(frame);
-        if(!transfer||
-            transfer->meta.common.transfer_id!=message.transfer_id||
-            transfer->meta.total_blocks!=message.total_blocks||
-            transfer->awaiting_complete_ack)
+        if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||transfer->meta.total_blocks!=message.total_blocks||transfer->awaiting_complete_ack)
             {
             return;
         }
@@ -1188,48 +1141,40 @@ void handle_control_message(
 
     if(type==srcast::ControlType::BackfillData)
     {
+
         const auto message=srcast::decode_backfill_data(frame);
-        if(!transfer||
-            transfer->meta.common.transfer_id!=message.transfer_id||
-            transfer->awaiting_complete_ack||
-            message.block_id>=transfer->meta.total_blocks)
+        if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||transfer->awaiting_complete_ack||message.block_id>=transfer->meta.total_blocks)
             {
             return;
         }
 
         const auto expected_offset=
-            static_cast<std::uint64_t>(message.block_id) *
-            transfer->meta.block_size;
+            static_cast<std::uint64_t>(message.block_id)*transfer->meta.block_size;
         const auto expected_size=
             static_cast<std::uint16_t>(
                 std::min<std::uint64_t>(
                     transfer->meta.block_size,
                     transfer->meta.file_size-expected_offset));
-        if(message.offset!=expected_offset||
-            message.payload_size!=expected_size||
-            message.offset+message.payload_size>
-                transfer->meta.file_size||
-            srcast::crc32(
+        if(message.offset!=expected_offset||message.payload_size!=expected_size||message.offset+message.payload_size>transfer->meta.file_size||srcast::crc32(
                 message.payload.data(),
                 message.payload.size())!=message.crc32)
                 {
-++transfer->rejected_count;
+            transfer->rejected_count++;
             return;
         }
 
         if(transfer->received[message.block_id]==0)
         {
+
             write_all_at(
                 transfer->output.get(),
                 message.payload.data(),
                 message.payload.size(),
                 message.offset);
             transfer->received[message.block_id]=1;
-++transfer->received_count;
+            transfer->received_count++;
             if(::fsync(transfer->output.get())!=0)
-            {
-                system_error("fsync TCP backfill block");
-            }
+            {system_error("fsync TCP backfill block");}
             save_receiver_state(*transfer);
         }
         return;
@@ -1237,13 +1182,9 @@ void handle_control_message(
 
     if(type==srcast::ControlType::BackfillEnd)
     {
+
         const auto message=srcast::decode_backfill_end(frame);
-        if(!transfer||
-            transfer->meta.common.transfer_id!=message.transfer_id||
-            transfer->meta.file_size!=message.file_size||
-            transfer->meta.total_blocks!=message.total_blocks||
-            transfer->meta.sha256!=message.sha256||
-            transfer->awaiting_complete_ack)
+        if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||transfer->meta.file_size!=message.file_size||transfer->meta.total_blocks!=message.total_blocks||transfer->meta.sha256!=message.sha256||transfer->awaiting_complete_ack)
             {
             return;
         }
@@ -1254,7 +1195,7 @@ void handle_control_message(
             send_section_status(
                 control_fd,
                 receiver_id,
-                *transfer,
+*transfer,
                 transfer->active_section_id.value_or(0),
                 transfer->last_reported_round.value_or(0),
                 srcast::SectionStatusCode::Failed,
@@ -1281,11 +1222,9 @@ void handle_control_message(
 
     if(type==srcast::ControlType::CompleteAck)
     {
+
         const auto message=srcast::decode_complete_ack(frame);
-        if(!transfer||
-            message.receiver_id!=receiver_id||
-            message.transfer_id!=transfer->meta.common.transfer_id||
-!transfer->awaiting_complete_ack)
+        if(!transfer||message.receiver_id!=receiver_id||message.transfer_id!=transfer->meta.common.transfer_id||!transfer->awaiting_complete_ack)
             {
             return;
         }
@@ -1305,6 +1244,7 @@ void handle_control_message(
 
     if(type==srcast::ControlType::TransferResult)
     {
+
         const auto message=srcast::decode_transfer_result(frame);
         if(!transfer)
         {
@@ -1324,7 +1264,7 @@ void handle_control_message(
 
         if(message.result==srcast::TransferResultCode::Failed)
         {
-            std::cout<<"transfer failed after maximum repair rounds; "
+            std::cout<<"transfer failed after maximum repair rounds;"
 <<"temporary file retained at "
 <<transfer->temporary_path<<'\n';
             const auto failed_transfer_id=message.transfer_id;
@@ -1346,7 +1286,8 @@ void handle_control_message(
 
 }
 
-int main(int argc,char** argv) try {
+int main(int argc,char**argv) try
+{
     if(argc<7||argc>8)
     {
         usage(argv[0]);
@@ -1359,11 +1300,8 @@ int main(int argc,char** argv) try {
     const std::string proxy_ip=argv[4];
     const int control_port=std::stoi(argv[5]);
     const auto receiver_id=std::stoull(argv[6]);
-    const std::string interface_ip=argc>=8 ? argv[7] : "0.0.0.0";
-
-    if(udp_port<1||udp_port>65535||
-        control_port<1||control_port>65535||
-        receiver_id==0)
+    const std::string interface_ip=argc>=8?argv[7]:"0.0.0.0";
+    if(udp_port<1||udp_port>65535||control_port<1||control_port>65535||receiver_id==0)
         {
         throw std::runtime_error("invalid command-line argument");
     }
@@ -1387,8 +1325,7 @@ int main(int argc,char** argv) try {
     if(::inet_pton(
             AF_INET,
             multicast_ip.c_str(),
-            &group_address)!=1||
-!IN_MULTICAST(ntohl(group_address.s_addr)))
+            &group_address)!=1||!IN_MULTICAST(ntohl(group_address.s_addr)))
         {
         throw std::runtime_error("group must be an IPv4 multicast address");
     }
@@ -1405,9 +1342,7 @@ int main(int argc,char** argv) try {
         SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,
         0));
     if(udp_fd.get()<0)
-    {
-        system_error("socket UDP");
-    }
+    {system_error("socket UDP");}
 
     const int reuse=1;
     if(::setsockopt(
@@ -1416,18 +1351,15 @@ int main(int argc,char** argv) try {
             SO_REUSEADDR,
             &reuse,
             sizeof(reuse))!=0)
-            {
-        system_error("setsockopt UDP SO_REUSEADDR");
-    }
+            {system_error("setsockopt UDP SO_REUSEADDR");}
 
-    int receive_buffer=4 * 1024 * 1024;
+    int receive_buffer=4*1024*1024;
     static_cast<void>(::setsockopt(
         udp_fd.get(),
         SOL_SOCKET,
         SO_RCVBUF,
         &receive_buffer,
         sizeof(receive_buffer)));
-
     sockaddr_in local{};
     local.sin_family=AF_INET;
     local.sin_port=htons(static_cast<std::uint16_t>(udp_port));
@@ -1436,9 +1368,7 @@ int main(int argc,char** argv) try {
             udp_fd.get(),
             reinterpret_cast<sockaddr*>(&local),
             sizeof(local))!=0)
-            {
-        system_error("bind UDP");
-    }
+            {system_error("bind UDP");}
 
     ip_mreq membership{};
     membership.imr_multiaddr=group_address;
@@ -1449,39 +1379,30 @@ int main(int argc,char** argv) try {
             IP_ADD_MEMBERSHIP,
             &membership,
             sizeof(membership))!=0)
-            {
-        system_error("setsockopt IP_ADD_MEMBERSHIP");
-    }
+            {system_error("setsockopt IP_ADD_MEMBERSHIP");}
 
     auto control_fd=connect_control(proxy_ip,control_port);
     send_control_frame(
         control_fd.get(),
         srcast::encode_register(
             {receiver_id,static_cast<std::uint16_t>(udp_port)}));
-
     std::cout<<"receiver_id="<<receiver_id
 <<" listening on "<<multicast_ip<<':'<<udp_port
 <<" via interface "<<interface_ip
 <<" control="<<proxy_ip<<':'<<control_port<<'\n';
-
     FileDescriptor drain_timer_fd(::timerfd_create(
         CLOCK_MONOTONIC,
         TFD_CLOEXEC|TFD_NONBLOCK));
     if(drain_timer_fd.get()<0)
-    {
-        system_error("timerfd_create");
-    }
+    {system_error("timerfd_create");}
 
     FileDescriptor epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
     if(epoll_fd.get()<0)
-    {
-        system_error("epoll_create1");
-    }
+    {system_error("epoll_create1");}
 
     add_epoll_interest(epoll_fd.get(),udp_fd.get());
     add_epoll_interest(epoll_fd.get(),drain_timer_fd.get());
     add_epoll_interest(epoll_fd.get(),control_fd.get());
-
     std::optional<TransferState>transfer;
     std::array<std::uint8_t,srcast::kMaxPacketSize>packet_buffer{};
     ControlStreamReader control_reader;
@@ -1489,7 +1410,7 @@ int main(int argc,char** argv) try {
     if(!initial_drop_blocks.empty())
     {
         std::cout<<"test hook enabled: SRCAST_DROP_INITIAL_BLOCKS";
-        for(const auto block_id : initial_drop_blocks)
+        for(const auto block_id:initial_drop_blocks)
         {
             std::cout<<' '<<block_id;
         }
@@ -1500,9 +1421,7 @@ int main(int argc,char** argv) try {
     bool stop_requested=false;
     std::uint32_t draining_round=0;
     SteadyClock::time_point hard_deadline{};
-
     std::vector<epoll_event>ready_events(3);
-
     while(!stop_requested)
     {
         const int event_count=::epoll_wait(
@@ -1522,19 +1441,17 @@ int main(int argc,char** argv) try {
         bool udp_ready=false;
         bool timer_ready=false;
         bool control_ready=false;
-
-        for(int index=0; index<event_count;++index)
+        for(int index=0;index<event_count;index++)
         {
             const auto&event=ready_events[static_cast<std::size_t>(index)];
             const int ready_fd=event.data.fd;
-
-            if((event.events & EPOLLERR)!=0U)
+            if((event.events&EPOLLERR)!=0U)
             {
                 throw std::runtime_error("epoll descriptor error");
             }
-            if((event.events & EPOLLIN)==0U)
+            if((event.events&EPOLLIN)==0U)
             {
-                if((event.events & EPOLLHUP)!=0U)
+                if((event.events&EPOLLHUP)!=0U)
                 {
                     throw std::runtime_error("epoll descriptor hangup");
                 }
@@ -1544,9 +1461,11 @@ int main(int argc,char** argv) try {
             if(ready_fd==udp_fd.get())
             {
                 udp_ready=true;
-            } else if(ready_fd==drain_timer_fd.get()) {
+            }else if(ready_fd==drain_timer_fd.get())
+            {
                 timer_ready=true;
-            } else if(ready_fd==control_fd.get()) {
+            }else if(ready_fd==control_fd.get())
+            {
                 control_ready=true;
             }
             else
@@ -1560,8 +1479,7 @@ int main(int argc,char** argv) try {
             std::size_t processed=0;
             const auto batch_start=SteadyClock::now();
 
-            while(processed<kMaxUdpPacketsPerBatch &&
-                   SteadyClock::now()-batch_start<kUdpBatchTimeBudget)
+            while(processed<kMaxUdpPacketsPerBatch&&SteadyClock::now()-batch_start<kUdpBatchTimeBudget)
                    {
                 const auto packet_size=::recvfrom(
                     udp_fd.get(),
@@ -1587,25 +1505,20 @@ int main(int argc,char** argv) try {
                     continue;
                 }
 
-++processed;
-
+                processed++;
                 try
                 {
                     srcast::PacketReader preview(
                         packet_buffer.data(),
                         static_cast<std::size_t>(packet_size));
                     const auto common=srcast::read_common(preview);
-
                     if(common.type==srcast::PacketType::Meta)
                     {
 
                         continue;
                     }
 
-                    if(!transfer||
-                        common.transfer_id!=
-                            transfer->meta.common.transfer_id||
-                        transfer->awaiting_complete_ack)
+                    if(!transfer||common.transfer_id!=transfer->meta.common.transfer_id||transfer->awaiting_complete_ack)
                         {
                         continue;
                     }
@@ -1616,37 +1529,29 @@ int main(int argc,char** argv) try {
                             packet_buffer.data(),
                             static_cast<std::size_t>(packet_size));
                         auto&state=*transfer;
-
-                        if(data.block_id>=state.meta.total_blocks||
-                            data.section_id!=
-                                srcast::section_id_for_block(data.block_id))
+                        if(data.block_id>=state.meta.total_blocks||data.section_id!=srcast::section_id_for_block(data.block_id))
                                 {
-++state.rejected_count;
+                            state.rejected_count++;
                             continue;
                         }
 
                         const auto expected_offset=
-                            static_cast<std::uint64_t>(data.block_id) *
-                            state.meta.block_size;
+                            static_cast<std::uint64_t>(data.block_id)*state.meta.block_size;
                         const auto expected_size=
                             static_cast<std::uint16_t>(
                                 std::min<std::uint64_t>(
                                     state.meta.block_size,
                                     state.meta.file_size-expected_offset));
-
-                        if(data.offset!=expected_offset||
-                            data.payload_size!=expected_size||
-                            data.offset+data.payload_size>
-                                state.meta.file_size)
+                        if(data.offset!=expected_offset||data.payload_size!=expected_size||data.offset+data.payload_size>state.meta.file_size)
                                 {
-++state.rejected_count;
+                            state.rejected_count++;
                             continue;
                         }
                         if(srcast::crc32(
                                 data.payload,
                                 data.payload_size)!=data.crc32)
                                 {
-++state.rejected_count;
+                            state.rejected_count++;
                             continue;
                         }
                         if(should_drop_initial_block_for_test(
@@ -1658,7 +1563,7 @@ int main(int argc,char** argv) try {
                         }
                         if(state.received[data.block_id]!=0)
                         {
-++state.duplicate_count;
+                            state.duplicate_count++;
                             continue;
                         }
 
@@ -1668,13 +1573,10 @@ int main(int argc,char** argv) try {
                             data.payload_size,
                             data.offset);
                         state.received[data.block_id]=1;
-++state.received_count;
+                        state.received_count++;
                         if(::fsync(state.output.get())!=0)
-                        {
-                            system_error("fsync received block");
-                        }
+                        {system_error("fsync received block");}
                         save_receiver_state(state);
-
                         if(draining)
                         {
                             arm_drain_timer(
@@ -1682,8 +1584,7 @@ int main(int argc,char** argv) try {
                                 hard_deadline);
                         }
 
-                        if(state.received_count%1000U==0U||
-                            state.received_count==state.meta.total_blocks)
+                        if(state.received_count%1000U==0U||state.received_count==state.meta.total_blocks)
                             {
                             std::cout<<"received "
 <<state.received_count<<'/'
@@ -1695,11 +1596,12 @@ int main(int argc,char** argv) try {
 
                     if(common.type==srcast::PacketType::End)
                     {
+
                         const auto end=srcast::decode_end(
                             packet_buffer.data(),
                             static_cast<std::size_t>(packet_size));
                         begin_drain_for_round(
-                            *transfer,
+*transfer,
                             end.section_id,
                             end.round_id,
                             end.total_blocks,
@@ -1709,10 +1611,11 @@ int main(int argc,char** argv) try {
                             hard_deadline);
                         continue;
                     }
-                } catch(const std::exception&error) {
+                }catch(const std::exception&error)
+                {
                     if(transfer)
                     {
-++transfer->rejected_count;
+                        transfer->rejected_count++;
                     }
                     std::cerr<<"drop malformed packet: "
 <<error.what()<<'\n';
@@ -1722,14 +1625,14 @@ int main(int argc,char** argv) try {
 
         if(timer_ready)
         {
-            if(consume_timer_expiration(drain_timer_fd.get()) &&
-                draining && transfer)
+            if(consume_timer_expiration(drain_timer_fd.get())&&                draining&&transfer)
                 {
                 draining=false;
+
                 finish_drain_and_report(
                     control_fd.get(),
                     receiver_id,
-                    *transfer,
+*transfer,
                     draining_round);
             }
         }
@@ -1737,7 +1640,7 @@ int main(int argc,char** argv) try {
         if(control_ready)
         {
             const auto frames=control_reader.read_frames(control_fd.get());
-            for(const auto&frame : frames)
+            for(const auto&frame:frames)
             {
                 handle_control_message(
                     frame,
@@ -1751,7 +1654,7 @@ int main(int argc,char** argv) try {
                     hard_deadline,
                     stop_requested);
             }
-            if(control_reader.peer_closed() &&!stop_requested)
+            if(control_reader.peer_closed()&&!stop_requested)
             {
                 throw std::runtime_error("proxy control connection closed");
             }
@@ -1760,8 +1663,8 @@ int main(int argc,char** argv) try {
 
     std::cout<<"proxy session ended cleanly\n";
     return 0;
-
-} catch(const std::exception&error) {
+}catch(const std::exception&error)
+{
     std::cerr<<"receiver error: "<<error.what()<<'\n';
     return 1;
 }

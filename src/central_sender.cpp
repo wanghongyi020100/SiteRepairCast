@@ -7,7 +7,6 @@
 #include<sys/socket.h>
 #include<sys/stat.h>
 #include<unistd.h>
-
 #include<algorithm>
 #include<array>
 #include<cerrno>
@@ -21,13 +20,12 @@
 #include<string>
 #include<thread>
 #include<vector>
-
 namespace
 {
 class FileDescriptor
 {
 public:
-    explicit FileDescriptor(int fd=-1):fd_(fd) {}
+    explicit FileDescriptor(int fd=-1):fd_(fd){}
     ~FileDescriptor()
     {
         if(fd_>=0)
@@ -38,13 +36,13 @@ public:
 
     FileDescriptor(const FileDescriptor&)=delete;
     FileDescriptor&operator=(const FileDescriptor&)=delete;
-
-    FileDescriptor(FileDescriptor&&other)noexcept : fd_(other.fd_)
+    FileDescriptor(FileDescriptor&&other)noexcept:fd_(other.fd_)
     {
         other.fd_=-1;
     }
 
-    FileDescriptor&operator=(FileDescriptor&&other)noexcept {
+    FileDescriptor&operator=(FileDescriptor&&other)noexcept
+    {
         if(this!=&other)
         {
             if(fd_>=0)
@@ -57,7 +55,7 @@ public:
         return *this;
     }
 
-    int get()const { return fd_; }
+    int get()const{return fd_;}
 
 private:
     int fd_;
@@ -138,7 +136,6 @@ std::vector<std::uint8_t>receive_control_frame(int fd)
         fd,
         reinterpret_cast<std::uint8_t*>(&network_size),
         sizeof(network_size));
-
     const auto size=ntohl(network_size);
     if(size==0||size>srcast::kMaxControlFrameSize)
     {
@@ -157,9 +154,7 @@ FileDescriptor connect_proxy(
 
     FileDescriptor fd(::socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0));
     if(fd.get()<0)
-    {
-        system_error("socket central");
-    }
+    {system_error("socket central");}
 
     sockaddr_in proxy{};
     proxy.sin_family=AF_INET;
@@ -175,9 +170,7 @@ FileDescriptor connect_proxy(
                 fd.get(),
                 reinterpret_cast<sockaddr*>(&proxy),
                 sizeof(proxy))==0)
-                {
-            return fd;
-        }
+                {return fd;}
         if(errno==EINTR)
         {
             continue;
@@ -191,7 +184,7 @@ std::uint64_t create_transfer_id(
     {
 
     std::uint64_t value=0;
-    for(std::size_t index=0; index<sizeof(value);++index)
+    for(std::size_t index=0;index<sizeof(value);index++)
     {
         value=(value<<8U)|digest[index];
     }
@@ -202,15 +195,12 @@ std::uint32_t stop_after_sections_for_test()
 {
     const char*raw=std::getenv("SRCAST_STOP_AFTER_SECTIONS");
     if(raw==nullptr||*raw=='\0')
-    {
-        return 0;
-    }
+    {return 0;}
 
     char*end=nullptr;
     errno=0;
     const auto value=std::strtoul(raw,&end,10);
-    if(raw==end||*end!='\0'||errno==ERANGE||
-        value>std::numeric_limits<std::uint32_t>::max())
+    if(raw==end||*end!='\0'||errno==ERANGE||value>std::numeric_limits<std::uint32_t>::max())
         {
         throw std::runtime_error(
             "invalid SRCAST_STOP_AFTER_SECTIONS value");
@@ -227,10 +217,9 @@ void read_block(
     std::uint64_t&offset)
     {
 
-    offset=static_cast<std::uint64_t>(block_id) * srcast::kPayloadSize;
+    offset=static_cast<std::uint64_t>(block_id)*srcast::kPayloadSize;
     const auto wanted=static_cast<std::size_t>(
         std::min<std::uint64_t>(srcast::kPayloadSize,file_size-offset));
-
     payload.assign(wanted,0);
     std::size_t received=0;
     while(received<wanted)
@@ -272,11 +261,8 @@ bool send_file(
     int pace_us)
     {
 
-    struct stat status{};
-    if(::stat(file_path.c_str(),&status)!=0)
-    {
-        system_error("stat "+file_path);
-    }
+    struct stat status{};    if(::stat(file_path.c_str(),&status)!=0)
+    {system_error("stat "+file_path);}
     if(!S_ISREG(status.st_mode)||status.st_size<0)
     {
         throw std::runtime_error(
@@ -295,12 +281,9 @@ bool send_file(
     const auto total_blocks=static_cast<std::uint32_t>(total_blocks64);
     const auto digest=srcast::sha256_file(file_path);
     const auto transfer_id=create_transfer_id(digest);
-
     FileDescriptor input(::open(file_path.c_str(),O_RDONLY|O_CLOEXEC));
     if(input.get()<0)
-    {
-        system_error("open source file "+file_path);
-    }
+    {system_error("open source file "+file_path);}
 
     srcast::CentralFileMetaMessage meta;
     meta.transfer_id=transfer_id;
@@ -308,23 +291,18 @@ bool send_file(
     meta.block_size=srcast::kPayloadSize;
     meta.total_blocks=total_blocks;
     meta.sha256=digest;
-
     std::cout<<"central sending file="<<file_path
 <<" transfer_id="<<transfer_id
 <<" size="<<file_size
 <<" blocks="<<total_blocks<<'\n';
-
     send_control_frame(
         central_fd,
         srcast::encode_central_file_meta(meta));
-
     const auto section_count=srcast::section_count_for_blocks(total_blocks);
+
     const auto resume_frame=receive_control_frame(central_fd);
     const auto resume=srcast::decode_central_resume(resume_frame);
-    if(resume.transfer_id!=transfer_id||
-        resume.file_size!=file_size||
-        resume.total_sections!=section_count||
-        resume.next_section_id>section_count)
+    if(resume.transfer_id!=transfer_id||resume.file_size!=file_size||resume.total_sections!=section_count||resume.next_section_id>section_count)
         {
         throw std::runtime_error(
             "invalid CENTRAL_RESUME from proxy: "+file_path);
@@ -344,22 +322,21 @@ bool send_file(
     std::cout<<"central resume transfer_id="<<transfer_id
 <<" next_section="<<resume.next_section_id
 <<'/'<<section_count<<'\n';
-
     std::vector<std::uint8_t>payload;
     const auto stop_after_sections=stop_after_sections_for_test();
     std::uint32_t confirmed_this_run=0;
+
     for(std::uint32_t section_id=resume.next_section_id;
          section_id<section_count;
-++section_id)
+         section_id++)
          {
         const auto first_block=srcast::section_first_block(section_id);
         const auto section_blocks=srcast::section_block_count(
             total_blocks,
             section_id);
-
         for(std::uint32_t local_block=0;
              local_block<section_blocks;
-++local_block)
+             local_block++)
              {
             const auto block_id=first_block+local_block;
             std::uint64_t offset{};
@@ -370,7 +347,6 @@ bool send_file(
                 block_id,
                 payload,
                 offset);
-
             srcast::CentralDataMessage data;
             data.transfer_id=transfer_id;
             data.section_id=section_id;
@@ -379,11 +355,9 @@ bool send_file(
             data.payload_size=static_cast<std::uint16_t>(payload.size());
             data.crc32=srcast::crc32(payload.data(),payload.size());
             data.payload=payload;
-
             send_control_frame(
                 central_fd,
                 srcast::encode_central_data(data));
-
             if(pace_us>0)
             {
                 std::this_thread::sleep_for(
@@ -398,26 +372,22 @@ bool send_file(
 
         const auto response=receive_control_frame(central_fd);
         const auto result=srcast::decode_central_status(response);
-        if(result.transfer_id!=transfer_id||
-            result.status!=srcast::CentralStatusCode::Cached||
-            result.file_size!=file_size)
+        if(result.transfer_id!=transfer_id||result.status!=srcast::CentralStatusCode::Cached||result.file_size!=file_size)
             {
             throw std::runtime_error(
                 "proxy did not confirm cached section: "+file_path);
         }
-        if(section_id+1U==section_count && result.sha256!=digest)
+        if(section_id+1U==section_count&&result.sha256!=digest)
         {
             throw std::runtime_error(
                 "proxy final digest mismatch: "+file_path);
         }
         std::cout<<"central confirmed section="<<section_id
 <<" transfer_id="<<transfer_id<<'\n';
-
-++confirmed_this_run;
-        if(stop_after_sections!=0 &&
-            confirmed_this_run>=stop_after_sections &&
-            section_id+1U<section_count)
+        confirmed_this_run++;
+        if(stop_after_sections!=0&&confirmed_this_run>=stop_after_sections&&section_id+1U<section_count)
             {
+
             std::cout<<"test hook closing central connection after "
 <<confirmed_this_run<<" confirmed sections\n";
             return false;
@@ -431,7 +401,8 @@ bool send_file(
 
 }
 
-int main(int argc,char** argv) try {
+int main(int argc,char**argv) try
+{
     if(argc<5)
     {
         usage(argv[0]);
@@ -441,29 +412,25 @@ int main(int argc,char** argv) try {
     const std::string proxy_ip=argv[1];
     const int central_port=std::stoi(argv[2]);
     const int pace_us=std::stoi(argv[3]);
-
     if(central_port<1||central_port>65535||pace_us<0)
     {
         throw std::runtime_error("invalid command-line argument");
     }
 
     auto central_fd=connect_proxy(proxy_ip,central_port);
-    for(int index=4; index<argc;++index)
+    for(int index=4;index<argc;index++)
     {
         if(!send_file(central_fd.get(),argv[index],pace_us))
-        {
-            return 0;
-        }
+        {return 0;}
     }
 
     send_control_frame(
         central_fd.get(),
         srcast::encode_central_session_end());
-
     std::cout<<"central session ended\n";
     return 0;
-
-} catch(const std::exception&error) {
+}catch(const std::exception&error)
+{
     std::cerr<<"central sender error: "<<error.what()<<'\n';
     return 1;
 }

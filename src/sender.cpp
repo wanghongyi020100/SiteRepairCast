@@ -11,7 +11,6 @@
 #include<sys/stat.h>
 #include<sys/statvfs.h>
 #include<unistd.h>
-
 #include<algorithm>
 #include<array>
 #include<cerrno>
@@ -32,13 +31,12 @@
 #include<unordered_set>
 #include<utility>
 #include<vector>
-
 namespace
 {
 class FileDescriptor
 {
 public:
-    explicit FileDescriptor(int fd=-1):fd_(fd) {}
+    explicit FileDescriptor(int fd=-1):fd_(fd){}
     ~FileDescriptor()
     {
         if(fd_>=0)
@@ -47,21 +45,15 @@ public:
         }
     }
 
-
     FileDescriptor(const FileDescriptor&)=delete;
     FileDescriptor&operator=(const FileDescriptor&)=delete;
-
-
-
-    FileDescriptor(FileDescriptor&&other)noexcept : fd_(other.fd_)
+    FileDescriptor(FileDescriptor&&other)noexcept:fd_(other.fd_)
     {
         other.fd_=-1;
     }
 
-
-
-    FileDescriptor&operator=(FileDescriptor&&other)noexcept {
-
+    FileDescriptor&operator=(FileDescriptor&&other)noexcept
+    {
         if(this!=&other)
         {
             if(fd_>=0)
@@ -74,7 +66,7 @@ public:
         return *this;
     }
 
-    int get()const { return fd_; }
+    int get()const{return fd_;}
 
     void reset(int fd)
     {
@@ -88,34 +80,22 @@ public:
 private:
     int fd_;
 };
-
 [[noreturn]] void system_error(const std::string&operation)
 {
     throw std::runtime_error(operation+": "+std::strerror(errno));
 }
 
-using SteadyClock=std::chrono::steady_clock;
-constexpr auto kReportTimeout=std::chrono::seconds(30);
-constexpr auto kMetaReadyTimeout=std::chrono::seconds(30);
-constexpr auto kReadyTimeout=std::chrono::seconds(10);
-constexpr std::uint32_t kSectionId=srcast::kSingleSectionId;
-constexpr std::size_t kMulticastRepairThreshold=2;
-constexpr std::uint32_t kDefaultSlowMissingThreshold=32;
-constexpr std::uint64_t kDiskSafetyMarginBytes=4 * 1024 * 1024;
-
+using SteadyClock=std::chrono::steady_clock;constexpr auto kReportTimeout=std::chrono::seconds(30);constexpr auto kMetaReadyTimeout=std::chrono::seconds(30);constexpr auto kReadyTimeout=std::chrono::seconds(10);constexpr std::uint32_t kSectionId=srcast::kSingleSectionId;constexpr std::size_t kMulticastRepairThreshold=2;constexpr std::uint32_t kDefaultSlowMissingThreshold=32;constexpr std::uint64_t kDiskSafetyMarginBytes=4*1024*1024;
 std::uint32_t slow_missing_threshold()
 {
     const char*raw=std::getenv("SRCAST_SLOW_MISSING_THRESHOLD");
     if(raw==nullptr||*raw=='\0')
-    {
-        return kDefaultSlowMissingThreshold;
-    }
+    {return kDefaultSlowMissingThreshold;}
 
     char*end=nullptr;
     errno=0;
     const auto value=std::strtoul(raw,&end,10);
-    if(raw==end||*end!='\0'||errno==ERANGE||
-        value>std::numeric_limits<std::uint32_t>::max())
+    if(raw==end||*end!='\0'||errno==ERANGE||value>std::numeric_limits<std::uint32_t>::max())
         {
         throw std::runtime_error(
             "invalid SRCAST_SLOW_MISSING_THRESHOLD value");
@@ -130,9 +110,7 @@ std::unordered_set<std::uint32_t>parse_block_set_env(
     std::unordered_set<std::uint32_t>blocks;
     const char*raw=std::getenv(name);
     if(raw==nullptr||*raw=='\0')
-    {
-        return blocks;
-    }
+    {return blocks;}
 
     const char*cursor=raw;
     while(*cursor!='\0')
@@ -140,13 +118,11 @@ std::unordered_set<std::uint32_t>parse_block_set_env(
         char*end=nullptr;
         errno=0;
         const auto value=std::strtoul(cursor,&end,10);
-        if(cursor==end||errno==ERANGE||
-            value>std::numeric_limits<std::uint32_t>::max())
+        if(cursor==end||errno==ERANGE||value>std::numeric_limits<std::uint32_t>::max())
             {
             throw std::runtime_error(std::string("invalid ")+name+" value");
         }
         blocks.insert(static_cast<std::uint32_t>(value));
-
         if(*end=='\0')
         {
             break;
@@ -170,9 +146,7 @@ std::unordered_set<std::uint32_t>parse_block_set_env(
 bool env_flag_enabled(const char*name)
 {
     const char*raw=std::getenv(name);
-    return raw!=nullptr &&
-        *raw!='\0' &&
-        std::string(raw)!="0";
+    return raw!=nullptr&&*raw!='\0'&&        std::string(raw)!="0";
 }
 
 void require_disk_space(
@@ -181,19 +155,79 @@ void require_disk_space(
     const std::string&label)
     {
 
-    struct statvfs info {};
-    if(::statvfs(directory.c_str(),&info)!=0)
-    {
-        system_error("statvfs "+label);
-    }
+    struct statvfs info {};    if(::statvfs(directory.c_str(),&info)!=0)
+    {system_error("statvfs "+label);}
 
-    const auto available=static_cast<std::uint64_t>(info.f_bavail) *
-        static_cast<std::uint64_t>(info.f_frsize);
+    const auto available=static_cast<std::uint64_t>(info.f_bavail)*static_cast<std::uint64_t>(info.f_frsize);
     const auto required=bytes_needed+kDiskSafetyMarginBytes;
     if(available<required)
     {
         throw std::runtime_error(
             label+" has insufficient disk space");
+    }
+}
+
+std::uint64_t storage_limit(const char*name)
+{
+    const char*raw=std::getenv(name);
+    if(raw==nullptr||*raw=='\0')
+    {return 0;}
+
+    char*end=nullptr;
+    errno=0;
+    const auto value=std::strtoull(raw,&end,10);
+    if(raw==end||*end!='\0'||errno==ERANGE)
+    {
+        throw std::runtime_error(std::string("invalid ")+name+" value");
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
+std::uint64_t directory_usage(const std::string&directory)
+{
+    std::uint64_t total=0;
+    std::error_code error;
+    for(const auto&entry:
+        std::filesystem::recursive_directory_iterator(directory,error))
+    {
+        if(error)
+        {
+            throw std::runtime_error(
+                "scan storage directory failed: "+error.message());
+        }
+        if(!entry.is_regular_file(error))
+        {
+            if(error)
+            {throw std::runtime_error("stat storage file failed: "+error.message());}
+            continue;
+        }
+        const auto size=entry.file_size(error);
+        if(error||size>std::numeric_limits<std::uint64_t>::max()-total)
+        {
+            throw std::runtime_error("storage usage is too large");
+        }
+        total+=size;
+    }
+    if(error)
+    {throw std::runtime_error("scan storage directory failed: "+error.message());}
+    return total;
+}
+
+void require_storage_limit(
+    const std::string&directory,
+    std::uint64_t additional,
+    const char*limit_name,
+    const std::string&label)
+{
+    const auto limit=storage_limit(limit_name);
+    if(limit==0)
+    {return;}
+
+    const auto used=directory_usage(directory);
+    if(used>limit||additional>limit-used)
+    {
+        throw std::runtime_error(
+            label+" exceeds "+limit_name);
     }
 }
 
@@ -296,11 +330,8 @@ void send_udp_packet(
         0,
         reinterpret_cast<const sockaddr*>(&destination),
         sizeof(destination));
-
     if(sent<0)
-    {
-        system_error("sendto");
-    }
+    {system_error("sendto");}
     if(static_cast<std::size_t>(sent)!=packet.size())
     {
         throw std::runtime_error("sendto sent a partial datagram");
@@ -317,10 +348,9 @@ void read_block(
     std::uint16_t&payload_size)
     {
 
-    offset=static_cast<std::uint64_t>(block_id) * srcast::kPayloadSize;
+    offset=static_cast<std::uint64_t>(block_id)*srcast::kPayloadSize;
     const auto wanted=static_cast<std::size_t>(
         std::min<std::uint64_t>(srcast::kPayloadSize,file_size-offset));
-
     std::size_t received=0;
     while(received<wanted)
     {
@@ -389,9 +419,7 @@ struct CachedCentralFile
 };
 
 std::string central_checkpoint_path(const std::string&final_path)
-{
-    return final_path+".state";
-}
+{return final_path+".state";}
 
 std::uint32_t load_central_checkpoint(
     const std::string&checkpoint_path,
@@ -399,25 +427,18 @@ std::uint32_t load_central_checkpoint(
     const srcast::CentralFileMetaMessage&meta)
     {
 
-    if(!std::filesystem::exists(checkpoint_path)||
-!std::filesystem::exists(temporary_path))
-        {
-        return 0;
-    }
+    if(!std::filesystem::exists(checkpoint_path)||!std::filesystem::exists(temporary_path))
+        {return 0;}
 
     std::error_code size_error;
     const auto temporary_size=
         std::filesystem::file_size(temporary_path,size_error);
     if(size_error||temporary_size!=meta.file_size)
-    {
-        return 0;
-    }
+    {return 0;}
 
     std::ifstream input(checkpoint_path);
     if(!input)
-    {
-        return 0;
-    }
+    {return 0;}
 
     std::string magic;
     int version=0;
@@ -426,27 +447,17 @@ std::uint32_t load_central_checkpoint(
     std::uint32_t total_blocks=0;
     std::uint32_t next_section_id=0;
     std::string digest_hex;
-
     input>>magic>>version
 >>transfer_id
 >>file_size
 >>total_blocks
 >>digest_hex
 >>next_section_id;
-
     const auto section_count=
         srcast::section_count_for_blocks(meta.total_blocks);
-    if(!input||
-        magic!="SRC_PROXY_CHECKPOINT"||
-        version!=1||
-        transfer_id!=meta.transfer_id||
-        file_size!=meta.file_size||
-        total_blocks!=meta.total_blocks||
-        digest_hex!=srcast::hex_digest(meta.sha256)||
-        next_section_id>=section_count)
-        {
-        return 0;
-    }
+    if(!input||magic!="SRC_PROXY_CHECKPOINT"||
+        version!=1||transfer_id!=meta.transfer_id||file_size!=meta.file_size||total_blocks!=meta.total_blocks||digest_hex!=srcast::hex_digest(meta.sha256)||next_section_id>=section_count)
+        {return 0;}
 
     return next_section_id;
 }
@@ -498,20 +509,15 @@ struct ReceiverConnection
     std::uint64_t receiver_id{};
     FileDescriptor control_fd;
     sockaddr_in udp_destination{};
-
-
     bool meta_ready{false};
-
     bool status_received{false};
     bool complete_received{false};
     bool completed{false};
     bool ready_for_next_transfer{false};
     bool isolated{false};
     std::vector<std::uint32_t>backfill_blocks;
-
     std::optional<srcast::SectionStatusMessage>status;
 };
-
 void usage(const char*program)
 {
     std::cerr
@@ -532,9 +538,7 @@ FileDescriptor create_control_listener(int control_port)
 {
     FileDescriptor listener(::socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0));
     if(listener.get()<0)
-    {
-        system_error("socket TCP listener");
-    }
+    {system_error("socket TCP listener");}
 
     const int reuse=1;
     if(::setsockopt(
@@ -543,26 +547,19 @@ FileDescriptor create_control_listener(int control_port)
             SO_REUSEADDR,
             &reuse,
             sizeof(reuse))!=0)
-            {
-        system_error("setsockopt TCP SO_REUSEADDR");
-    }
+            {system_error("setsockopt TCP SO_REUSEADDR");}
 
     sockaddr_in local{};
     local.sin_family=AF_INET;
     local.sin_port=htons(static_cast<std::uint16_t>(control_port));
     local.sin_addr.s_addr=htonl(INADDR_ANY);
-
     if(::bind(
             listener.get(),
             reinterpret_cast<sockaddr*>(&local),
             sizeof(local))!=0)
-            {
-        system_error("bind TCP listener");
-    }
+            {system_error("bind TCP listener");}
     if(::listen(listener.get(),64)!=0)
-    {
-        system_error("listen TCP listener");
-    }
+    {system_error("listen TCP listener");}
     return listener;
 }
 
@@ -577,9 +574,7 @@ void set_receive_timeout(int fd,std::chrono::seconds timeout)
             SO_RCVTIMEO,
             &value,
             sizeof(value))!=0)
-            {
-        system_error("setsockopt SO_RCVTIMEO");
-    }
+            {system_error("setsockopt SO_RCVTIMEO");}
 }
 
 std::vector<ReceiverConnection>accept_receivers(
@@ -590,11 +585,9 @@ std::vector<ReceiverConnection>accept_receivers(
     std::vector<ReceiverConnection>receivers;
     receivers.reserve(expected_receivers);
     std::unordered_set<std::uint64_t>receiver_ids;
-
     std::cout<<"waiting for "<<expected_receivers
 <<" receiver control connections\n"
 <<std::flush;
-
     while(receivers.size()<expected_receivers)
     {
         sockaddr_in peer{};
@@ -620,7 +613,6 @@ std::vector<ReceiverConnection>accept_receivers(
             const auto frame=receive_control_frame(control_fd.get());
             const auto registration=srcast::decode_register(frame);
             set_receive_timeout(control_fd.get(),std::chrono::seconds(0));
-
             if(registration.receiver_id==0)
             {
                 throw std::runtime_error("receiver_id must not be zero");
@@ -636,26 +628,23 @@ std::vector<ReceiverConnection>accept_receivers(
 
             ReceiverConnection receiver;
             receiver.receiver_id=registration.receiver_id;
-
             receiver.control_fd=std::move(control_fd);
             receiver.udp_destination=peer;
             receiver.udp_destination.sin_port=htons(registration.udp_port);
-
             char address[INET_ADDRSTRLEN]{};
             if(::inet_ntop(
                     AF_INET,
                     &peer.sin_addr,
                     address,
                     sizeof(address))==nullptr)
-                    {
-                std::strcpy(address,"?");
-            }
+                    {std::strcpy(address,"?");}
 
             std::cout<<"registered receiver_id="<<receiver.receiver_id
 <<" address="<<address<<':'
 <<registration.udp_port<<'\n';
             receivers.push_back(std::move(receiver));
-        } catch(const std::exception&error) {
+        }catch(const std::exception&error)
+        {
             std::cerr<<"rejected receiver registration: "
 <<error.what()<<'\n';
         }
@@ -672,42 +661,37 @@ bool validate_missing_bitmap(
     const auto expected_size=srcast::bitmap_size_for_blocks(section_blocks);
     if(status.status==srcast::SectionStatusCode::Missing)
     {
-        if(status.missing_bitmap.size()!=expected_size||
-            status.missing_count==0)
-            {
-            return false;
-        }
+        if(status.missing_bitmap.size()!=expected_size||status.missing_count==0)
+            {return false;}
 
         std::uint32_t counted=0;
         for(std::uint32_t local_block=0;
              local_block<section_blocks;
-++local_block)
+             local_block++)
              {
             if(srcast::bitmap_test(status.missing_bitmap,local_block))
             {
-++counted;
+                counted++;
             }
         }
 
-        if(section_blocks%8U!=0U &&!status.missing_bitmap.empty())
+        if(section_blocks%8U!=0U&&!status.missing_bitmap.empty())
         {
             const auto used_bits=static_cast<unsigned int>(section_blocks%8U);
             const auto unused_mask=static_cast<std::uint8_t>(
                 0xffU<<used_bits);
-            if((status.missing_bitmap.back() & unused_mask)!=0U)
-            {
-                return false;
-            }
+            if((status.missing_bitmap.back()&unused_mask)!=0U)
+            {return false;}
         }
         return counted==status.missing_count;
     }
 
-    return status.missing_count==0 && status.missing_bitmap.empty();
+    return status.missing_count==0&&status.missing_bitmap.empty();
 }
 
 void reset_round_state(std::vector<ReceiverConnection>&receivers)
 {
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
         receiver.status_received=false;
         receiver.complete_received=false;
@@ -721,23 +705,16 @@ bool round_responses_complete(
     bool final_section)
     {
 
-    for(const auto&receiver : receivers)
+    for(const auto&receiver:receivers)
     {
         if(receiver.completed||receiver.isolated)
         {
             continue;
         }
         if(!receiver.status_received)
-        {
-            return false;
-        }
-        if(final_section &&
-            receiver.status &&
-            receiver.status->status==srcast::SectionStatusCode::Complete &&
-!receiver.complete_received)
-            {
-            return false;
-        }
+        {return false;}
+        if(final_section&&receiver.status&&receiver.status->status==srcast::SectionStatusCode::Complete&&!receiver.complete_received)
+            {return false;}
     }
     return true;
 }
@@ -754,14 +731,10 @@ void handle_control_frame(
     {
 
     const auto type=srcast::peek_control_type(frame);
-
     if(type==srcast::ControlType::SectionStatus)
     {
         const auto status=srcast::decode_section_status(frame);
-        if(status.receiver_id!=receiver.receiver_id||
-            status.transfer_id!=transfer_id||
-            status.section_id!=section_id||
-            status.round_id!=round_id)
+        if(status.receiver_id!=receiver.receiver_id||status.transfer_id!=transfer_id||status.section_id!=section_id||status.round_id!=round_id)
             {
             std::cerr<<"ignore stale or mismatched SECTION_STATUS from receiver_id="
 <<receiver.receiver_id<<'\n';
@@ -776,7 +749,6 @@ void handle_control_frame(
 
         receiver.status=status;
         receiver.status_received=true;
-
         std::cout<<"section="<<section_id
 <<" round="<<round_id
 <<" receiver_id="<<receiver.receiver_id
@@ -784,7 +756,8 @@ void handle_control_frame(
         if(status.status==srcast::SectionStatusCode::Complete)
         {
             std::cout<<"COMPLETE";
-        } else if(status.status==srcast::SectionStatusCode::Missing) {
+        }else if(status.status==srcast::SectionStatusCode::Missing)
+        {
             std::cout<<"MISSING missing_blocks="<<status.missing_count;
         }
         else
@@ -798,12 +771,7 @@ void handle_control_frame(
     if(type==srcast::ControlType::ReceiverComplete)
     {
         const auto complete=srcast::decode_receiver_complete(frame);
-        if(!receiver.status_received||!receiver.status||
-            receiver.status->status!=srcast::SectionStatusCode::Complete||
-            complete.receiver_id!=receiver.receiver_id||
-            complete.transfer_id!=transfer_id||
-            complete.file_size!=file_size||
-            complete.sha256!=digest)
+        if(!receiver.status_received||!receiver.status||receiver.status->status!=srcast::SectionStatusCode::Complete||complete.receiver_id!=receiver.receiver_id||complete.transfer_id!=transfer_id||complete.file_size!=file_size||complete.sha256!=digest)
             {
             std::cerr<<"reject invalid RECEIVER_COMPLETE from receiver_id="
 <<receiver.receiver_id<<'\n';
@@ -835,12 +803,10 @@ std::vector<std::size_t>wait_for_receiver_events(
 
     FileDescriptor epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
     if(epoll_fd.get()<0)
-    {
-        system_error("epoll_create1 "+operation);
-    }
+    {system_error("epoll_create1 "+operation);}
 
     std::size_t watched_count=0;
-    for(std::size_t index=0; index<receivers.size();++index)
+    for(std::size_t index=0;index<receivers.size();index++)
     {
         if(!should_watch(receivers[index]))
         {
@@ -855,16 +821,12 @@ std::vector<std::size_t>wait_for_receiver_events(
                 EPOLL_CTL_ADD,
                 receivers[index].control_fd.get(),
                 &event)!=0)
-                {
-            system_error("epoll_ctl add "+operation);
-        }
-++watched_count;
+                {system_error("epoll_ctl add "+operation);}
+        watched_count++;
     }
 
     if(watched_count==0)
-    {
-        return {};
-    }
+    {return {};}
 
     std::vector<epoll_event>events(watched_count);
     int ready=0;
@@ -888,15 +850,15 @@ std::vector<std::size_t>wait_for_receiver_events(
 
     std::vector<std::size_t>indexes;
     indexes.reserve(static_cast<std::size_t>(ready));
-    for(int event_index=0; event_index<ready;++event_index)
+    for(int event_index=0;event_index<ready;event_index++)
     {
         const auto&event=events[static_cast<std::size_t>(event_index)];
-        if((event.events & (EPOLLERR|EPOLLHUP))!=0U)
+        if((event.events&(EPOLLERR|EPOLLHUP))!=0U)
         {
             throw std::runtime_error(
                 "receiver control connection failed during "+operation);
         }
-        if((event.events & EPOLLIN)==0U)
+        if((event.events&EPOLLIN)==0U)
         {
             continue;
         }
@@ -923,7 +885,6 @@ void collect_round_reports(
     const auto section_blocks=srcast::section_block_count(
         total_blocks,
         section_id);
-
     while(!round_responses_complete(receivers,final_section))
     {
         const auto now=SteadyClock::now();
@@ -936,13 +897,10 @@ void collect_round_reports(
             deadline-now);
         const auto timeout_ms=static_cast<int>(
             std::max<std::int64_t>(1,remaining.count()));
-
         const auto ready_indexes=wait_for_receiver_events(
             receivers,
             [](const ReceiverConnection&receiver)
-            {
-                return!receiver.completed &&!receiver.isolated;
-            },
+            {return!receiver.completed&&!receiver.isolated;},
             timeout_ms,
             "receiver reports");
         if(ready_indexes.empty())
@@ -950,7 +908,7 @@ void collect_round_reports(
             break;
         }
 
-        for(const auto receiver_index : ready_indexes)
+        for(const auto receiver_index:ready_indexes)
         {
             auto&receiver=receivers[receiver_index];
             const auto frame=receive_control_frame(receiver.control_fd.get());
@@ -966,11 +924,9 @@ void collect_round_reports(
         }
     }
 
-    for(const auto&receiver : receivers)
+    for(const auto&receiver:receivers)
     {
-        if(!receiver.completed &&
-!receiver.isolated &&
-!receiver.status_received)
+        if(!receiver.completed&&!receiver.isolated&&!receiver.status_received)
             {
             std::cout<<"section="<<section_id
 <<" round="<<round_id
@@ -991,21 +947,16 @@ void isolate_slow_receivers(
     const auto section_blocks=srcast::section_block_count(
         total_blocks,
         section_id);
-
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
-        if(receiver.completed||
-            receiver.isolated||
-!receiver.status||
-            receiver.status->status!=srcast::SectionStatusCode::Missing||
-            receiver.status->missing_count<=missing_threshold)
+        if(receiver.completed||receiver.isolated||!receiver.status||receiver.status->status!=srcast::SectionStatusCode::Missing||receiver.status->missing_count<=missing_threshold)
             {
             continue;
         }
 
         for(std::uint32_t local_block=0;
              local_block<section_blocks;
-++local_block)
+             local_block++)
              {
             if(srcast::bitmap_test(
                     receiver.status->missing_bitmap,
@@ -1023,7 +974,6 @@ void isolate_slow_receivers(
                 receiver.backfill_blocks.begin(),
                 receiver.backfill_blocks.end()),
             receiver.backfill_blocks.end());
-
         receiver.isolated=true;
         std::cout<<"receiver_id="<<receiver.receiver_id
 <<" isolated for TCP backfill missing_blocks="
@@ -1042,21 +992,19 @@ std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
         total_blocks,
         section_id);
     std::vector<std::vector<std::size_t>>missing_by_block(section_blocks);
-
     for(std::size_t receiver_index=0;
          receiver_index<receivers.size();
-++receiver_index)
+         receiver_index++)
          {
         const auto&receiver=receivers[receiver_index];
-        if(receiver.completed||receiver.isolated||!receiver.status||
-            receiver.status->status!=srcast::SectionStatusCode::Missing)
+        if(receiver.completed||receiver.isolated||!receiver.status||receiver.status->status!=srcast::SectionStatusCode::Missing)
             {
             continue;
         }
 
         for(std::uint32_t local_block=0;
              local_block<section_blocks;
-++local_block)
+             local_block++)
              {
             if(srcast::bitmap_test(
                     receiver.status->missing_bitmap,
@@ -1085,8 +1033,7 @@ void send_end_round(
         section_id,
         round_id,
         total_blocks);
-
-    for(int repetition=0; repetition<10;++repetition)
+    for(int repetition=0;repetition<10;repetition++)
     {
         send_udp_packet(udp_fd,multicast_destination,end_packet);
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -1094,12 +1041,10 @@ void send_end_round(
 
     const auto section_end=srcast::encode_section_end(
         {transfer_id,section_id,round_id,total_blocks});
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
-        if(!receiver.completed &&!receiver.isolated)
-        {
-            send_control_frame(receiver.control_fd.get(),section_end);
-        }
+        if(!receiver.completed&&!receiver.isolated)
+        {send_control_frame(receiver.control_fd.get(),section_end);}
     }
 }
 
@@ -1119,31 +1064,26 @@ void send_repair_round(
 
     const auto repair_begin=srcast::encode_repair_begin(
         {transfer_id,section_id,round_id});
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
-        if(!receiver.completed &&!receiver.isolated)
-        {
-            send_control_frame(receiver.control_fd.get(),repair_begin);
-        }
+        if(!receiver.completed&&!receiver.isolated)
+        {send_control_frame(receiver.control_fd.get(),repair_begin);}
     }
 
     const auto missing_by_block=aggregate_missing_blocks(
         receivers,
         total_blocks,
         section_id);
-
     std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
     std::uint64_t multicast_packets=0;
     std::uint64_t unicast_packets=0;
-
-
     const auto first_block=srcast::section_first_block(section_id);
     const auto section_blocks=srcast::section_block_count(
         total_blocks,
         section_id);
     for(std::uint32_t local_block=0;
          local_block<section_blocks;
-++local_block)
+         local_block++)
          {
         const auto&targets=missing_by_block[local_block];
         if(targets.empty())
@@ -1151,7 +1091,6 @@ void send_repair_round(
             continue;
         }
         const auto block_id=first_block+local_block;
-
         std::uint64_t offset{};
         std::uint16_t payload_size{};
         read_block(
@@ -1162,7 +1101,6 @@ void send_repair_round(
             buffer,
             offset,
             payload_size);
-
         const auto packet=srcast::encode_data(
             transfer_id,
             section_id,
@@ -1171,13 +1109,10 @@ void send_repair_round(
             buffer.data(),
             payload_size,
             srcast::crc32(buffer.data(),payload_size));
-
-
-
         if(targets.size()>=kMulticastRepairThreshold)
         {
             send_udp_packet(udp_fd,multicast_destination,packet);
-++multicast_packets;
+            multicast_packets++;
         }
         else
         {
@@ -1186,7 +1121,7 @@ void send_repair_round(
                 udp_fd,
                 receivers[receiver_index].udp_destination,
                 packet);
-++unicast_packets;
+            unicast_packets++;
         }
 
         if(pace_us>0)
@@ -1199,8 +1134,6 @@ void send_repair_round(
     std::cout<<"repair round="<<round_id
 <<" multicast_packets="<<multicast_packets
 <<" unicast_packets="<<unicast_packets<<'\n';
-
-
     send_end_round(
         udp_fd,
         multicast_destination,
@@ -1241,10 +1174,8 @@ bool distribute_section(
         parse_block_set_env("SRCAST_CORRUPT_DATA_BLOCKS");
     const bool reverse_initial_data=
         env_flag_enabled("SRCAST_REVERSE_INITIAL_DATA");
-
     std::cout<<"sending section="<<section_id
 <<" blocks="<<section_blocks<<'\n';
-
     if(reverse_initial_data)
     {
         std::cout<<"fault injection reversed DATA section="
@@ -1255,16 +1186,14 @@ bool distribute_section(
     local_blocks.reserve(section_blocks);
     for(std::uint32_t local_block=0;
          local_block<section_blocks;
-++local_block)
+         local_block++)
          {
         local_blocks.push_back(local_block);
     }
     if(reverse_initial_data)
-    {
-        std::reverse(local_blocks.begin(),local_blocks.end());
-    }
+    {std::reverse(local_blocks.begin(),local_blocks.end());}
 
-    for(const auto local_block : local_blocks)
+    for(const auto local_block:local_blocks)
     {
         const auto block_id=first_block+local_block;
         std::uint64_t offset{};
@@ -1277,7 +1206,6 @@ bool distribute_section(
             buffer,
             offset,
             payload_size);
-
         const auto packet=srcast::encode_data(
             transfer_id,
             section_id,
@@ -1286,20 +1214,15 @@ bool distribute_section(
             buffer.data(),
             payload_size,
             srcast::crc32(buffer.data(),payload_size));
-
-        if(corrupt_blocks.find(block_id)!=corrupt_blocks.end() &&
-!packet.empty())
+        if(corrupt_blocks.find(block_id)!=corrupt_blocks.end()&&!packet.empty())
             {
             auto corrupted=packet;
             corrupted.back()^=0xffU;
             send_udp_packet(udp_fd,multicast_destination,corrupted);
             std::cout<<"fault injection corrupted DATA block_id="
 <<block_id<<'\n';
-        }
-        else
-        {
-            send_udp_packet(udp_fd,multicast_destination,packet);
-        }
+        }else
+        {send_udp_packet(udp_fd,multicast_destination,packet);}
 
         if(duplicate_blocks.find(block_id)!=duplicate_blocks.end())
         {
@@ -1323,7 +1246,6 @@ bool distribute_section(
         section_id,
         0,
         total_blocks);
-
     std::cout<<"section="<<section_id
 <<" initial multicast finished; collecting round 0 reports\n";
     collect_round_reports(
@@ -1339,11 +1261,9 @@ bool distribute_section(
         total_blocks,
         section_id,
         missing_threshold);
-
     for(int repair_round=1;
-         repair_round<=max_repair_rounds &&
-!all_receivers_completed(receivers);
-++repair_round)
+         repair_round<=max_repair_rounds&&!all_receivers_completed(receivers);
+         repair_round++)
          {
 
         const bool section_done=std::all_of(
@@ -1351,16 +1271,10 @@ bool distribute_section(
             receivers.end(),
             [](const ReceiverConnection&receiver)
             {
-                return receiver.completed||
-                    receiver.isolated||
-                    (receiver.status &&
-                     receiver.status->status==
-                         srcast::SectionStatusCode::Complete);
+                return receiver.completed||receiver.isolated||(receiver.status&&receiver.status->status==srcast::SectionStatusCode::Complete);
             });
         if(section_done)
-        {
-            return true;
-        }
+        {return true;}
 
         send_repair_round(
             udp_fd,
@@ -1374,7 +1288,6 @@ bool distribute_section(
             section_id,
             static_cast<std::uint32_t>(repair_round),
             pace_us);
-
         collect_round_reports(
             receivers,
             transfer_id,
@@ -1395,11 +1308,7 @@ bool distribute_section(
         receivers.end(),
         [](const ReceiverConnection&receiver)
         {
-            return receiver.completed||
-                receiver.isolated||
-                (receiver.status &&
-                 receiver.status->status==
-                     srcast::SectionStatusCode::Complete);
+            return receiver.completed||receiver.isolated||(receiver.status&&receiver.status->status==srcast::SectionStatusCode::Complete);
         });
 }
 
@@ -1411,9 +1320,7 @@ bool all_receivers_completed(
         receivers.begin(),
         receivers.end(),
         [](const ReceiverConnection&receiver)
-        {
-            return receiver.completed;
-        });
+        {return receiver.completed;});
 }
 
 void wait_for_receivers_ready(
@@ -1421,7 +1328,7 @@ void wait_for_receivers_ready(
     std::uint64_t transfer_id)
     {
 
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
         receiver.ready_for_next_transfer=false;
     }
@@ -1433,9 +1340,7 @@ void wait_for_receivers_ready(
             receivers.begin(),
             receivers.end(),
             [](const ReceiverConnection&receiver)
-            {
-                return receiver.ready_for_next_transfer;
-            });
+            {return receiver.ready_for_next_transfer;});
         if(all_ready)
         {
             std::cout<<"all receivers are ready for the next transfer\n";
@@ -1453,13 +1358,10 @@ void wait_for_receivers_ready(
             deadline-now);
         const auto timeout_ms=static_cast<int>(
             std::max<std::int64_t>(1,remaining.count()));
-
         const auto ready_indexes=wait_for_receiver_events(
             receivers,
             [](const ReceiverConnection&receiver)
-            {
-                return!receiver.ready_for_next_transfer;
-            },
+            {return!receiver.ready_for_next_transfer;},
             timeout_ms,
             "receiver ready acknowledgements");
         if(ready_indexes.empty())
@@ -1467,12 +1369,11 @@ void wait_for_receivers_ready(
             continue;
         }
 
-        for(const auto receiver_index : ready_indexes)
+        for(const auto receiver_index:ready_indexes)
         {
             auto&receiver=receivers[receiver_index];
             const auto frame=receive_control_frame(receiver.control_fd.get());
-            if(srcast::peek_control_type(frame)!=
-                srcast::ControlType::ReceiverReady)
+            if(srcast::peek_control_type(frame)!=srcast::ControlType::ReceiverReady)
                 {
                 std::cerr<<"ignore unexpected message while waiting for ready"
 <<" receiver_id="<<receiver.receiver_id<<'\n';
@@ -1480,8 +1381,7 @@ void wait_for_receivers_ready(
             }
 
             const auto message=srcast::decode_receiver_ready(frame);
-            if(message.receiver_id!=receiver.receiver_id||
-                message.previous_transfer_id!=transfer_id)
+            if(message.receiver_id!=receiver.receiver_id||message.previous_transfer_id!=transfer_id)
                 {
                 std::cerr<<"ignore stale RECEIVER_READY receiver_id="
 <<receiver.receiver_id<<'\n';
@@ -1502,12 +1402,10 @@ void notify_failed_receivers(
 
     const auto frame=srcast::encode_transfer_result(
         {transfer_id,srcast::TransferResultCode::Failed});
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
         if(!receiver.completed)
-        {
-            send_control_frame(receiver.control_fd.get(),frame);
-        }
+        {send_control_frame(receiver.control_fd.get(),frame);}
     }
 }
 
@@ -1522,8 +1420,7 @@ void backfill_isolated_receivers(
     {
 
     std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
-
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
         if(!receiver.isolated||receiver.completed)
         {
@@ -1534,13 +1431,11 @@ void backfill_isolated_receivers(
 <<receiver.receiver_id
 <<" blocks="<<receiver.backfill_blocks.size()
 <<'\n';
-
         send_control_frame(
             receiver.control_fd.get(),
             srcast::encode_backfill_begin(
                 {transfer_id,total_blocks}));
-
-        for(const auto block_id : receiver.backfill_blocks)
+        for(const auto block_id:receiver.backfill_blocks)
         {
             std::uint64_t offset{};
             std::uint16_t payload_size{};
@@ -1552,7 +1447,6 @@ void backfill_isolated_receivers(
                 buffer,
                 offset,
                 payload_size);
-
             srcast::BackfillDataMessage data;
             data.transfer_id=transfer_id;
             data.block_id=block_id;
@@ -1571,7 +1465,6 @@ void backfill_isolated_receivers(
             receiver.control_fd.get(),
             srcast::encode_backfill_end(
                 {transfer_id,file_size,total_blocks,digest}));
-
         for(;;)
         {
             const auto complete_frame=
@@ -1591,10 +1484,7 @@ void backfill_isolated_receivers(
 
             const auto complete=
                 srcast::decode_receiver_complete(complete_frame);
-            if(complete.receiver_id!=receiver.receiver_id||
-                complete.transfer_id!=transfer_id||
-                complete.file_size!=file_size||
-                complete.sha256!=digest)
+            if(complete.receiver_id!=receiver.receiver_id||complete.transfer_id!=transfer_id||complete.file_size!=file_size||complete.sha256!=digest)
                 {
                 throw std::runtime_error(
                     "invalid RECEIVER_COMPLETE after TCP backfill");
@@ -1631,11 +1521,9 @@ void send_central_status(
 void wait_for_meta_ready(
     std::vector<ReceiverConnection>&receivers,
     std::uint64_t transfer_id);
-
 void wait_for_receivers_ready(
     std::vector<ReceiverConnection>&receivers,
     std::uint64_t transfer_id);
-
 std::optional<CachedCentralFile>receive_cached_file_from_central(
     int central_fd,
     const std::string&cache_directory,
@@ -1667,8 +1555,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
 
     const auto expected_blocks64=
         (meta.file_size+meta.block_size-1)/meta.block_size;
-    if(expected_blocks64>std::numeric_limits<std::uint32_t>::max()||
-        static_cast<std::uint32_t>(expected_blocks64)!=meta.total_blocks)
+    if(expected_blocks64>std::numeric_limits<std::uint32_t>::max()||static_cast<std::uint32_t>(expected_blocks64)!=meta.total_blocks)
         {
         throw std::runtime_error("inconsistent central file block count");
     }
@@ -1678,21 +1565,12 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
     if(directory_error)
     {
         throw std::runtime_error(
-            "create central cache directory failed: "+
-            directory_error.message());
+            "create central cache directory failed: "+directory_error.message());
     }
-    require_disk_space(
-        cache_directory,
-        meta.file_size,
-        "central cache directory");
-
     const auto final_path=
-        (std::filesystem::path(cache_directory)/
-         ("central-transfer-"+std::to_string(meta.transfer_id)+".bin"))
+        (std::filesystem::path(cache_directory)/("central-transfer-"+std::to_string(meta.transfer_id)+".bin"))
             .string();
     const auto temporary_path=final_path+".part";
-    const auto checkpoint_path=central_checkpoint_path(final_path);
-
     if(std::filesystem::exists(final_path))
     {
         const auto actual_digest=srcast::sha256_file(final_path);
@@ -1718,6 +1596,29 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
                 actual_digest};
         }
     }
+    std::uint64_t existing_size=0;
+    std::error_code existing_error;
+    if(std::filesystem::exists(temporary_path,existing_error))
+    {
+        existing_size=std::filesystem::file_size(temporary_path,existing_error);
+    }
+    if(existing_error)
+    {
+        throw std::runtime_error(
+            "stat central cache temporary file failed: "+existing_error.message());
+    }
+    const auto additional=existing_size<meta.file_size?
+        meta.file_size-existing_size:0;
+    require_storage_limit(
+        cache_directory,
+        additional,
+        "SRCAST_CACHE_LIMIT_BYTES",
+        "central cache directory");
+    require_disk_space(
+        cache_directory,
+        meta.file_size,
+        "central cache directory");
+    const auto checkpoint_path=central_checkpoint_path(final_path);
 
     const auto section_count=
         srcast::section_count_for_blocks(meta.total_blocks);
@@ -1728,24 +1629,17 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
 
     FileDescriptor output(::open(
         temporary_path.c_str(),
-        O_CREAT|
-            (resume_section==0 ? O_TRUNC : 0)|
-            O_RDWR|
-            O_CLOEXEC,
+        O_CREAT|(resume_section==0?O_TRUNC:0)|O_RDWR|O_CLOEXEC,
         0644));
     if(output.get()<0)
-    {
-        system_error("open central cache temporary file");
-    }
+    {system_error("open central cache temporary file");}
     if(::ftruncate(output.get(),static_cast<off_t>(meta.file_size))!=0)
-    {
-        system_error("ftruncate central cache");
-    }
+    {system_error("ftruncate central cache");}
 
     std::vector<std::uint8_t>received(meta.total_blocks,0);
     for(std::uint32_t section_id=0;
          section_id<resume_section;
-++section_id)
+         section_id++)
          {
         const auto first_block=srcast::section_first_block(section_id);
         const auto section_blocks=srcast::section_block_count(
@@ -1753,7 +1647,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
             section_id);
         for(std::uint32_t local_block=0;
              local_block<section_blocks;
-++local_block)
+             local_block++)
              {
             received[first_block+local_block]=1;
         }
@@ -1764,15 +1658,13 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
             srcast::section_first_block(resume_section));
     std::uint64_t duplicate_count=0;
     std::uint64_t rejected_count=0;
-
     std::cout<<"central transfer started transfer_id="
 <<meta.transfer_id
 <<" size="<<meta.file_size
 <<" blocks="<<meta.total_blocks
 <<" resume_section="<<resume_section
 <<'/'<<section_count<<'\n';
-
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
         receiver.meta_ready=false;
         receiver.completed=false;
@@ -1791,14 +1683,10 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
     file_meta.block_size=meta.block_size;
     file_meta.total_blocks=meta.total_blocks;
     file_meta.sha256=meta.sha256;
-
     const auto file_meta_frame=srcast::encode_file_meta(file_meta);
-    for(auto&receiver : receivers)
-    {
-        send_control_frame(receiver.control_fd.get(),file_meta_frame);
-    }
+    for(auto&receiver:receivers)
+    {send_control_frame(receiver.control_fd.get(),file_meta_frame);}
     wait_for_meta_ready(receivers,meta.transfer_id);
-
     send_control_frame(
         central_fd,
         srcast::encode_central_resume(
@@ -1822,47 +1710,35 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         wait_for_receivers_ready(receivers,meta.transfer_id);
         throw std::runtime_error(reason);
     };
-
     std::uint32_t next_section_id=resume_section;
     for(;;)
     {
         const auto frame=receive_control_frame(central_fd);
         const auto type=srcast::peek_control_type(frame);
-
         if(type==srcast::ControlType::CentralData)
         {
             const auto data=srcast::decode_central_data(frame);
-            if(data.transfer_id!=meta.transfer_id||
-                data.block_id>=meta.total_blocks||
-                data.section_id!=next_section_id||
-                data.section_id!=
-                    srcast::section_id_for_block(data.block_id))
+            if(data.transfer_id!=meta.transfer_id||data.block_id>=meta.total_blocks||data.section_id!=next_section_id||data.section_id!=srcast::section_id_for_block(data.block_id))
                     {
-++rejected_count;
+                rejected_count++;
                 continue;
             }
 
             const auto expected_offset=
-                static_cast<std::uint64_t>(data.block_id) *
-                meta.block_size;
+                static_cast<std::uint64_t>(data.block_id)*meta.block_size;
             const auto expected_size=
                 static_cast<std::uint16_t>(
                     std::min<std::uint64_t>(
                         meta.block_size,
                         meta.file_size-expected_offset));
-
-            if(data.offset!=expected_offset||
-                data.payload_size!=expected_size||
-                data.offset+data.payload_size>meta.file_size||
-                srcast::crc32(data.payload.data(),data.payload.size())!=
-                    data.crc32)
+            if(data.offset!=expected_offset||data.payload_size!=expected_size||data.offset+data.payload_size>meta.file_size||srcast::crc32(data.payload.data(),data.payload.size())!=data.crc32)
                     {
-++rejected_count;
+                rejected_count++;
                 continue;
             }
             if(received[data.block_id]!=0)
             {
-++duplicate_count;
+                duplicate_count++;
                 continue;
             }
 
@@ -1872,10 +1748,8 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
                 data.payload.size(),
                 data.offset);
             received[data.block_id]=1;
-++received_count;
-
-            if(received_count%1000U==0U||
-                received_count==meta.total_blocks)
+            received_count++;
+            if(received_count%1000U==0U||received_count==meta.total_blocks)
                 {
                 std::cout<<"central cached "
 <<received_count<<'/'
@@ -1891,11 +1765,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         }
 
         const auto end=srcast::decode_central_file_end(frame);
-        if(end.transfer_id!=meta.transfer_id||
-            end.total_blocks!=meta.total_blocks||
-            end.section_id!=next_section_id||
-            end.section_id>=section_count||
-            rejected_count!=0)
+        if(end.transfer_id!=meta.transfer_id||end.total_blocks!=meta.total_blocks||end.section_id!=next_section_id||end.section_id>=section_count||rejected_count!=0)
             {
             fail_after_meta(
                 "central transfer did not complete cleanly",
@@ -1908,7 +1778,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
             end.section_id);
         for(std::uint32_t local_block=0;
              local_block<section_blocks;
-++local_block)
+             local_block++)
              {
             if(received[first_block+local_block]==0)
             {
@@ -1943,9 +1813,8 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         {
             const auto completed_section=end.section_id+1U;
             if(::fsync(output.get())!=0)
-            {
-                system_error("fsync central cache section");
-            }
+            {system_error("fsync central cache section");}
+
             save_central_checkpoint(
                 checkpoint_path,
                 meta,
@@ -1970,9 +1839,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         }
 
         if(::fsync(output.get())!=0)
-        {
-            system_error("fsync central cache");
-        }
+        {system_error("fsync central cache");}
         output.reset(-1);
 
         const auto actual_digest=srcast::sha256_file(temporary_path);
@@ -2000,9 +1867,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
         FileDescriptor backfill_input(
             ::open(final_path.c_str(),O_RDONLY|O_CLOEXEC));
         if(backfill_input.get()<0)
-        {
-            system_error("open central cache for TCP backfill");
-        }
+        {system_error("open central cache for TCP backfill");}
         backfill_isolated_receivers(
             receivers,
             backfill_input.get(),
@@ -2011,14 +1876,12 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
             meta.transfer_id,
             meta.total_blocks,
             actual_digest);
-
         send_central_status(
             central_fd,
             meta.transfer_id,
             srcast::CentralStatusCode::Cached,
             meta.file_size,
             actual_digest);
-
         if(all_receivers_completed(receivers))
         {
             std::cout<<"file completed by all receivers: "
@@ -2032,19 +1895,15 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(
                     receivers.begin(),
                     receivers.end(),
                     [](const ReceiverConnection&receiver)
-                    {
-                        return receiver.completed;
-                    }));
+                    {return receiver.completed;}));
             std::cout<<"file finished PARTIAL completed="
 <<completed_count<<'/'<<receivers.size()
 <<" after max repair rounds\n";
         }
         wait_for_receivers_ready(receivers,meta.transfer_id);
-
         std::cout<<"central transfer cached path="<<final_path
 <<" duplicates="<<duplicate_count
 <<" rejected="<<rejected_count<<'\n';
-
         return CachedCentralFile{
             final_path,
             meta.transfer_id,
@@ -2061,27 +1920,22 @@ void wait_for_meta_ready(
 
     const auto deadline=
         SteadyClock::now()+kMetaReadyTimeout;
-
     for(;;)
     {
         const bool all_ready=std::all_of(
             receivers.begin(),
             receivers.end(),
             [](const ReceiverConnection&receiver)
-            {
-                return receiver.meta_ready;
-            });
-
+            {return receiver.meta_ready;});
         if(all_ready)
         {
             std::cout
-<<"all receivers accepted FILE_META; "
+<<"all receivers accepted FILE_META;"
 <<"starting UDP DATA\n";
             return;
         }
 
         const auto now=SteadyClock::now();
-
         if(now>=deadline)
         {
             throw std::runtime_error(
@@ -2089,22 +1943,17 @@ void wait_for_meta_ready(
         }
 
         const auto remaining=
-            std::chrono::duration_cast<
-                std::chrono::milliseconds>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
                     deadline-now);
-
         const auto timeout_ms=
             static_cast<int>(
                 std::max<std::int64_t>(
                     1,
                     remaining.count()));
-
         const auto ready_indexes=wait_for_receiver_events(
             receivers,
             [](const ReceiverConnection&receiver)
-            {
-                return!receiver.meta_ready;
-            },
+            {return!receiver.meta_ready;},
             timeout_ms,
             "META_READY");
         if(ready_indexes.empty())
@@ -2112,22 +1961,17 @@ void wait_for_meta_ready(
             continue;
         }
 
-        for(const auto receiver_index : ready_indexes)
+        for(const auto receiver_index:ready_indexes)
         {
             auto&receiver=
                 receivers[receiver_index];
 
-
-
             const auto frame=
                 receive_control_frame(
                     receiver.control_fd.get());
-
             const auto type=
                 srcast::peek_control_type(frame);
-
-            if(type!=
-                srcast::ControlType::MetaReady)
+            if(type!=srcast::ControlType::MetaReady)
                 {
 
                 throw std::runtime_error(
@@ -2137,11 +1981,7 @@ void wait_for_meta_ready(
 
             const auto message=
                 srcast::decode_meta_ready(frame);
-
-            if(message.receiver_id!=
-                    receiver.receiver_id||
-                message.transfer_id!=
-                    transfer_id)
+            if(message.receiver_id!=receiver.receiver_id||message.transfer_id!=transfer_id)
                     {
 
                 throw std::runtime_error(
@@ -2149,7 +1989,6 @@ void wait_for_meta_ready(
             }
 
             receiver.meta_ready=true;
-
             std::cout
 <<"META_READY receiver_id="
 <<receiver.receiver_id
@@ -2170,7 +2009,7 @@ void send_file(
     {
     (void)file_count,(void)file_index;
 
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
         receiver.meta_ready=false;
         receiver.completed=false;
@@ -2180,11 +2019,8 @@ void send_file(
         receiver.status.reset();
     }
 
-    struct stat status{};
-    if(::stat(file_path.c_str(),&status)!=0)
-    {
-        system_error("stat "+file_path);
-    }
+    struct stat status{};    if(::stat(file_path.c_str(),&status)!=0)
+    {system_error("stat "+file_path);}
     if(!S_ISREG(status.st_mode)||status.st_size<0)
     {
         throw std::runtime_error(
@@ -2194,7 +2030,6 @@ void send_file(
     const auto file_size=static_cast<std::uint64_t>(status.st_size);
     const auto total_blocks64=
         (file_size+srcast::kPayloadSize-1)/srcast::kPayloadSize;
-
     if(total_blocks64>std::numeric_limits<std::uint32_t>::max())
     {
         throw std::runtime_error(
@@ -2204,14 +2039,11 @@ void send_file(
     const auto total_blocks=static_cast<std::uint32_t>(total_blocks64);
     const auto digest=srcast::sha256_file(file_path);
     const auto transfer_id=create_transfer_id();
-
     FileDescriptor input(::open(file_path.c_str(),O_RDONLY|O_CLOEXEC));
     if(input.get()<0)
-    {
-        system_error("open source file "+file_path);
-    }
+    {system_error("open source file "+file_path);}
 
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
         receiver.meta_ready=false;
         receiver.completed=false;
@@ -2224,36 +2056,29 @@ void send_file(
     }
 
     srcast::FileMetaMessage file_meta;
-
     file_meta.transfer_id=transfer_id;
     file_meta.section_id=kSectionId;
     file_meta.file_size=file_size;
     file_meta.block_size=srcast::kPayloadSize;
     file_meta.total_blocks=total_blocks;
     file_meta.sha256=digest;
-
     const auto file_meta_frame=
         srcast::encode_file_meta(file_meta);
 
-
-
-    for(auto&receiver : receivers)
+    for(auto&receiver:receivers)
     {
         send_control_frame(
             receiver.control_fd.get(),
             file_meta_frame);
     }
 
-
-
     wait_for_meta_ready(
         receivers,
         transfer_id);
-
     const auto section_count=srcast::section_count_for_blocks(total_blocks);
     for(std::uint32_t section_id=0;
-         section_id<section_count &&!all_receivers_completed(receivers);
-++section_id)
+         section_id<section_count&&!all_receivers_completed(receivers);
+         section_id++)
          {
         const bool section_delivered=distribute_section(
             udp_fd,
@@ -2282,7 +2107,6 @@ void send_file(
         transfer_id,
         total_blocks,
         digest);
-
     if(all_receivers_completed(receivers))
     {
         std::cout<<"file completed by all receivers: "
@@ -2295,24 +2119,21 @@ void send_file(
             receivers.begin(),
             receivers.end(),
             [](const ReceiverConnection&receiver)
-            {
-                return receiver.completed;
-            }));
+            {return receiver.completed;}));
         std::cout<<"file finished PARTIAL completed="
 <<completed_count<<'/'<<receivers.size()
 <<" after max repair rounds\n";
     }
-
 
     wait_for_receivers_ready(receivers,transfer_id);
 }
 
 }
 
-int main(int argc,char** argv) try {
+int main(int argc,char**argv) try
+{
     std::cout<<std::unitbuf;
     std::cerr<<std::unitbuf;
-
     if(argc<10)
     {
         usage(argv[0]);
@@ -2328,19 +2149,14 @@ int main(int argc,char** argv) try {
     const int gap_ms=std::stoi(argv[7]);
     const int max_repair_rounds=std::stoi(argv[8]);
     const bool central_mode=
-        argc==12 && std::string(argv[9])=="--central-listen";
-    const int central_port=central_mode ? std::stoi(argv[10]):0;
-    const std::string cache_directory=central_mode ? argv[11] : "";
-
-    if(udp_port<1||udp_port>65535||
-        control_port<1||control_port>65535||
-        receiver_count<1||
-        pace_us<0||gap_ms<0||max_repair_rounds<0||
-        (central_mode && (central_port<1||central_port>65535)))
+        argc==12&&std::string(argv[9])=="--central-listen";
+    const int central_port=central_mode?std::stoi(argv[10]):0;
+    const std::string cache_directory=central_mode?argv[11]:"";
+    if(udp_port<1||udp_port>65535||control_port<1||control_port>65535||receiver_count<1||pace_us<0||gap_ms<0||max_repair_rounds<0||(central_mode&&(central_port<1||central_port>65535)))
         {
         throw std::runtime_error("invalid command-line argument");
     }
-    if(!central_mode && std::string(argv[9])=="--central-listen")
+    if(!central_mode&&std::string(argv[9])=="--central-listen")
     {
         usage(argv[0]);
         return 2;
@@ -2351,9 +2167,7 @@ int main(int argc,char** argv) try {
         SOCK_DGRAM|SOCK_CLOEXEC,
         0));
     if(udp_fd.get()<0)
-    {
-        system_error("socket UDP");
-    }
+    {system_error("socket UDP");}
 
     const unsigned char ttl=1;
     const unsigned char loop=1;
@@ -2363,18 +2177,14 @@ int main(int argc,char** argv) try {
             IP_MULTICAST_TTL,
             &ttl,
             sizeof(ttl))!=0)
-            {
-        system_error("setsockopt IP_MULTICAST_TTL");
-    }
+            {system_error("setsockopt IP_MULTICAST_TTL");}
     if(::setsockopt(
             udp_fd.get(),
             IPPROTO_IP,
             IP_MULTICAST_LOOP,
             &loop,
             sizeof(loop))!=0)
-            {
-        system_error("setsockopt IP_MULTICAST_LOOP");
-    }
+            {system_error("setsockopt IP_MULTICAST_LOOP");}
 
     if(interface_ip!="0.0.0.0")
     {
@@ -2392,9 +2202,7 @@ int main(int argc,char** argv) try {
                 IP_MULTICAST_IF,
                 &interface_address,
                 sizeof(interface_address))!=0)
-                {
-            system_error("setsockopt IP_MULTICAST_IF");
-        }
+                {system_error("setsockopt IP_MULTICAST_IF");}
     }
 
     sockaddr_in multicast_destination{};
@@ -2404,14 +2212,11 @@ int main(int argc,char** argv) try {
     if(::inet_pton(
             AF_INET,
             multicast_ip.c_str(),
-            &multicast_destination.sin_addr)!=1||
-!IN_MULTICAST(ntohl(multicast_destination.sin_addr.s_addr)))
+            &multicast_destination.sin_addr)!=1||!IN_MULTICAST(ntohl(multicast_destination.sin_addr.s_addr)))
         {
         throw std::runtime_error(
             "destination must be an IPv4 multicast address");
     }
-
-
 
     auto listener=create_control_listener(control_port);
     std::optional<FileDescriptor>central_listener;
@@ -2426,7 +2231,6 @@ int main(int argc,char** argv) try {
     auto receivers=accept_receivers(
         listener.get(),
         static_cast<std::size_t>(receiver_count));
-
     if(central_mode)
     {
         bool central_session_finished=false;
@@ -2472,7 +2276,8 @@ int main(int argc,char** argv) try {
                         central_session_finished=true;
                         break;
                     }
-                } catch(const std::exception&error) {
+                }catch(const std::exception&error)
+                {
                     std::cerr<<"central session interrupted: "
 <<error.what()
 <<"; waiting for reconnect\n";
@@ -2484,15 +2289,12 @@ int main(int argc,char** argv) try {
     else
     {
         const std::size_t file_count=static_cast<std::size_t>(argc-9);
-
-
         for(int argument_index=9;
              argument_index<argc;
-++argument_index)
+             argument_index++)
              {
             const std::size_t file_index=
                 static_cast<std::size_t>(argument_index-8);
-
             send_file(
                 udp_fd.get(),
                 multicast_destination,
@@ -2502,8 +2304,7 @@ int main(int argc,char** argv) try {
                 max_repair_rounds,
                 file_index,
                 file_count);
-
-            if(argument_index+1<argc && gap_ms>0)
+            if(argument_index+1<argc&&gap_ms>0)
             {
                 std::cout<<"waiting "<<gap_ms
 <<"ms before the next file\n";
@@ -2513,17 +2314,14 @@ int main(int argc,char** argv) try {
         }
     }
 
-
     const auto session_end=srcast::encode_session_end();
-    for(auto&receiver : receivers)
-    {
-        send_control_frame(receiver.control_fd.get(),session_end);
-    }
+    for(auto&receiver:receivers)
+    {send_control_frame(receiver.control_fd.get(),session_end);}
 
     std::cout<<"all files processed serially\n";
     return 0;
-
-} catch(const std::exception&error) {
+}catch(const std::exception&error)
+{
     std::cerr<<"sender error: "<<error.what()<<'\n';
     return 1;
 }

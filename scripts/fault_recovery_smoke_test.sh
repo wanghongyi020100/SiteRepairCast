@@ -217,3 +217,4 @@ grep -Eq "recovered_blocks=[1-9]" "$KILL_DIR/receiver-2-resume.log"
 grep -q "central confirmed cached transfer_id=" "$KILL_DIR/central-resume.log"
 
 echo "fault recovery smoke test passed"
+

@@ -1,7 +1,6 @@
 #include"checksum.hpp"
 
 #include<openssl/evp.h>
-
 #include<array>
 #include<cerrno>
 #include<cstring>
@@ -10,29 +9,27 @@
 #include<memory>
 #include<sstream>
 #include<stdexcept>
-
 namespace srcast
 {
 std::uint32_t crc32(const std::uint8_t*data,std::size_t size)
 {
     static const std::array<std::uint32_t,256>table=[] {
         std::array<std::uint32_t,256>result{};
-        for(std::uint32_t i=0; i<result.size();++i)
+        for(std::uint32_t i=0;i<result.size();i++)
         {
             std::uint32_t value=i;
-            for(int bit=0; bit<8;++bit)
+            for(int bit=0;bit<8;bit++)
             {
-                value=(value & 1U) ? (0xedb88320U^(value>>1U)):(value>>1U);
+                value=(value&1U)?(0xedb88320U^(value>>1U)):(value>>1U);
             }
             result[i]=value;
         }
         return result;
     }();
-
     std::uint32_t value=0xffffffffU;
-    for(std::size_t i=0; i<size;++i)
+    for(std::size_t i=0;i<size;i++)
     {
-        value=table[(value^data[i]) & 0xffU]^(value>>8U);
+        value=table[(value^data[i])&0xffU]^(value>>8U);
     }
     return value^0xffffffffU;
 }
@@ -52,12 +49,12 @@ std::array<std::uint8_t,32>sha256_file(const std::string&path)
         throw std::runtime_error("EVP_DigestInit_ex failed");
     }
 
-    std::array<char,64 * 1024>buffer{};
+    std::array<char,64*1024>buffer{};
     while(input)
     {
         input.read(buffer.data(),static_cast<std::streamsize>(buffer.size()));
         const auto count=input.gcount();
-        if(count>0 && EVP_DigestUpdate(context.get(),buffer.data(),static_cast<std::size_t>(count))!=1)
+        if(count>0&&EVP_DigestUpdate(context.get(),buffer.data(),static_cast<std::size_t>(count))!=1)
         {
             throw std::runtime_error("EVP_DigestUpdate failed");
         }
@@ -80,10 +77,8 @@ std::string hex_digest(const std::array<std::uint8_t,32>&digest)
 {
     std::ostringstream output;
     output<<std::hex<<std::setfill('0');
-    for(const auto byte : digest)
-    {
-        output<<std::setw(2)<<static_cast<unsigned int>(byte);
-    }
+    for(const auto byte:digest)
+    {output<<std::setw(2)<<static_cast<unsigned int>(byte);}
     return output.str();
 }
 

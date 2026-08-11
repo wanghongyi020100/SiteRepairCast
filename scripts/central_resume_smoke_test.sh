@@ -117,3 +117,4 @@ grep -q "central confirmed section=3" "$WORK_DIR/central-resume.log"
 grep -q "central confirmed cached transfer_id=" "$WORK_DIR/central-resume.log"
 
 echo "central resume smoke test passed"
+

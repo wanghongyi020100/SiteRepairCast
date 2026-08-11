@@ -303,3 +303,4 @@ REPORT="$ARTIFACT_DIR/benchmark_report.md"
 
 cat "$REPORT"
 echo "benchmark benchmark passed"
+
