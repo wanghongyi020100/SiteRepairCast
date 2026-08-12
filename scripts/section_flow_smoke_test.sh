@@ -114,4 +114,3 @@ grep -q "repair round=1" "$WORK_DIR/proxy.log"
 grep -q "section complete; waiting for next section" "$WORK_DIR/receiver-1.log"
 
 echo "section flow smoke test passed"
-

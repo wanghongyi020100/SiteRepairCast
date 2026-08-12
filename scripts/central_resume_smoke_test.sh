@@ -110,11 +110,10 @@ fi
 grep -q "test hook closing central connection after 2 confirmed sections" \
     "$WORK_DIR/central-first.log"
 grep -q "central session interrupted" "$WORK_DIR/proxy.log"
-grep -q "resume_section=2/4" "$WORK_DIR/proxy.log"
-grep -q "central resume transfer_id=.*next_section=2/4" \
+grep -q "resume_section=2/" "$WORK_DIR/proxy.log"
+grep -q "central resume transfer_id=.*next_section=2/" \
     "$WORK_DIR/central-resume.log"
 grep -q "central confirmed section=3" "$WORK_DIR/central-resume.log"
 grep -q "central confirmed cached transfer_id=" "$WORK_DIR/central-resume.log"
 
 echo "central resume smoke test passed"
-

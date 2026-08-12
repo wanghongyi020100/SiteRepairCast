@@ -107,4 +107,3 @@ grep -q "TCP backfill completed; waiting for COMPLETE_ACK" \
 grep -q "central confirmed cached transfer_id=" "$WORK_DIR/central.log"
 
 echo "tcp backfill smoke test passed"
-

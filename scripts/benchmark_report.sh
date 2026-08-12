@@ -266,9 +266,9 @@ run_scenario "mixed-lan-loss-2-receivers" 2 512 \
     ""
 run_scenario "slow-backfill-4-receivers" 4 512 "SRCAST_SLOW_MISSING_THRESHOLD=8" \
     "" \
-    "" \
-    "" \
-    "SRCAST_DROP_INITIAL_BLOCKS=0,1,2,3,4,5,6,7,8,9,10,11"
+    "SRCAST_DROP_INITIAL_BLOCKS=0,1,2,3,4,5,6,7,8,9,10,11" \
+    "SRCAST_DROP_INITIAL_BLOCKS=12,13,14,15,16,17,18,19,20,21,22,23" \
+    ""
 
 CSV="$ARTIFACT_DIR/benchmark_metrics.csv"
 {
@@ -303,4 +303,3 @@ REPORT="$ARTIFACT_DIR/benchmark_report.md"
 
 cat "$REPORT"
 echo "benchmark benchmark passed"
-

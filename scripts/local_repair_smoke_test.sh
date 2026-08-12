@@ -90,4 +90,3 @@ grep -q "test hook dropped initial DATA block_id=3" "$WORK_DIR/receiver-1.log"
 grep -q "test hook dropped initial DATA block_id=3" "$WORK_DIR/receiver-2.log"
 
 echo "local repair smoke test passed"
-

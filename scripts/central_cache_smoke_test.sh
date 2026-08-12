@@ -108,4 +108,3 @@ grep -q "MISSING missing_blocks=" "$WORK_DIR/proxy.log"
 grep -q "repair round=1" "$WORK_DIR/proxy.log"
 
 echo "central cache smoke test passed"
-

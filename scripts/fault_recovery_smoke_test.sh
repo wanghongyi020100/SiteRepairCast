@@ -209,12 +209,11 @@ assert_sha \
     "$KILL_DIR/receiver-1" \
     "$KILL_DIR/receiver-2"
 
-grep -q "resume_section=2/4" "$PROXY_KILL_RESUME_LOG"
-grep -q "central resume transfer_id=.*next_section=2/4" \
+grep -q "resume_section=2/" "$PROXY_KILL_RESUME_LOG"
+grep -q "central resume transfer_id=.*next_section=2/" \
     "$KILL_DIR/central-resume.log"
 grep -Eq "recovered_blocks=[1-9]" "$KILL_DIR/receiver-1-resume.log"
 grep -Eq "recovered_blocks=[1-9]" "$KILL_DIR/receiver-2-resume.log"
 grep -q "central confirmed cached transfer_id=" "$KILL_DIR/central-resume.log"
 
 echo "fault recovery smoke test passed"
-

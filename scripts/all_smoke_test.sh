@@ -8,5 +8,6 @@ for week in 2 3 4 5 6 7; do
 done
 
 bash "$ROOT_DIR/scripts/benchmark_smoke_test.sh"
+SRCAST_SECTION_BLOCKS=17 bash "$ROOT_DIR/scripts/central_cache_smoke_test.sh"
+bash "$ROOT_DIR/scripts/multi_proxy_smoke_test.sh"
 echo "all SiteRepairCast smoke tests passed"
-
