@@ -24,3 +24,32 @@ target_compile_options(receiver_agent PRIVATE -Wall -Wextra -Wpedantic -Wconvers
 add_executable(central_sender src/central_sender.cpp)
 target_link_libraries(central_sender PRIVATE srcast_common Threads::Threads)
 target_compile_options(central_sender PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+find_program(BASH_EXECUTABLE bash)
+if(BASH_EXECUTABLE)
+    set(SMOKE_TEST_BUILD_DIRS
+        ${CMAKE_SOURCE_DIR}/build-local-repair-smoke
+        ${CMAKE_SOURCE_DIR}/build-central-cache-smoke
+        ${CMAKE_SOURCE_DIR}/build-section-flow-smoke
+        ${CMAKE_SOURCE_DIR}/build-central-resume-smoke
+        ${CMAKE_SOURCE_DIR}/build-tcp-backfill-smoke
+        ${CMAKE_SOURCE_DIR}/build-fault-recovery-smoke
+        ${CMAKE_SOURCE_DIR}/build-benchmark-smoke
+        ${CMAKE_SOURCE_DIR}/build-multi-proxy-smoke
+    )
+
+    add_custom_target(test
+        COMMAND ${BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/all_smoke_test.sh
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        USES_TERMINAL
+    )
+
+    add_custom_target(cleantest
+        COMMAND ${CMAKE_COMMAND} -E rm -rf
+            ${SMOKE_TEST_BUILD_DIRS}
+            ${CMAKE_SOURCE_DIR}/artifacts/benchmark
+        COMMAND ${BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/all_smoke_test.sh
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        USES_TERMINAL
+    )
+endif()

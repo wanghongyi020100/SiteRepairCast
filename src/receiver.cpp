@@ -36,13 +36,12 @@
 namespace
 {
 using SteadyClock=std::chrono::steady_clock;
-constexpr auto kDrainQuietPeriod=std::chrono::milliseconds(200);
-constexpr auto kDrainHardTimeout=std::chrono::seconds(1);
-constexpr std::size_t kMaxUdpPacketsPerBatch=256;
-constexpr auto kUdpBatchTimeBudget=std::chrono::milliseconds(2);
+constexpr auto kDrainQuietPeriod=std::chrono::milliseconds(200);//等待UDP数据安静的时间
+constexpr auto kDrainHardTimeout=std::chrono::seconds(1);//等待缺块统计的最长时间
+constexpr std::size_t kMaxUdpPacketsPerBatch=256;//单轮最多处理的UDP包数量
+constexpr auto kUdpBatchTimeBudget=std::chrono::milliseconds(2);//单轮处理UDP的最长时间
 
-class ControlStreamReader
-{
+class ControlStreamReader{
 public:
     std::vector<std::vector<std::uint8_t>>read_frames(int fd)
     {
@@ -156,11 +155,11 @@ void add_epoll_interest(int epoll_fd,int fd)
 void usage(const char *program)
 {
     std::cerr
-<<"Usage: "<<program
-<<"<multicast_ip><udp_port><output_directory>"
-<<"<proxy_ip><control_port><receiver_id>[interface_ip]\n"
-<<"Example: "<<program
-<<" 239.255.42.99 5000 received 127.0.0.1 6000 1 127.0.0.1\n";
+        <<"Usage: "<<program
+        <<" <multicast_ip> <udp_port> <output_directory>"
+        <<" <proxy_ip> <control_port> <receiver_id> [interface_ip]\n"
+        <<"Example: "<<program
+        <<" 239.255.42.99 5000 received 127.0.0.1 6000 1 127.0.0.1\n";
 }
 
 struct ReceiverOptions
@@ -242,9 +241,10 @@ struct TransferState
     bool awaiting_complete_ack{false};
     std::unordered_set<std::uint32_t>intentionally_dropped_blocks;
 };
-
+//正式文件旁边放 .state，重启时和 .part 一起校验
 std::string received_state_path(const std::string &output_path){return output_path+".state";}
 
+//位图
 std::string hex_bytes(const std::vector<std::uint8_t>&bytes)
 {
     static constexpr char digits[]="0123456789abcdef";
@@ -258,7 +258,7 @@ std::string hex_bytes(const std::vector<std::uint8_t>&bytes)
     return result;
 }
 
-std::optional<std::vector<std::uint8_t>>parse_hex_bytes(const std::string&hex)
+std::optional<std::vector<std::uint8_t>>parse_hex_bytes(const std::string& hex)
 {
     if(hex.size()%2U!=0U)return std::nullopt;
 
@@ -267,7 +267,7 @@ std::optional<std::vector<std::uint8_t>>parse_hex_bytes(const std::string&hex)
         if(ch>='0'&&ch<='9')return ch-'0';
         if(ch>='a'&&ch<='f')return ch-'a'+10;
         if(ch>='A'&&ch<='F')return ch-'A'+10;
-        return-1;
+        return -1;
     };
 
     std::vector<std::uint8_t>bytes(hex.size()/2U);
@@ -281,6 +281,7 @@ std::optional<std::vector<std::uint8_t>>parse_hex_bytes(const std::string&hex)
     return bytes;
 }
 
+//恢复时要同时检查 transfer_id、文件大小、摘要和位图计数。
 bool load_receiver_state(TransferState &state,const srcast::MetaPacket &meta)
 {
     if(!std::filesystem::exists(state.state_path)||!std::filesystem::exists(state.temporary_path))
@@ -303,7 +304,7 @@ bool load_receiver_state(TransferState &state,const srcast::MetaPacket &meta)
     std::string digest_hex;
     std::string received_hex;
     input>>magic>>version>>transfer_id>>file_size>>total_blocks>>section_block_count>>digest_hex
->>received_count>>received_hex;
+         >>received_count>>received_hex;
     auto received=parse_hex_bytes(received_hex);
     if(!input||!received||magic!="SRC_RECEIVER_STATE"||version!=2||transfer_id!=meta.common.transfer_id||
         file_size!=meta.file_size||total_blocks!=meta.total_blocks||
@@ -318,6 +319,7 @@ bool load_receiver_state(TransferState &state,const srcast::MetaPacket &meta)
     return true;
 }
 
+//先写.tmp 再rename，避免state文件被写坏一半
 void save_receiver_state(const TransferState &state)
 {
     const auto temporary_state_path=state.state_path+".tmp";
@@ -328,9 +330,9 @@ void save_receiver_state(const TransferState &state)
             throw std::runtime_error("open receiver state failed: "+temporary_state_path);
         }
         output<<"SRC_RECEIVER_STATE 2\n"<<state.meta.common.transfer_id<<'\n'<<state.meta.file_size<<'\n'
-<<state.meta.total_blocks<<'\n'<<state.meta.section_block_count<<'\n'
-<<srcast::hex_digest(state.meta.sha256)<<'\n'<<state.received_count<<'\n'
-<<hex_bytes(state.received)<<'\n';
+        <<state.meta.total_blocks<<'\n'<<state.meta.section_block_count<<'\n'
+        <<srcast::hex_digest(state.meta.sha256)<<'\n'<<state.received_count<<'\n'
+        <<hex_bytes(state.received)<<'\n';
         output.flush();
         if(!output)
         {
@@ -346,6 +348,7 @@ void save_receiver_state(const TransferState &state)
     }
 }
 
+//测试hook：只丢初始轮指定block，修复轮正常接
 std::unordered_set<std::uint32_t>parse_initial_drop_blocks()
 {
     std::unordered_set<std::uint32_t>blocks;
@@ -378,6 +381,7 @@ std::unordered_set<std::uint32_t>parse_initial_drop_blocks()
     return blocks;
 }
 
+//初始化临时文件；如果 state 和 .part 匹配，就从已有位图继续。
 bool initialize_transfer(TransferState &state,const srcast::MetaPacket &meta,
                          const std::string &output_directory)
 {
@@ -432,13 +436,14 @@ bool initialize_transfer(TransferState &state,const srcast::MetaPacket &meta,
     }
 
     std::cout<<"accepted transfer_id="<<meta.common.transfer_id<<'\n'
-<<"sections="<<srcast::section_count_for_blocks(meta.total_blocks,meta.section_block_count)<<'\n'
-<<"file_size="<<meta.file_size<<" bytes\n"<<"blocks="<<meta.total_blocks<<'\n'
-<<"recovered_blocks="<<state.received_count<<'\n'
-<<"expected_sha256="<<srcast::hex_digest(meta.sha256)<<'\n';
+    <<"sections="<<srcast::section_count_for_blocks(meta.total_blocks,meta.section_block_count)<<'\n'
+    <<"file_size="<<meta.file_size<<" bytes\n"<<"blocks="<<meta.total_blocks<<'\n'
+    <<"recovered_blocks="<<state.received_count<<'\n'
+    <<"expected_sha256="<<srcast::hex_digest(meta.sha256)<<'\n';
     return true;
 }
 
+//只统计当前section，避免每轮扫描文件
 std::vector<std::uint8_t>make_missing_bitmap(const TransferState &state,std::uint32_t section_id,
                                              std::uint32_t &missing_count)
 {
@@ -459,7 +464,8 @@ std::vector<std::uint8_t>make_missing_bitmap(const TransferState &state,std::uin
     return bitmap;
 }
 
-bool finalize_transfer(TransferState &state,std::array<std::uint8_t,srcast::kSha256Size>&actual_digest)
+//最终提交检查文件SHA
+bool finalize_transfer(TransferState &state,std::array<std::uint8_t,srcast::kSha256Size> &actual_digest)
 {
     if(state.received_count!=state.meta.total_blocks)return false;
     if(::fsync(state.output.get())!=0)
@@ -486,11 +492,12 @@ bool finalize_transfer(TransferState &state,std::array<std::uint8_t,srcast::kSha
     std::error_code remove_error;
     std::filesystem::remove(state.state_path,remove_error);
     std::cout<<"COMPLETED output="<<state.output_path<<" duplicates="<<state.duplicate_count
-<<" intentional_drops="<<state.intentional_drop_count<<" rejected="<<state.rejected_count<<'\n';
+        <<" intentional_drops="<<state.intentional_drop_count<<" rejected="<<state.rejected_count<<'\n';
     return true;
 }
 
-void send_section_status(int control_fd,std::uint64_t receiver_id,const TransferState&state,
+//缺块，完成状态都从TCP控制回 proxy
+void send_section_status(int control_fd,std::uint64_t receiver_id,const TransferState& state,
                         std::uint32_t section_id,std::uint32_t round_id,srcast::SectionStatusCode status,
                         std::uint32_t missing_count,std::vector<std::uint8_t>missing_bitmap)
 {
@@ -505,6 +512,7 @@ void send_section_status(int control_fd,std::uint64_t receiver_id,const Transfer
     send_control_frame(control_fd,srcast::encode_section_status(message));
 }
 
+//DATA结束后等quiet period，内核处理UDP队列里的包
 void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
                              TransferState &state,std::uint32_t round_id)
 {
@@ -516,7 +524,7 @@ void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
     std::uint32_t missing_count{};
     auto missing_bitmap=make_missing_bitmap(state,section_id,missing_count);
     std::cout<<"DATA quiet period finished; round="<<round_id<<" section="<<section_id
-<<" missing_blocks="<<missing_count<<'\n';
+             <<" missing_blocks="<<missing_count<<'\n';
     if(missing_count!=0)
     {
         send_section_status(control_fd,receiver_id,state,section_id,round_id,
@@ -558,7 +566,7 @@ void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
 }
 
 bool should_drop_initial_block_for_test(TransferState &state,
-    const std::unordered_set<std::uint32_t>&configured_blocks,std::uint32_t block_id)
+    const std::unordered_set<std::uint32_t>& configured_blocks,std::uint32_t block_id)
 {
     if(configured_blocks.empty()||state.last_end_round)return false;
     if(configured_blocks.find(block_id)==configured_blocks.end())return false;
@@ -570,9 +578,10 @@ bool should_drop_initial_block_for_test(TransferState &state,
     return true;
 }
 
+//同一轮SECTION_END可能重复到，drain timer只保留当前轮
 void begin_drain_for_round(TransferState &state,std::uint32_t section_id,std::uint32_t round_id,
     std::uint32_t total_blocks,int drain_timer_fd,bool &draining,std::uint32_t &draining_round,
-    SteadyClock::time_point&hard_deadline)
+    SteadyClock::time_point& hard_deadline)
 {
     if(state.awaiting_complete_ack||total_blocks!=state.meta.total_blocks)
     {
@@ -606,9 +615,10 @@ void begin_drain_for_round(TransferState &state,std::uint32_t section_id,std::ui
     hard_deadline=SteadyClock::now()+kDrainHardTimeout;
     arm_drain_timer(drain_timer_fd,hard_deadline);
     std::cout<<"SECTION_END received section="<<section_id<<" round="<<round_id
-<<"; waiting for 200ms DATA quiet period"<<" (maximum 1s)\n";
+             <<"; waiting for 200ms DATA quiet period"<<" (maximum 1s)\n";
 }
 
+//proxy的TCP控制消息都从这里进，UDP DATA 只负责文件块
 void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd,
     std::uint64_t receiver_id,const std::string &output_directory,std::optional<TransferState>&transfer,
     int drain_timer_fd,bool &draining,std::uint32_t &draining_round,
@@ -627,7 +637,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
     if(type==srcast::ControlType::FileMeta)
     {
         const auto message=srcast::decode_file_meta(frame);
-
+//FILE_META只描述整文件，Section后面继续
         if(message.section_id!=srcast::kSingleSectionId)
         {
             throw std::runtime_error("unsupported FILE_META section_id");
@@ -638,6 +648,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
             throw std::runtime_error("unsupported FILE_META block size");
         }
 
+//文件大小和block数对上
         const auto expected_blocks64=(message.file_size+message.block_size-1)/message.block_size;
         if(expected_blocks64>std::numeric_limits<std::uint32_t>::max()||
            static_cast<std::uint32_t>(expected_blocks64)!=message.total_blocks)
@@ -645,6 +656,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
             throw std::runtime_error("inconsistent FILE_META block count");
         }
 
+//重复FILE_META直接回READY，避免重建 .part
         if(transfer)
         {
             if(transfer->meta.common.transfer_id==message.transfer_id)
@@ -655,6 +667,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
             throw std::runtime_error("FILE_META received while another ""transfer is active");
         }
 
+//内部复用MetaPacket，入口已经从UDP META换成TCP FILE_META
         srcast::MetaPacket meta;
         meta.common={srcast::PacketType::Meta,message.transfer_id};
         meta.file_size=message.file_size;
@@ -686,6 +699,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
             throw std::runtime_error("failed to initialize FILE_META");
         }
 
+//清上一文件可能留下的drain timer
         disarm_timer(drain_timer_fd);
         static_cast<void>(consume_timer_expiration(drain_timer_fd));
         draining=false;
@@ -696,7 +710,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
     if(type==srcast::ControlType::SectionEnd)
     {
-
+//先不上报，等UDP队列安静后算缺块
         const auto message=srcast::decode_section_end(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id)return;
         begin_drain_for_round(*transfer,message.section_id,message.round_id,message.total_blocks,
@@ -706,7 +720,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
     if(type==srcast::ControlType::RepairBegin)
     {
-
+//修复轮开始提示，数据走UDP
         const auto message=srcast::decode_repair_begin(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||
             transfer->awaiting_complete_ack)return;
@@ -724,7 +738,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
     if(type==srcast::ControlType::BackfillBegin)
     {
-
+//慢节点被隔离后，proxy会走TCP backfill
         const auto message=srcast::decode_backfill_begin(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||
             transfer->meta.total_blocks!=message.total_blocks||transfer->awaiting_complete_ack)return;
@@ -734,7 +748,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
     if(type==srcast::ControlType::BackfillData)
     {
-
+//backfill和UDP DATA一样校验offset size crc
         const auto message=srcast::decode_backfill_data(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||
             transfer->awaiting_complete_ack||message.block_id>=transfer->meta.total_blocks)return;
@@ -752,7 +766,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
         if(transfer->received[message.block_id]==0)
         {
-
+//写完数据再更新state，崩溃后重复收，不跳过
             write_all_at(transfer->output.get(),message.payload.data(),
                          message.payload.size(),message.offset);
             transfer->received[message.block_id]=1;
@@ -768,11 +782,11 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
     if(type==srcast::ControlType::BackfillEnd)
     {
-
+//TCP补齐后仍然文件SHA和原子rename
         const auto message=srcast::decode_backfill_end(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||
            transfer->meta.file_size!=message.file_size||transfer->meta.total_blocks!=message.total_blocks
-||transfer->meta.sha256!=message.sha256||transfer->awaiting_complete_ack)return;
+           ||transfer->meta.sha256!=message.sha256||transfer->awaiting_complete_ack)return;
 
         std::array<std::uint8_t,srcast::kSha256Size>actual_digest{};
         if(!finalize_transfer(*transfer,actual_digest))
@@ -796,7 +810,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
     if(type==srcast::ControlType::CompleteAck)
     {
-
+//proxy ACK后，receiver才清理当前TransferState
         const auto message=srcast::decode_complete_ack(frame);
         if(!transfer||message.receiver_id!=receiver_id||
             message.transfer_id!=transfer->meta.common.transfer_id||!transfer->awaiting_complete_ack)
@@ -814,7 +828,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
     if(type==srcast::ControlType::TransferResult)
     {
-
+//失败时保留 .part 和 .state
         const auto message=srcast::decode_transfer_result(frame);
         if(!transfer)
         {
@@ -830,7 +844,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         if(message.result==srcast::TransferResultCode::Failed)
         {
             std::cout<<"transfer failed after maximum repair rounds;"
-<<"temporary file retained at "<<transfer->temporary_path<<'\n';
+                     <<"temporary file retained at "<<transfer->temporary_path<<'\n';
             const auto failed_transfer_id=message.transfer_id;
             disarm_timer(drain_timer_fd);
             static_cast<void>(consume_timer_expiration(drain_timer_fd));
@@ -872,7 +886,7 @@ int main(int argc,char**argv) try
     in_addr group_address{};
     in_addr interface_address{};
     if(::inet_pton(AF_INET,multicast_ip.c_str(),&group_address)!=1||
-!IN_MULTICAST(ntohl(group_address.s_addr)))
+       !IN_MULTICAST(ntohl(group_address.s_addr)))
     {
         throw std::runtime_error("group must be an IPv4 multicast address");
     }
@@ -917,7 +931,7 @@ int main(int argc,char**argv) try
     send_control_frame(control_fd.get(),srcast::encode_register
                      ({receiver_id,static_cast<std::uint16_t>(udp_port)}));
     std::cout<<"receiver_id="<<receiver_id<<" listening on "<<multicast_ip<<':'<<udp_port
-<<" via interface "<<interface_ip<<" control="<<proxy_ip<<':'<<control_port<<'\n';
+             <<" via interface "<<interface_ip<<" control="<<proxy_ip<<':'<<control_port<<'\n';
     FileDescriptor drain_timer_fd(::timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK));
     if(drain_timer_fd.get()<0)
     {
@@ -964,7 +978,7 @@ int main(int argc,char**argv) try
         bool control_ready=false;
         for(int index=0;index<event_count;index++)
         {
-            const auto&event=ready_events[static_cast<std::size_t>(index)];
+            const auto& event=ready_events[static_cast<std::size_t>(index)];
             const int ready_fd=event.data.fd;
             if((event.events&EPOLLERR)!=0U)
             {
@@ -992,7 +1006,7 @@ int main(int argc,char**argv) try
         {
             std::size_t processed=0;
             const auto batch_start=SteadyClock::now();
-
+//一次 epoll 唤醒只处理一批，UDP不能抢控制面时间
             while(processed<kMaxUdpPacketsPerBatch&&SteadyClock::now()-batch_start<kUdpBatchTimeBudget)
             {
                 const auto packet_size=::recvfrom(udp_fd.get(),packet_buffer.data(),packet_buffer.size(),
@@ -1010,14 +1024,14 @@ int main(int argc,char**argv) try
                 {
                 srcast::PacketReader preview(packet_buffer.data(),static_cast<std::size_t>(packet_size));
                     const auto common=srcast::read_common(preview);
-                    if(common.type==srcast::PacketType::Meta)continue;
+                    if(common.type==srcast::PacketType::Meta)continue;//元数据TCP，UDP META 忽略
                     if(!transfer||common.transfer_id!=transfer->meta.common.transfer_id||
                         transfer->awaiting_complete_ack)continue;
                     if(common.type==srcast::PacketType::Data)
                     {
                         const auto data=srcast::decode_data(packet_buffer.data(),
                                                             static_cast<std::size_t>(packet_size));
-                        auto&state=*transfer;
+                        auto& state=*transfer;
                         if(data.block_id>=state.meta.total_blocks||data.section_id!=
                            srcast::section_id_for_block(data.block_id,state.meta.section_block_count))
                         {
@@ -1048,6 +1062,7 @@ int main(int argc,char**argv) try
                             continue;
                         }
 
+//数据先落盘，fsync后再改位图和state
                         write_all_at(state.output.get(),data.payload,data.payload_size,data.offset);
                         state.received[data.block_id]=1;
                         state.received_count++;
@@ -1060,21 +1075,21 @@ int main(int argc,char**argv) try
                         if(state.received_count%1000U==0U||state.received_count==state.meta.total_blocks)
                         {
                             std::cout<<"received "<<state.received_count<<'/'<<state.meta.total_blocks
-<<" blocks\n";
+                            <<" blocks\n";
                         }
                         continue;
                     }
 
                     if(common.type==srcast::PacketType::End)
                     {
-
+//UDP END是冗余提醒，真正上报是TCP SECTION_END
                         const auto end=srcast::decode_end(packet_buffer.data(),
                                                           static_cast<std::size_t>(packet_size));
                         begin_drain_for_round(*transfer,end.section_id,end.round_id,end.total_blocks,
                                              drain_timer_fd.get(),draining,draining_round,hard_deadline);
                         continue;
                     }
-                }catch(const std::exception&error)
+                }catch(const std::exception& error)
                 {
                     if(transfer)transfer->rejected_count++;
                     std::cerr<<"drop malformed packet: "<<error.what()<<'\n';
@@ -1087,7 +1102,7 @@ int main(int argc,char**argv) try
             if(consume_timer_expiration(drain_timer_fd.get())&&draining&&transfer)
             {
                 draining=false;
-
+//quiet period到了，当前section round可以报状态
                 finish_drain_and_report(control_fd.get(),receiver_id,*transfer,
                 draining_round);
             }
@@ -1096,7 +1111,7 @@ int main(int argc,char**argv) try
         if(control_ready)
         {
             const auto frames=control_reader.read_frames(control_fd.get());
-            for(const auto&frame:frames)
+            for(const auto& frame:frames)
             {
                 handle_control_message(frame,control_fd.get(),receiver_id,output_directory,transfer,
                              drain_timer_fd.get(),draining,draining_round,hard_deadline,stop_requested);

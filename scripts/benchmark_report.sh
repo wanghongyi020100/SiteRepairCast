@@ -33,7 +33,7 @@ on_error() {
     local status=$?
     mkdir -p "$ARTIFACT_DIR/failure"
     cp -r "$WORK_DIR"/. "$ARTIFACT_DIR/failure/" 2>/dev/null || true
-    echo "benchmark benchmark failed; preserved logs in $ARTIFACT_DIR/failure" >&2
+    echo "benchmark failed; preserved logs in $ARTIFACT_DIR/failure" >&2
     find "$ARTIFACT_DIR/failure" -name '*.log' -maxdepth 3 -print -exec sh -c '
         echo "== $1 =="
         tail -80 "$1"
@@ -270,36 +270,36 @@ run_scenario "slow-backfill-4-receivers" 4 512 "SRCAST_SLOW_MISSING_THRESHOLD=8"
     "SRCAST_DROP_INITIAL_BLOCKS=12,13,14,15,16,17,18,19,20,21,22,23" \
     ""
 
-CSV="$ARTIFACT_DIR/benchmark_metrics.csv"
+CSV="$ARTIFACT_DIR/metrics.csv"
 {
-    echo "scenario,receivers,file_bytes,direct_tcp_wan_payload_bytes,forward_only_wan_payload_bytes,srcast_wan_payload_bytes,srcast_wan_repair_bytes_saved_vs_forward_only,lan_initial_payload_bytes,lan_repair_multicast_packets,lan_repair_unicast_packets,tcp_backfill_blocks,receiver_duplicates,receiver_rejected,duration_ms,sha_ok"
+    echo "场景,接收端数量,文件字节数,直接TCP跨园区流量,普通转发跨园区流量,SiteRepairCast跨园区流量,相比普通转发节省流量,局域网初始流量,组播修复包数,单播修复包数,TCP补传块数,重复包数,拒绝包数,耗时毫秒,校验通过"
     printf '%s\n' "${ROWS[@]}"
 } >"$CSV"
 
-REPORT="$ARTIFACT_DIR/benchmark_report.md"
+REPORT="$ARTIFACT_DIR/report.md"
 {
-    echo "# SiteRepairCast Week 8 Performance Snapshot"
+    echo "# SiteRepairCast 第 8 周性能概览"
     echo
-    echo "All byte counts are payload-level estimates from a local loopback run. They exclude TCP/UDP/IP headers and control-frame overhead."
+    echo "以下字节数均为本机回环测试中的数据载荷估算值，不包含 TCP、UDP、IP 头部以及控制帧开销。"
     echo
-    echo "| Scenario | Receivers | File bytes | Direct TCP WAN | Forward-only WAN | SiteRepairCast WAN | WAN repair saved | LAN repair multicast | LAN repair unicast | TCP backfill blocks | Duration ms | SHA |"
+    echo "| 场景 | 接收端数量 | 文件字节数 | 直接 TCP 跨园区流量 | 普通转发跨园区流量 | SiteRepairCast 跨园区流量 | 节省的跨园区流量 | 局域网组播修复 | 局域网单播修复 | TCP 补传块数 | 耗时（毫秒） | 校验 |"
     echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
     awk -F, 'NR > 1 {
         printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6, $7, $9, $10, $11, $14, $15
     }' "$CSV"
     echo
-    echo "## Comparison Modes"
+    echo "## 对比方式"
     echo
-    echo "- Mode A direct TCP sends the full file once per receiver: file_size * receiver_count."
-    echo "- Mode B proxy-forward-only assumes the proxy cannot repair locally, so LAN repair/backfill payload must cross the WAN again."
-    echo "- Mode C SiteRepairCast sends the file to the proxy once; receiver loss is repaired from the proxy cache inside the site."
-    echo "- This loopback benchmark uses multicast repair and TCP backfill. Per-receiver UDP unicast repair needs distinct receiver IPs, so it is covered by implementation logic but not by the single-host benchmark."
+    echo "- 方式 A：直接 TCP 向每个接收端发送一份完整文件，流量为 file_size * receiver_count。"
+    echo "- 方式 B：普通代理转发，假设代理不能在本地修复，因此修复数据和补传数据还需要再次经过跨园区链路。"
+    echo "- 方式 C：SiteRepairCast 只向代理发送一份文件，接收端缺失的数据由站点内的代理缓存完成修复。"
+    echo "- 本次回环测试覆盖组播修复和 TCP 补传。按接收端分别进行 UDP 单播修复需要不同的接收端 IP，因此这里只验证实现逻辑，不在单机测试中单独测量。"
     echo
-    echo "## Generated Artifacts"
+    echo "## 生成结果"
     echo
-    echo "- Metrics CSV: \`$CSV\`"
-    echo "- Scenario logs: \`$ARTIFACT_DIR/logs/\`"
+    echo "- 指标 CSV：\`$CSV\`"
+    echo "- 场景日志：\`$ARTIFACT_DIR/logs/\`"
 } >"$REPORT"
 
 cat "$REPORT"
-echo "benchmark benchmark passed"
+echo "benchmark passed"

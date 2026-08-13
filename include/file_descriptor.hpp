@@ -9,10 +9,10 @@ public:
     ~FileDescriptor(){if(fd_>=0)::close(fd_);}
 
     FileDescriptor(const FileDescriptor&)=delete;
-    FileDescriptor&operator=(const FileDescriptor&)=delete;
-    FileDescriptor(FileDescriptor&&other)noexcept:fd_(other.fd_){other.fd_=-1;}
+    FileDescriptor& operator=(const FileDescriptor&)=delete;
+    FileDescriptor(FileDescriptor&&other) noexcept:fd_(other.fd_){other.fd_=-1;}
 
-    FileDescriptor&operator=(FileDescriptor&&other)noexcept
+    FileDescriptor& operator=(FileDescriptor&&other)noexcept
     {
         if(this!=&other)
         {

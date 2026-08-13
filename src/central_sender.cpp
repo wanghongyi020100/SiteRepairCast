@@ -41,6 +41,7 @@ struct ProxySession
     bool stopped{false};
 };
 
+//控制4+body
 FileDescriptor connect_proxy(const std::string &proxy_ip,int central_port)
 {
     FileDescriptor fd(::socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0));
@@ -62,6 +63,7 @@ FileDescriptor connect_proxy(const std::string &proxy_ip,int central_port)
     }
 }
 
+//transfer_id用文件摘要生成，重试同文件时id稳定
 std::uint64_t create_transfer_id(const std::array<std::uint8_t,srcast::kSha256Size>&digest)
 {
     std::uint64_t value=0;
@@ -69,9 +71,10 @@ std::uint64_t create_transfer_id(const std::array<std::uint8_t,srcast::kSha256Si
     return value;
 }
 
+//测试：确认若干 section 后主动断线
 std::uint32_t stop_after_sections_for_test()
 {
-    const char*raw=std::getenv("SRCAST_STOP_AFTER_SECTIONS");
+    const char* raw=std::getenv("SRCAST_STOP_AFTER_SECTIONS");
     if(raw==nullptr||*raw=='\0')return 0;
 
     char*end=nullptr;
@@ -84,16 +87,16 @@ std::uint32_t stop_after_sections_for_test()
     return static_cast<std::uint32_t>(value);
 }
 
-void usage(const char*program)
+void usage(const char* program)
 {
     std::cerr
-<<"Usage: "<<program
-<<"<proxy_ip><central_port><pace_us><file1>[file2 ...]\n"
-<<"   or: "<<program
-<<"--pace-us<pace_us>--proxy<proxy_ip><central_port>"
-<<" [--proxy<proxy_ip><central_port>...]<file1>[file2 ...]\n"
-<<"Example: "<<program
-<<" 127.0.0.1 7000 0 input-a.bin input-b.bin\n";
+        <<"Usage: "<<program
+        <<" <proxy_ip> <central_port> <pace_us> <file1> [file2 ...]\n"
+        <<"   or: "<<program
+        <<" --pace-us <pace_us> --proxy <proxy_ip> <central_port>"
+        <<" [--proxy <proxy_ip> <central_port> ...] <file1> [file2 ...]\n"
+        <<"Example: "<<program
+        <<" 127.0.0.1 7000 0 input-a.bin input-b.bin\n";
 }
 
 struct CentralOptions
@@ -123,7 +126,7 @@ CentralOptions parse_options(int argc,char**argv)
             {
                 if(++index>=argc)
                 {
-                    throw std::runtime_error("missing--pace-us value");
+                    throw std::runtime_error("missing --pace-us value");
                 }
                 options.pace_us=std::stoi(argv[index]);
                 continue;
@@ -132,15 +135,14 @@ CentralOptions parse_options(int argc,char**argv)
             {
                 if(index+2>=argc)
                 {
-                    throw std::runtime_error("missing--proxy value");
+                    throw std::runtime_error("missing --proxy value");
                 }
                 options.endpoints.push_back({argv[++index],std::stoi(argv[++index])});
                 continue;
             }
             options.files.emplace_back(option);
         }
-    }
-    else
+    }else
     {
         options.endpoints.push_back({argv[1],std::stoi(argv[2])});
         options.pace_us=std::stoi(argv[3]);
@@ -162,6 +164,7 @@ CentralOptions parse_options(int argc,char**argv)
     return options;
 }
 
+//返回false表示测试hook主动断线，外层不再发送SESSION_END
 bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint32_t section_blocks)
 {
     struct stat status{};
@@ -198,12 +201,12 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
     meta.section_block_count=section_blocks;
     meta.sha256=digest;
     std::cout<<"central sending file="<<file_path
-<<" transfer_id="<<transfer_id
-<<" size="<<file_size
-<<" blocks="<<total_blocks<<'\n';
+              <<" transfer_id="<<transfer_id
+              <<" size="<<file_size
+              <<" blocks="<<total_blocks<<'\n';
     send_control_frame(central_fd,srcast::encode_central_file_meta(meta));
     const auto section_count=srcast::section_count_for_blocks(total_blocks,section_blocks);
-
+    //proxy 是缓存事实来源，中心按它返回的section继续发
     const auto resume_frame=receive_control_frame(central_fd);
     const auto resume=srcast::decode_central_resume(resume_frame);
     if(resume.transfer_id!=transfer_id||resume.file_size!=file_size||
@@ -222,11 +225,11 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
     }
 
     std::cout<<"central resume transfer_id="<<transfer_id<<" next_section="<<resume.next_section_id
-<<'/'<<section_count<<'\n';
+             <<'/'<<section_count<<'\n';
     std::vector<std::uint8_t>payload;
     const auto stop_after_sections=stop_after_sections_for_test();
     std::uint32_t confirmed_this_run=0;
-
+    //每个section发完都等proxy确认，避免中心太快
     for(std::uint32_t section_id=resume.next_section_id;section_id<section_count;section_id++)
     {
         const auto first_block=srcast::section_first_block(section_id,section_blocks);
@@ -254,7 +257,7 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
 
         send_control_frame(central_fd,srcast::encode_central_file_end
                           ({transfer_id,section_id,total_blocks}));
-
+        //只有proxy落盘并更新checkpoint后，中心才推进下一段。
         const auto response=receive_control_frame(central_fd);
         const auto result=srcast::decode_central_status(response);
         if(result.transfer_id!=transfer_id||result.status!=srcast::CentralStatusCode::Cached||
@@ -270,9 +273,9 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
         confirmed_this_run++;
         if(stop_after_sections!=0&&confirmed_this_run>=stop_after_sections&&section_id+1U<section_count)
         {
-
+        //模拟中心断线，proxy端checkpoint能接
             std::cout<<"test hook closing central connection after "
-<<confirmed_this_run<<" confirmed sections\n";
+            <<confirmed_this_run<<" confirmed sections\n";
             return false;
         }
     }
@@ -299,7 +302,7 @@ void run_proxy_session(ProxySession&session,const std::vector<std::string>&files
     {
         session.failed=true;
         std::cerr<<"proxy transfer failed "<<session.endpoint.ip<<':'
-<<session.endpoint.port<<": "<<error.what()<<'\n';
+                 <<session.endpoint.port<<": "<<error.what()<<'\n';
         session.fd.reset(-1);
     }
 }
@@ -319,7 +322,7 @@ int main(int argc,char**argv)try
         {
             connection_failed=true;
             std::cerr<<"proxy connection failed "<<endpoint.ip
-<<':'<<endpoint.port<<": "<<error.what()<<'\n';
+                     <<':'<<endpoint.port<<": "<<error.what()<<'\n';
         }
     }
     if(sessions.empty())

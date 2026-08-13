@@ -60,7 +60,7 @@ public:
     }
 
     template<typename F,typename...Args>
-    auto add(F&&func,Args&&...args)->std::future<std::invoke_result_t<F,Args...>>
+    auto add(F &&func,Args &&...args)->std::future<std::invoke_result_t<F,Args...>>
     {
         using ReturnType=std::invoke_result_t<F,Args...>;
         auto task=std::make_shared<std::packaged_task<ReturnType()>>

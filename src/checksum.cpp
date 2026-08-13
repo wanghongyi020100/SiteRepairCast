@@ -12,7 +12,7 @@
 
 namespace srcast
 {
-    std::uint32_t crc32(const std::uint8_t*data,std::size_t size)
+    std::uint32_t crc32(const std::uint8_t* data,std::size_t size)
     {
         static const std::array<std::uint32_t,256>table=[]
         {

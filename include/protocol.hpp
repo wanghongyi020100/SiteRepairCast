@@ -13,26 +13,24 @@
 #include<vector>
 namespace srcast
 {
-    constexpr std::uint32_t kMagic=0x53524331U;
-    constexpr std::uint32_t kControlMagic=0x53524343U;
-    constexpr std::uint16_t kVersion=8;
-    constexpr std::size_t kPayloadSize=1200;
-    constexpr std::size_t kSha256Size=32;
-    constexpr std::uint32_t kSingleSectionId=0;
-    constexpr std::uint32_t kDefaultSectionBlockCount=64;
+    constexpr std::uint32_t kMagic=0x53524331U;//UDP数据包魔数
+    constexpr std::uint32_t kControlMagic=0x53524343U;//TCP控制帧魔数
+    constexpr std::uint16_t kVersion=8;//当前协议版本
+    constexpr std::size_t kPayloadSize=1200;//单个数据块的最大载荷
+    constexpr std::size_t kSha256Size=32;//SHA-256摘要长度
+    constexpr std::uint32_t kSingleSectionId=0;//未分段流程使用的Section编号
+    constexpr std::uint32_t kDefaultSectionBlockCount=64;//默认每个Section的数据块数量
 
-    constexpr std::size_t kCommonHeaderSize=16;
-    constexpr std::size_t kMetaPacketSize=kCommonHeaderSize+8+4+4+4+kSha256Size;
-    constexpr std::size_t kDataHeaderSize=kCommonHeaderSize+4+4+8+2+2+4;
-    constexpr std::size_t kEndPacketSize=kCommonHeaderSize+4+4+4;
-    constexpr std::size_t kMaxPacketSize=kDataHeaderSize+kPayloadSize;
-    constexpr std::size_t kMaxControlFrameSize=1024*1024;
+    constexpr std::size_t kCommonHeaderSize=16;//数据包公共头长度
+    constexpr std::size_t kMetaPacketSize=kCommonHeaderSize+8+4+4+4+kSha256Size;//元数据包固定长度
+    constexpr std::size_t kDataHeaderSize=kCommonHeaderSize+4+4+8+2+2+4;//数据包头长度
+    constexpr std::size_t kEndPacketSize=kCommonHeaderSize+4+4+4;//结束包长度
+    constexpr std::size_t kMaxPacketSize=kDataHeaderSize+kPayloadSize;//UDP数据包最大长度
+    constexpr std::size_t kMaxControlFrameSize=1024*1024;//TCP控制帧最大长度
 
-    inline std::uint64_t host_to_network64(std::uint64_t value)
-    {return htobe64(value);}
+    inline std::uint64_t host_to_network64(std::uint64_t value){return htobe64(value);}
 
-    inline std::uint64_t network_to_host64(std::uint64_t value)
-    {return be64toh(value);}
+    inline std::uint64_t network_to_host64(std::uint64_t value){return be64toh(value);}
 
     class PacketWriter
     {
@@ -97,7 +95,7 @@ namespace srcast
             return network_to_host64(value);
         }
 
-        void bytes(void*destination,std::size_t size)
+        void bytes(void* destination,std::size_t size)
         {
             if(size==0)return;
             read(destination,size);
@@ -106,7 +104,7 @@ namespace srcast
         [[nodiscard]] std::size_t remaining()const{return size_-offset_;}
 
     private:
-        void read(void*destination,std::size_t size)
+        void read(void* destination,std::size_t size)
         {
             if(size>remaining())
             {
@@ -121,14 +119,15 @@ namespace srcast
         std::size_t offset_{0};
     };
 
+    // UDP 数据包类型
     enum class PacketType:std::uint16_t
     {
-        Meta=1,
-        Data=2,
-        End=3,
+        Meta=1,//元数据包
+        Data=2,//文件数据块
+        End=3,//当前 Section 结束提示
     };
 
-
+    //UDP 数据层次包头，receiver靠transfer_id 过滤旧包。
     struct CommonHeader
     {
         PacketType type{};
@@ -145,7 +144,7 @@ namespace srcast
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
-
+    //UDP DATA不拷贝payload，decode后只拿原buffer指针。
     struct DataPacketView
     {
         CommonHeader common;
@@ -206,7 +205,7 @@ namespace srcast
         return writer.data();
     }
 
-    inline MetaPacket decode_meta(const void*data,std::size_t size)
+    inline MetaPacket decode_meta(const void* data,std::size_t size)
     {
         if(size!=kMetaPacketSize)
         {
@@ -227,14 +226,9 @@ namespace srcast
         return packet;
     }
 
-    inline std::vector<std::uint8_t>encode_data(
-        std::uint64_t transfer_id,
-        std::uint32_t section_id,
-        std::uint32_t block_id,
-        std::uint64_t offset,
-        const std::uint8_t*payload,
-        std::uint16_t payload_size,
-        std::uint32_t crc32)
+    inline std::vector<std::uint8_t>encode_data(std::uint64_t transfer_id,std::uint32_t section_id,
+        std::uint32_t block_id,std::uint64_t offset,const std::uint8_t* payload,
+        std::uint16_t payload_size,std::uint32_t crc32)
     {
         if(payload_size>kPayloadSize)
         {
@@ -253,7 +247,7 @@ namespace srcast
         return writer.data();
     }
 
-    inline DataPacketView decode_data(const void*data,std::size_t size)
+    inline DataPacketView decode_data(const void* data,std::size_t size)
     {
         if(size<kDataHeaderSize)
         {
@@ -280,11 +274,8 @@ namespace srcast
         return packet;
     }
 
-    inline std::vector<std::uint8_t>encode_end(
-        std::uint64_t transfer_id,
-        std::uint32_t section_id,
-        std::uint32_t round_id,
-        std::uint32_t total_blocks)
+    inline std::vector<std::uint8_t>encode_end(std::uint64_t transfer_id,std::uint32_t section_id,
+           std::uint32_t round_id,std::uint32_t total_blocks)
     {
         PacketWriter writer(kEndPacketSize);
         write_common(writer,PacketType::End,transfer_id);
@@ -294,7 +285,7 @@ namespace srcast
         return writer.data();
     }
 
-    inline EndPacket decode_end(const void*data,std::size_t size)
+    inline EndPacket decode_end(const void* data,std::size_t size)
     {
         if(size!=kEndPacketSize)
         {
@@ -313,57 +304,61 @@ namespace srcast
         return packet;
     }
 
+    //TCP 控制帧类型
     enum class ControlType:std::uint16_t
     {
-        Register=1,
-        SectionStatus=2,
-        RepairBegin=3,
-        ReceiverComplete=4,
-        CompleteAck=5,
-        TransferResult=6,
-        SectionEnd=7,
-        ReceiverReady=8,
-        SessionEnd=9,
-        FileMeta=10,
-        MetaReady=11,
-        CentralFileMeta=12,
-        CentralData=13,
-        CentralFileEnd=14,
-        CentralStatus=15,
-        CentralSessionEnd=16,
-        CentralResume=17,
-        BackfillBegin=18,
-        BackfillData=19,
-        BackfillEnd=20,
+        Register=1,//接收端注册
+        SectionStatus=2,//Section状态和缺块信息
+        RepairBegin=3,//修复轮开始
+        ReceiverComplete=4,//接收端完成整文件
+        CompleteAck=5,//完成确认
+        TransferResult=6,//传输结果
+        SectionEnd=7,//Section结束
+        ReceiverReady=8,//接收端准备就绪
+        SessionEnd=9,//会话结束
+        FileMeta=10,//文件元数据
+        MetaReady=11,//元数据确认
+        CentralFileMeta=12,//中心发送的文件元数据
+        CentralData=13,//中心发送的数据块
+        CentralFileEnd=14,//中心发送的Section结束
+        CentralStatus=15,//代理返回中心的缓存状态
+        CentralSessionEnd=16,//中心会话结束
+        CentralResume=17,//断点恢复位置
+        BackfillBegin=18,//TCP补传开始
+        BackfillData=19,//TCP补传数据块
+        BackfillEnd=20,//TCP补传结束
     };
 
+    //接收端上报的Section状态
     enum class SectionStatusCode:std::uint16_t
     {
-        Missing=1,
-        Complete=2,
-        Failed=3,
+        Missing=1,//存在缺失数据
+        Complete=2,//Section 已完成
+        Failed=3,//Section 处理失败
     };
 
+    //整体传输结果
     enum class TransferResultCode:std::uint16_t
     {
-        Completed=1,
-        Failed=2,
+        Completed=1,//文件传输完成
+        Failed=2,//文件传输失败
     };
 
+    //代理返回中心的Section缓存结果
     enum class CentralStatusCode:std::uint16_t
     {
-        Cached=1,
-        Failed=2,
+        Cached=1,//Section已缓存
+        Failed=2,//Section缓存失败
     };
 
-
+    //receiver->proxy：启动时注册TCP控制连接和UDP接收端口
     struct RegisterMessage
     {
         std::uint64_t receiver_id{};
         std::uint16_t udp_port{};
     };
 
-
+    //proxy->receiver：正式任务元数据
     struct FileMetaMessage
     {
         std::uint64_t transfer_id{};
@@ -375,14 +370,14 @@ namespace srcast
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
-
+    //receiver->proxy：临时文件和位图都准备好了
     struct MetaReadyMessage
     {
         std::uint64_t receiver_id{};
         std::uint64_t transfer_id{};
     };
 
-
+    //receiver->proxy：每轮section drain后的缺块报告
     struct SectionStatusMessage
     {
         std::uint64_t receiver_id{};
@@ -394,7 +389,7 @@ namespace srcast
         std::vector<std::uint8_t>missing_bitmap;
     };
 
-
+    //proxy->receiver：提示下一轮修复开始
     struct RepairBeginMessage
     {
         std::uint64_t transfer_id{};
@@ -402,7 +397,7 @@ namespace srcast
         std::uint32_t round_id{};
     };
 
-
+    //receiver->proxy：文件校验通过后才发
     struct ReceiverCompleteMessage
     {
         std::uint64_t receiver_id{};
@@ -437,7 +432,7 @@ namespace srcast
         std::uint64_t previous_transfer_id{};
     };
 
-
+    //central->proxy：中心文件元数据
     struct CentralFileMetaMessage
     {
         std::uint64_t transfer_id{};
@@ -448,7 +443,7 @@ namespace srcast
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
-
+    //central->proxy：中心TCP数据块
     struct CentralDataMessage
     {
         std::uint64_t transfer_id{};
@@ -484,7 +479,7 @@ namespace srcast
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
-
+    //proxy->receiver：慢节点独立TCP补传
     struct BackfillBeginMessage
     {
         std::uint64_t transfer_id{};
@@ -572,16 +567,16 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_file_meta(const FileMetaMessage &message)
     {
-
-
-
-
-
-
-
-
-
-
+        //8字节控制头
+        //magic 4+version 2+type 2
+        ////消息体：
+        //transfer_id  8
+        //section_id   4
+        //file_size    8
+        //block_size   4
+        //total_blocks 4
+        //sha256       32
+        //72
         PacketWriter writer(72);
         write_control_header(writer,ControlType::FileMeta);
 
@@ -625,7 +620,7 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_meta_ready(const MetaReadyMessage &message)
     {
-
+        //控制头 8+receiver_id 8+transfer_id 8=24
         PacketWriter writer(24);
 
         write_control_header(writer,ControlType::MetaReady);

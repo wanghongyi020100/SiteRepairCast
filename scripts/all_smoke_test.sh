@@ -3,8 +3,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-for week in 2 3 4 5 6 7; do
-    bash "$ROOT_DIR/scripts/week${week}_smoke_test.sh"
+tests=(
+    local_repair_smoke_test.sh
+    central_cache_smoke_test.sh
+    section_flow_smoke_test.sh
+    central_resume_smoke_test.sh
+    tcp_backfill_smoke_test.sh
+    fault_recovery_smoke_test.sh
+)
+
+for test_script in "${tests[@]}"; do
+    bash "$ROOT_DIR/scripts/$test_script"
 done
 
 bash "$ROOT_DIR/scripts/benchmark_smoke_test.sh"

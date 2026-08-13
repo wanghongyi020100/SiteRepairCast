@@ -40,20 +40,20 @@
 namespace
 {
 using SteadyClock=std::chrono::steady_clock;
-constexpr auto kReportTimeout=std::chrono::seconds(30);
-constexpr auto kMetaReadyTimeout=std::chrono::seconds(30);
-constexpr auto kReadyTimeout=std::chrono::seconds(10);
-constexpr std::uint32_t kSectionId=srcast::kSingleSectionId;
-constexpr std::size_t kMulticastRepairThreshold=2;
-constexpr std::uint32_t kDefaultSlowMissingThreshold=32;
-constexpr std::size_t kBackfillThreadCount=4;
+constexpr auto kReportTimeout=std::chrono::seconds(30);//等待接收端上报状态的最长时间
+constexpr auto kMetaReadyTimeout=std::chrono::seconds(30);//等待接收端确认元数据的最长时间
+constexpr auto kReadyTimeout=std::chrono::seconds(10);//等待接收端进入就绪状态的最长时间
+constexpr std::uint32_t kSectionId=srcast::kSingleSectionId;//未分段流程使用的Section编号
+constexpr std::size_t kMulticastRepairThreshold=2;//至少两个目标缺块时使用组播修复
+constexpr std::uint32_t kDefaultSlowMissingThreshold=32;//超过该缺块数后隔离慢接收端
+constexpr std::size_t kBackfillThreadCount=4;//TCP补传线程池的最大线程数
 std::mutex output_mutex;
 std::uint32_t slow_missing_threshold()
 {
-    const char*raw=std::getenv("SRCAST_SLOW_MISSING_THRESHOLD");
+    const char* raw=std::getenv("SRCAST_SLOW_MISSING_THRESHOLD");
     if(raw==nullptr||*raw=='\0')return kDefaultSlowMissingThreshold;
 
-    char*end=nullptr;
+    char *end=nullptr;
     errno=0;
     const auto value=std::strtoul(raw,&end,10);
     if(raw==end||*end!='\0'||errno==ERANGE||value>std::numeric_limits<std::uint32_t>::max())
@@ -63,6 +63,7 @@ std::uint32_t slow_missing_threshold()
     return static_cast<std::uint32_t>(value);
 }
 
+//测试 1 3 5 block
 std::unordered_set<std::uint32_t>parse_block_set_env(const char *name)
 {
     std::unordered_set<std::uint32_t>blocks;
@@ -94,6 +95,7 @@ std::unordered_set<std::uint32_t>parse_block_set_env(const char *name)
     return blocks;
 }
 
+//环境变量非空且不是 0，认为打开
 bool env_flag_enabled(const char*name)
 {
     const char *raw=std::getenv(name);
@@ -126,9 +128,10 @@ struct CachedCentralFile
     std::uint32_t total_blocks{};
     std::array<std::uint8_t,srcast::kSha256Size>sha256{};
 };
-
+//proxy的checkpoint跟最终缓存文件放一起，重启扫描
 std::string central_checkpoint_path(const std::string &final_path){return final_path+".state";}
 
+//只相信已经提交的section .part写半不算
 std::uint32_t load_central_checkpoint(const std::string &checkpoint_path,
     const std::string &temporary_path,const srcast::CentralFileMetaMessage &meta)
 {
@@ -149,16 +152,17 @@ std::uint32_t load_central_checkpoint(const std::string &checkpoint_path,
     std::uint32_t section_block_count=0;
     std::uint32_t next_section_id=0;
     std::string digest_hex;
-    input>>magic>>version>>transfer_id>>file_size>>total_blocks
->>section_block_count>>digest_hex>>next_section_id;
+    input>>magic>>version>>transfer_id>>file_size >>total_blocks
+         >>section_block_count>>digest_hex>>next_section_id;
     const auto section_count=srcast::section_count_for_blocks(meta.total_blocks,meta.section_block_count);
-    if(!input||magic!="SRC_PROXY_CHECKPOINT"||version!=2||transfer_id!=meta.transfer_id||
+    if(!input||magic!="SRC_PROXY_CHECKPOINT" ||version!=2||transfer_id!=meta.transfer_id||
         file_size!=meta.file_size||total_blocks!=meta.total_blocks||
         section_block_count!=meta.section_block_count||digest_hex!=srcast::hex_digest(meta.sha256)||
         next_section_id>=section_count)return 0;
     return next_section_id;
 }
 
+//checkpoint先写tmp再rename，proxy被kill不丢已提交section
 void save_central_checkpoint(const std::string &checkpoint_path,const srcast::CentralFileMetaMessage &meta,
      std::uint32_t next_section_id)
 {
@@ -170,8 +174,8 @@ void save_central_checkpoint(const std::string &checkpoint_path,const srcast::Ce
             throw std::runtime_error("open central checkpoint failed: "+temporary_checkpoint);
         }
         output<<"SRC_PROXY_CHECKPOINT 2\n"<<meta.transfer_id<<'\n'<<meta.file_size<<'\n'
-<<meta.total_blocks<<'\n'<<meta.section_block_count<<'\n'<<srcast::hex_digest(meta.sha256)<<'\n'
-<<next_section_id<<'\n';
+        <<meta.total_blocks<<'\n'<<meta.section_block_count<<'\n'<<srcast::hex_digest(meta.sha256)<<'\n'
+        <<next_section_id<<'\n';
         output.flush();
         if(!output)
         {
@@ -187,6 +191,7 @@ void save_central_checkpoint(const std::string &checkpoint_path,const srcast::Ce
     }
 }
 
+//一条TCP控制连接对应一个receiver
 struct ReceiverConnection
 {
     std::uint64_t receiver_id{};
@@ -205,17 +210,17 @@ struct ReceiverConnection
 void usage(const char *program)
 {
     std::cerr
-<<"Usage: "<<program
-<<"<multicast_ip><udp_port><interface_ip><control_port>"
-<<"<receiver_count><pace_us><gap_ms><max_repair_rounds>"
-<<"<file1>[file2 ...]\n"
-<<"   or: "<<program
-<<"<multicast_ip><udp_port><interface_ip><control_port>"
-<<"<receiver_count><pace_us><gap_ms><max_repair_rounds>"
-<<"--central-listen<central_port><cache_dir>\n"
-<<"Example: "<<program
-<<" 239.255.42.99 5000 127.0.0.1 6000 3 200 1500 3"
-<<" input-a.bin input-b.bin\n";
+        <<"Usage: "<<program
+        <<" <multicast_ip> <udp_port> <interface_ip> <control_port>"
+        <<" <receiver_count> <pace_us> <gap_ms> <max_repair_rounds>"
+        <<" <file1> [file2 ...]\n"
+        <<"   or: "<<program
+        <<" <multicast_ip> <udp_port> <interface_ip> <control_port>"
+        <<" <receiver_count> <pace_us> <gap_ms> <max_repair_rounds>"
+        <<" --central-listen <central_port> <cache_dir>\n"
+        <<"Example: "<<program
+        <<" 239.255.42.99 5000 127.0.0.1 6000 3 200 1500 3"
+        <<" input-a.bin input-b.bin\n";
 }
 
 struct SenderOptions
@@ -271,6 +276,7 @@ SenderOptions parse_options(int argc,char**argv)
     return options;
 }
 
+//创建TCP控制面监听socket
 FileDescriptor create_control_listener(int control_port)
 {
     FileDescriptor listener(::socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0));
@@ -311,6 +317,8 @@ void set_receive_timeout(int fd,std::chrono::seconds timeout)
     }
 }
 
+//等齐固定接收端，坏注册丢掉，继续等合法连接
+//注册帧 2s，防止半包TCP连接占住启动流程
 std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expected_receivers)
 {
     std::vector<ReceiverConnection>receivers;
@@ -357,9 +365,9 @@ std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expe
             std::strcpy(address,"?");
 
             std::cout<<"registered receiver_id="<<receiver.receiver_id<<" address="<<address<<':'
-<<registration.udp_port<<'\n';
+                     <<registration.udp_port<<'\n';
             receivers.push_back(std::move(receiver));
-        }catch(const std::exception&error)
+        }catch(const std::exception& error)
         {
             std::cerr<<"rejected receiver registration: "<<error.what()<<'\n';
         }
@@ -367,6 +375,7 @@ std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expe
     return receivers;
 }
 
+//缺块位图
 bool validate_missing_bitmap(const srcast::SectionStatusMessage &status,std::uint32_t section_blocks)
 {
     const auto expected_size=srcast::bitmap_size_for_blocks(section_blocks);
@@ -393,7 +402,7 @@ bool validate_missing_bitmap(const srcast::SectionStatusMessage &status,std::uin
 
 void reset_round_state(std::vector<ReceiverConnection>&receivers)
 {
-    for(auto&receiver:receivers)
+    for(auto& receiver:receivers)
     {
         receiver.status_received=false;
         receiver.complete_received=false;
@@ -402,6 +411,7 @@ void reset_round_state(std::vector<ReceiverConnection>&receivers)
     }
 }
 
+//最后一段等COMPLETE，中间段只需要缺块位图
 bool round_responses_complete(const std::vector<ReceiverConnection>&receivers,bool final_section)
 {
     for(const auto &receiver:receivers)
@@ -414,6 +424,8 @@ bool round_responses_complete(const std::vector<ReceiverConnection>&receivers,bo
     return true;
 }
 
+//控制消息可能晚到，先按transfer/round/receiver_id过滤
+//收到COMPLETE时才回COMPLETE_ACK，receiver可以安全退出当前文件
 void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::uint8_t>&frame,
                           std::uint64_t transfer_id,std::uint32_t section_id,std::uint32_t round_id,
                           std::uint64_t file_size,std::uint32_t section_blocks,
@@ -427,7 +439,7 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
            status.section_id!=section_id||status.round_id!=round_id)
         {
             std::cerr<<"ignore stale or mismatched SECTION_STATUS from receiver_id="
-<<receiver.receiver_id<<'\n';
+                     <<receiver.receiver_id<<'\n';
             return;
         }
         if(!validate_missing_bitmap(status,section_blocks))
@@ -439,7 +451,7 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
         receiver.status=status;
         receiver.status_received=true;
         std::cout<<"section="<<section_id<<" round="<<round_id
-<<" receiver_id="<<receiver.receiver_id<<" status=";
+                 <<" receiver_id="<<receiver.receiver_id<<" status=";
         if(status.status==srcast::SectionStatusCode::Complete)std::cout<<"COMPLETE";
         else if(status.status==srcast::SectionStatusCode::Missing)
         std::cout<<"MISSING missing_blocks="<<status.missing_count;
@@ -471,7 +483,7 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
     std::cerr<<"ignore unexpected control message from receiver_id="<<receiver.receiver_id<<'\n';
 }
 
-template<typename Predicate>
+template<typename Predicate>//临时建epoll
 std::vector<std::size_t>wait_for_receiver_events(const std::vector<ReceiverConnection>&receivers,
      Predicate should_watch,int timeout_ms,const std::string &operation)
 {
@@ -522,6 +534,8 @@ std::vector<std::size_t>wait_for_receiver_events(const std::vector<ReceiverConne
     return indexes;
 }
 
+//使用epoll时等待所有接收端的本轮状态报告
+//超时不是失败，后面慢接收端逻辑会处理
 void collect_round_reports(std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id,
      std::uint32_t section_id,std::uint32_t round_id,std::uint64_t file_size,std::uint32_t total_blocks,
      std::uint32_t section_block_limit,const std::array<std::uint8_t,srcast::kSha256Size>&digest)
@@ -539,7 +553,7 @@ void collect_round_reports(std::vector<ReceiverConnection>&receivers,std::uint64
         const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
         const auto timeout_ms=static_cast<int>(std::max<std::int64_t>(1,remaining.count()));
         const auto ready_indexes=wait_for_receiver_events(receivers,
-            [](const ReceiverConnection &receiver){return!receiver.completed&&!receiver.isolated;},
+            [](const ReceiverConnection &receiver){return !receiver.completed&&!receiver.isolated;},
             timeout_ms,"receiver reports");
         if(ready_indexes.empty())break;
 
@@ -557,11 +571,12 @@ void collect_round_reports(std::vector<ReceiverConnection>&receivers,std::uint64
         if(!receiver.completed&&!receiver.isolated&&!receiver.status_received)
         {
             std::cout<<"section="<<section_id<<" round="<<round_id
-<<" receiver_id="<<receiver.receiver_id<<" status=NO_REPORT\n";
+                     <<" receiver_id="<<receiver.receiver_id<<" status=NO_REPORT\n";
         }
     }
 }
 
+//缺块超过阈值转入慢节点队列，主组继续
 void isolate_slow_receivers(std::vector<ReceiverConnection>&receivers,std::uint32_t total_blocks,
      std::uint32_t section_id,std::uint32_t section_block_limit,std::uint32_t missing_threshold)
 {
@@ -585,10 +600,11 @@ void isolate_slow_receivers(std::vector<ReceiverConnection>&receivers,std::uint3
         receiver.isolated=true;
         std::cout<<"receiver_id="<<receiver.receiver_id<<
         " isolated for TCP backfill missing_blocks="<<receiver.status->missing_count
-<<" section="<<section_id<<'\n';
+        <<" section="<<section_id<<'\n';
     }
 }
 
+//block->receiver列表，修复时决定组播单播
 std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
     const std::vector<ReceiverConnection>&receivers,std::uint32_t total_blocks,std::uint32_t section_id,
     std::uint32_t section_block_limit)
@@ -597,7 +613,7 @@ std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
     std::vector<std::vector<std::size_t>>missing_by_block(section_blocks);
     for(std::size_t receiver_index=0;receiver_index<receivers.size();receiver_index++)
     {
-        const auto&receiver=receivers[receiver_index];
+        const auto& receiver=receivers[receiver_index];
         if(receiver.completed||receiver.isolated||!receiver.status||
            receiver.status->status!=srcast::SectionStatusCode::Missing)continue;
 
@@ -610,6 +626,8 @@ std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
     return missing_by_block;
 }
 
+//UDP END多发，真正的排上报靠TCP SECTION_END
+//receiver收到SECTION_END等quiet period，再计算缺块
 void send_end_round(int udp_fd,const sockaddr_in &multicast_destination,
      std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id,std::uint32_t section_id,
      std::uint32_t round_id,std::uint32_t total_blocks)
@@ -629,6 +647,8 @@ void send_end_round(int udp_fd,const sockaddr_in &multicast_destination,
     }
 }
 
+//本地修复，多机同缺组播，单机缺块单播
+//修复包从proxy缓存读，不回中心拿。
 void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
      std::vector<ReceiverConnection>&receivers,int input_fd,const std::string &file_path,
      std::uint64_t file_size,std::uint64_t transfer_id,std::uint32_t total_blocks,std::uint32_t section_id,
@@ -662,8 +682,7 @@ void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
         {
             send_udp_packet(udp_fd,multicast_destination,packet);
             multicast_packets++;
-        }
-        else
+        }else
         {
             const auto receiver_index=targets.front();
             send_udp_packet(udp_fd,receivers[receiver_index].udp_destination,packet);
@@ -677,10 +696,11 @@ void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
     }
 
     std::cout<<"repair round="<<round_id<<" multicast_packets="<<multicast_packets
-<<" unicast_packets="<<unicast_packets<<'\n';
+             <<" unicast_packets="<<unicast_packets<<'\n';
     send_end_round(udp_fd,multicast_destination,receivers,transfer_id,section_id,round_id,total_blocks);
 }
 
+//初 DATA的故障注入只给smoke，实际环境变量为空
 bool all_receivers_completed(const std::vector<ReceiverConnection>&receivers);
 
 bool distribute_section(int udp_fd,const sockaddr_in &multicast_destination,
@@ -738,10 +758,10 @@ bool distribute_section(int udp_fd,const sockaddr_in &multicast_destination,
                           file_size,total_blocks,section_block_limit,digest);
     isolate_slow_receivers(receivers,total_blocks,section_id,section_block_limit,missing_threshold);
     for(int repair_round=1;repair_round<=max_repair_rounds&&
-!all_receivers_completed(receivers);repair_round++)
+                           !all_receivers_completed(receivers);repair_round++)
     {
         const bool section_done=std::all_of(receivers.begin(),receivers.end(),
-            [](const ReceiverConnection&receiver)
+            [](const ReceiverConnection& receiver)
             {
                 return receiver.completed||receiver.isolated||
                       (receiver.status&&receiver.status->status==srcast::SectionStatusCode::Complete);
@@ -770,6 +790,7 @@ bool all_receivers_completed(const std::vector<ReceiverConnection>&receivers)
     [](const ReceiverConnection &receiver){return receiver.completed;});
 }
 
+//文件间屏障，防止下一个FILE_META和上一个收尾串在一起
 void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id)
 {
     for(auto &receiver:receivers)receiver.ready_for_next_transfer=false;
@@ -778,7 +799,7 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
     for(;;)
     {
         const bool all_ready=std::all_of(receivers.begin(),receivers.end(),
-            [](const ReceiverConnection&receiver){return receiver.ready_for_next_transfer;});
+            [](const ReceiverConnection& receiver){return receiver.ready_for_next_transfer;});
         if(all_ready)
         {
             std::cout<<"all receivers are ready for the next transfer\n";
@@ -794,7 +815,7 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
         const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
         const auto timeout_ms=static_cast<int>(std::max<std::int64_t>(1,remaining.count()));
         const auto ready_indexes=wait_for_receiver_events(receivers,
-            [](const ReceiverConnection&receiver){return!receiver.ready_for_next_transfer;},
+            [](const ReceiverConnection& receiver){return !receiver.ready_for_next_transfer;},
             timeout_ms,"receiver ready acknowledgements");
         if(ready_indexes.empty())continue;
 
@@ -805,7 +826,7 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
             if(srcast::peek_control_type(frame)!=srcast::ControlType::ReceiverReady)
             {
                 std::cerr<<"ignore unexpected message while waiting for ready"
-<<" receiver_id="<<receiver.receiver_id<<'\n';
+                         <<" receiver_id="<<receiver.receiver_id<<'\n';
                 continue;
             }
 
@@ -829,6 +850,7 @@ void notify_failed_receivers(std::vector<ReceiverConnection>&receivers,std::uint
     if(!receiver.completed)send_control_frame(receiver.control_fd.get(),frame);
 }
 
+//慢receiver最后TCP补齐，避免拖住UDP主组
 void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::string &file_path,
                            std::uint64_t file_size,std::uint64_t transfer_id,std::uint32_t total_blocks,
                            const std::array<std::uint8_t,srcast::kSha256Size>&digest)
@@ -838,7 +860,7 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
     {
         std::lock_guard<std::mutex>lock(output_mutex);
         std::cout<<"TCP backfill receiver_id="<<receiver.receiver_id
-<<" blocks="<<receiver.backfill_blocks.size()<<'\n';
+                 <<" blocks="<<receiver.backfill_blocks.size()<<'\n';
     }
         send_control_frame(receiver.control_fd.get(),
                            srcast::encode_backfill_begin({transfer_id,total_blocks}));
@@ -867,7 +889,7 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
             {
                 std::lock_guard<std::mutex>lock(output_mutex);
                 std::cout<<"ignore stale SECTION_STATUS during TCP backfill"
-<<" receiver_id="<<receiver.receiver_id<<'\n';
+                         <<" receiver_id="<<receiver.receiver_id<<'\n';
                 continue;
             }
             if(type!=srcast::ControlType::ReceiverComplete)
@@ -915,6 +937,7 @@ void backfill_isolated_receivers(std::vector<ReceiverConnection>&receivers,int i
     for(auto &task:tasks)task.get();
 }
 
+//中心每个section都等这个 ACK，确认proxy已经落盘
 void send_central_status(int central_fd,std::uint64_t transfer_id,srcast::CentralStatusCode status,
     std::uint64_t file_size,const std::array<std::uint8_t,srcast::kSha256Size>&sha256)
 {
@@ -927,9 +950,9 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
 
 std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     const std::string &cache_directory,int udp_fd,const sockaddr_in &multicast_destination,
-    std::vector<ReceiverConnection>&receivers,int pace_us,int max_repair_rounds)
+    std::vector<ReceiverConnection>& receivers,int pace_us,int max_repair_rounds)
 {
-
+//中心可能发新文件，也可能只发 SESSION_END
     const auto first_frame=receive_control_frame(central_fd);
     const auto first_type=srcast::peek_control_type(first_frame);
     if(first_type==srcast::ControlType::CentralSessionEnd)
@@ -995,7 +1018,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     const auto section_count=srcast::
                              section_count_for_blocks(meta.total_blocks,meta.section_block_count);
     const auto resume_section=load_central_checkpoint(checkpoint_path,temporary_path,meta);
-
+//断点恢复时复用 .part；新任务才截断
     FileDescriptor output(::open(temporary_path.c_str(),O_CREAT|(resume_section==0?O_TRUNC:0)|
                                  O_RDWR|O_CLOEXEC,0644));
     if(output.get()<0)
@@ -1021,8 +1044,8 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     std::uint64_t duplicate_count=0;
     std::uint64_t rejected_count=0;
     std::cout<<"central transfer started transfer_id="<<meta.transfer_id<<" size="<<meta.file_size
-<<" blocks="<<meta.total_blocks<<" resume_section="
-<<resume_section<<'/'<<section_count<<'\n';
+             <<" blocks="<<meta.total_blocks<<" resume_section="
+             <<resume_section<<'/'<<section_count<<'\n';
     for(auto &receiver:receivers)
     {
         receiver.meta_ready=false;
@@ -1049,7 +1072,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     wait_for_meta_ready(receivers,meta.transfer_id);
     send_control_frame(central_fd,srcast::encode_central_resume({meta.transfer_id,resume_section,
                        section_count,meta.file_size,std::array<std::uint8_t,srcast::kSha256Size>{}}));
-
+//之后只接收resume_section及后面的DATA
     auto fail_after_meta=[&](const std::string &reason,
                              const std::array<std::uint8_t,srcast::kSha256Size>&sha256)
     {
@@ -1105,6 +1128,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             throw std::runtime_error("unexpected central control message during file transfer");
         }
 
+//中心声明section 结束后，proxy才检查这一段有没有收齐
         const auto end=srcast::decode_central_file_end(frame);
         if(end.transfer_id!=meta.transfer_id||end.total_blocks!=meta.total_blocks||
            end.section_id!=next_section_id||end.section_id>=section_count||rejected_count!=0)
@@ -1123,6 +1147,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
                 std::array<std::uint8_t,srcast::kSha256Size>{});
         }
 
+//proxy先本地分发已缓存section，再向中心ACK
         const bool section_delivered=distribute_section(udp_fd,multicast_destination,receivers,
             output.get(),temporary_path,meta.file_size,meta.transfer_id,meta.total_blocks,meta.sha256,
             end.section_id,pace_us,max_repair_rounds,meta.section_block_count);
@@ -1138,7 +1163,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             {
                 system_error("fsync central cache section");
             }
-
+//非最终section只记checkpoint，不SHA
             save_central_checkpoint(checkpoint_path,meta,completed_section);
             send_central_status(central_fd,meta.transfer_id,srcast::CentralStatusCode::Cached,
                                 meta.file_size,std::array<std::uint8_t,srcast::kSha256Size>{});
@@ -1156,7 +1181,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             system_error("fsync central cache");
         }
         output.reset(-1);
-
+//最后一段收完后文件校验，再rename成正式缓存
         const auto actual_digest=srcast::sha256_file(temporary_path);
         if(actual_digest!=meta.sha256)
         fail_after_meta("central cached file SHA-256 mismatch",actual_digest);
@@ -1170,7 +1195,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
 
         std::error_code remove_error;
         std::filesystem::remove(checkpoint_path,remove_error);
-
+//正式缓存可读后，再给慢receiver TCP backfill
         FileDescriptor backfill_input(::open(final_path.c_str(),O_RDONLY|O_CLOEXEC));
         if(backfill_input.get()<0)
         {
@@ -1189,11 +1214,11 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
                 (receivers.begin(),receivers.end(),[](const ReceiverConnection &receiver)
                 {return receiver.completed;}));
             std::cout<<"file finished PARTIAL completed="<<completed_count<<'/'<<receivers.size()
-<<" after max repair rounds\n";
+                     <<" after max repair rounds\n";
         }
         wait_for_receivers_ready(receivers,meta.transfer_id);
         std::cout<<"central transfer cached path="<<final_path<<" duplicates="<<duplicate_count
-<<" rejected="<<rejected_count<<'\n';
+                 <<" rejected="<<rejected_count<<'\n';
         return CachedCentralFile{final_path,meta.transfer_id,meta.file_size,
                                  meta.total_blocks,actual_digest};
     }
@@ -1221,14 +1246,14 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
         const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
         const auto timeout_ms=static_cast<int>(std::max<std::int64_t>(1,remaining.count()));
         const auto ready_indexes=wait_for_receiver_events(receivers,
-            [](const ReceiverConnection &receiver){return!receiver.meta_ready;},
+            [](const ReceiverConnection &receiver){return !receiver.meta_ready;},
             timeout_ms,"META_READY");
         if(ready_indexes.empty())continue;
 
         for(const auto receiver_index:ready_indexes)
         {
             auto &receiver=receivers[receiver_index];
-
+//receive_control_frame会读4字节+完整消息体
             const auto frame=receive_control_frame(receiver.control_fd.get());
             const auto type=srcast::peek_control_type(frame);
             if(type!=srcast::ControlType::MetaReady)
@@ -1248,11 +1273,12 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
     }
 }
 
+//单文件流程 FILE_META 组播 修复 backfill READY
 void send_file(int udp_fd,const sockaddr_in &multicast_destination,
     std::vector<ReceiverConnection>&receivers,const std::string &file_path,int pace_us,
     int max_repair_rounds,std::uint32_t section_block_limit)
 {
-
+//新文件开始前清理上一文件的接收端状态，但保留 TCP 连接。
     for(auto &receiver:receivers)
     {
         receiver.meta_ready=false;
@@ -1310,9 +1336,10 @@ void send_file(int udp_fd,const sockaddr_in &multicast_destination,
     file_meta.section_block_count=section_block_limit;
     file_meta.sha256=digest;
     const auto file_meta_frame=srcast::encode_file_meta(file_meta);
-
+//FILE_META走TCP，逐个接收端发
     for(auto &receiver:receivers)send_control_frame(receiver.control_fd.get(),file_meta_frame);
 
+//receiver文件准备好后发UDP DATA
     wait_for_meta_ready(receivers,transfer_id);
     const auto section_count=srcast::section_count_for_blocks(total_blocks,section_block_limit);
     for(std::uint32_t section_id=0;section_id<section_count&&!all_receivers_completed(receivers);
@@ -1332,9 +1359,9 @@ void send_file(int udp_fd,const sockaddr_in &multicast_destination,
         notify_failed_receivers(receivers,transfer_id);
         const auto completed_count=static_cast<std::size_t>(std::count_if
             (receivers.begin(),receivers.end(),
-            [](const ReceiverConnection&receiver){return receiver.completed;}));
+            [](const ReceiverConnection& receiver){return receiver.completed;}));
         std::cout<<"file finished PARTIAL completed="<<completed_count<<'/'<<receivers.size()
-<<" after max repair rounds\n";
+                 <<" after max repair rounds\n";
     }
 
     wait_for_receivers_ready(receivers,transfer_id);
@@ -1394,11 +1421,12 @@ int main(int argc,char**argv) try
     multicast_destination.sin_family=AF_INET;
     multicast_destination.sin_port=htons(static_cast<std::uint16_t>(udp_port));
     if(::inet_pton(AF_INET,multicast_ip.c_str(),&multicast_destination.sin_addr)!=1||
-!IN_MULTICAST(ntohl(multicast_destination.sin_addr.s_addr)))
+                   !IN_MULTICAST(ntohl(multicast_destination.sin_addr.s_addr)))
     {
         throw std::runtime_error("destination must be an IPv4 multicast address");
     }
 
+//先开控制面，receiver 注册完再接中心。
     auto listener=create_control_listener(control_port);
     std::optional<FileDescriptor>central_listener;
     if(central_mode)
@@ -1438,15 +1466,14 @@ int main(int argc,char**argv) try
                         central_session_finished=true;
                         break;
                     }
-                }catch(const std::exception&error)
+                }catch(const std::exception& error)
                 {
                     std::cerr<<"central session interrupted:"<<error.what()<<"; waiting for reconnect\n";
                     break;
                 }
             }
         }
-    }
-    else
+    }else
     {
         for(std::size_t argument_index=0;argument_index<options.files.size();argument_index++)
         {
