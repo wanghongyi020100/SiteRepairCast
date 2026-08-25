@@ -348,7 +348,7 @@ void save_receiver_state(const TransferState &state)
     }
 }
 
-//测试hook：只丢初始轮指定block，修复轮正常接
+//测试hook：每个指定block首次到达时丢一次，修复重传正常接
 std::unordered_set<std::uint32_t>parse_initial_drop_blocks()
 {
     std::unordered_set<std::uint32_t>blocks;
@@ -568,7 +568,7 @@ void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
 bool should_drop_initial_block_for_test(TransferState &state,
     const std::unordered_set<std::uint32_t>& configured_blocks,std::uint32_t block_id)
 {
-    if(configured_blocks.empty()||state.last_end_round)return false;
+    if(configured_blocks.empty())return false;
     if(configured_blocks.find(block_id)==configured_blocks.end())return false;
     const auto inserted=state.intentionally_dropped_blocks.insert(block_id);
     if(!inserted.second)return false;

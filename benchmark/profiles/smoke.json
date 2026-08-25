@@ -1,0 +1,54 @@
+{
+  "name": "smoke",
+  "description": "快速验证完整指标链路；结果只代表本机小文件回环测试。",
+  "file_size_bytes": 524288,
+  "repetitions": 1,
+  "section_blocks": 64,
+  "udp_pace_us": 100,
+  "central_pace_us": 0,
+  "max_repair_rounds": 3,
+  "timeout_seconds": 45,
+  "scenarios": [
+    {
+      "id": "distribution-clean-2",
+      "kind": "transfer",
+      "receivers": 2,
+      "deterministic_initial_data_drop_percent": 0
+    },
+    {
+      "id": "distribution-loss-3pct-2",
+      "kind": "transfer",
+      "receivers": 2,
+      "deterministic_initial_data_drop_percent": 3
+    },
+    {
+      "id": "slow-shared-repair-4",
+      "kind": "slow_shared",
+      "comparison_group": "lagging-pair-4",
+      "receivers": 4,
+      "lagging_receiver_ids": [3, 4],
+      "lagging_drop_blocks": 12
+    },
+    {
+      "id": "slow-isolated-4",
+      "kind": "slow_isolated",
+      "comparison_group": "lagging-pair-4",
+      "receivers": 4,
+      "lagging_receiver_ids": [3, 4],
+      "lagging_drop_blocks": 12,
+      "slow_missing_threshold": 4
+    },
+    {
+      "id": "central-resume-2",
+      "kind": "central_resume",
+      "receivers": 2,
+      "stop_after_sections": 2
+    },
+    {
+      "id": "proxy-crash-recovery-2",
+      "kind": "proxy_crash",
+      "receivers": 2,
+      "kill_after_section": 1
+    }
+  ]
+}

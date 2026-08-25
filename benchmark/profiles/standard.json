@@ -1,0 +1,66 @@
+{
+  "name": "standard",
+  "description": "用于形成可重复简历数据的本机回环配置；建议机器空闲时完整运行。",
+  "file_size_bytes": 8388608,
+  "repetitions": 5,
+  "section_blocks": 512,
+  "udp_pace_us": 100,
+  "central_pace_us": 0,
+  "max_repair_rounds": 3,
+  "timeout_seconds": 180,
+  "scenarios": [
+    {
+      "id": "distribution-clean-8",
+      "kind": "transfer",
+      "receivers": 8,
+      "deterministic_initial_data_drop_percent": 0
+    },
+    {
+      "id": "distribution-loss-1pct-8",
+      "kind": "transfer",
+      "receivers": 8,
+      "deterministic_initial_data_drop_percent": 1
+    },
+    {
+      "id": "distribution-loss-3pct-8",
+      "kind": "transfer",
+      "receivers": 8,
+      "deterministic_initial_data_drop_percent": 3
+    },
+    {
+      "id": "distribution-loss-5pct-8",
+      "kind": "transfer",
+      "receivers": 8,
+      "deterministic_initial_data_drop_percent": 5
+    },
+    {
+      "id": "slow-shared-repair-8",
+      "kind": "slow_shared",
+      "comparison_group": "lagging-pair-8",
+      "receivers": 8,
+      "lagging_receiver_ids": [7, 8],
+      "lagging_drop_blocks": 128
+    },
+    {
+      "id": "slow-isolated-8",
+      "kind": "slow_isolated",
+      "comparison_group": "lagging-pair-8",
+      "receivers": 8,
+      "lagging_receiver_ids": [7, 8],
+      "lagging_drop_blocks": 128,
+      "slow_missing_threshold": 32
+    },
+    {
+      "id": "central-resume-8",
+      "kind": "central_resume",
+      "receivers": 8,
+      "stop_after_sections": 4
+    },
+    {
+      "id": "proxy-crash-recovery-8",
+      "kind": "proxy_crash",
+      "receivers": 8,
+      "kill_after_section": 3
+    }
+  ]
+}
