@@ -1,103 +1,67 @@
-# SiteRepairCast benchmark / validation
+# SiteRepairCast Benchmark
 
-这个目录把简历中的“支持分发、丢包修复、慢节点隔离、断点续传和崩溃恢复”变成可重复运行、保留原始证据的实验。运行器调用现有三个程序及其测试环境变量，不修改生产协议和传输路径。
+## 怎么测试
 
-唯一配套 C++ 改动记录在 `src/receiver.cpp` 的 `should_drop_initial_block_for_test`：删除对 `state.last_end_round` 的提前返回，并同步修改注释。原钩子在 Section 0 结束后会让后续配置 Block 永远不再丢弃，导致“整文件 3%”实际只执行了一小部分；现在由已有的 `intentionally_dropped_blocks.insert` 保证每个配置 Block 只在首次到达时丢一次，修复重传正常接收。未设置 `SRCAST_DROP_INITIAL_BLOCKS` 时路径立即返回，生产运行行为不变。
-
-## 快速运行
-
-依赖与主项目一致：Linux、CMake 3.16+、C++17 编译器、OpenSSL 开发包、Python 3.8+。Python 脚本只使用标准库，不需要 `pip install`；IPv4 loopback 必须支持 multicast。
-
-从仓库根目录运行：
-
-```bash
-python3 benchmark/run.py --profile benchmark/profiles/smoke.json
-```
-
-`smoke.json` 使用 512 KiB 文件、每场景 1 轮，只检查整条采集链路。它会运行：
-
-- 2 个接收端的无丢包与 3% 确定性相关有效丢包；
-- 4 个接收端、其中 2 个落后接收端的隔离开/关 A/B；
-- 中心在确认 2 个 Section 后断线并续传；
-- 代理在提交第 2 个 Section 后被 `SIGKILL`，随后代理与接收端重启恢复。
-
-正式收集多轮数据：
+在项目根目录执行正式测试：
 
 ```bash
 python3 benchmark/run.py --profile benchmark/profiles/standard.json
 ```
 
-`standard.json` 明确记录了 8 MiB、8 接收端、5 次重复和 1%/3%/5% 丢包等条件。它不是 1 GB 实验，报告也不会把结果外推为 1 GB。建议复制配置、调整 `file_size_bytes` 和 `repetitions`，并把修改后的 JSON 与结果一起保存。
+`standard.json` 使用 8 MiB 文件、8 个 Receiver，每个场景重复 5 次。脚本会自动编译
+Release 版的 Central、Proxy 和 Receiver，启动各场景所需的进程，并对每个输出文件做 SHA-256 校验。
 
-常用选项：
+只想检查测试脚本能否正常运行，可以使用 512 KiB、单轮的 smoke 配置：
 
 ```bash
-# 只跑一个场景并指定新的输出目录
-python3 benchmark/run.py \
-  --profile benchmark/profiles/standard.json \
-  --scenario central-resume-8 \
-  --output artifacts/validation/resume-8m-5runs
-
-# 已有 Release 构建时复用它
-python3 benchmark/run.py \
-  --profile benchmark/profiles/smoke.json \
-  --build-dir build-benchmark-validation \
-  --no-build
+python3 benchmark/run.py --profile benchmark/profiles/smoke.json
 ```
 
-输出目录必须是一个尚不存在的新目录，运行器不会覆盖旧结果。默认写到 `artifacts/validation/<时间>-<profile>`，该位置已由项目 `.gitignore` 忽略。为避免固定回环组播互相干扰，同一仓库一次只允许运行一个 benchmark。
+结果保存在 `artifacts/validation/<时间>-<profile>/`：
 
-## 输出与可审计性
+- `report.md` 保存汇总结果
+- `summary.csv` 和 `summary.json` 保存各场景统计值
+- `raw/metrics.csv` 和 `raw/metrics.jsonl` 保存每一轮的原始指标
+- `raw/<scenario>-rNN/` 保存各进程日志、启动参数和测试钩子
 
-每次运行产生：
+## 测试了什么
 
-```text
-artifacts/validation/<run>/
-├── manifest.json          # 完整 profile、机器、编译器、commit 和执行命令
-├── build.log              # Release 配置与构建日志
-├── raw/
-│   ├── metrics.csv        # 每一轮一行的原始指标
-│   ├── metrics.jsonl      # 含完整字段的逐轮记录
-│   └── <scenario>-rNN/
-│       ├── central*.log
-│       ├── proxy*.log
-│       ├── receiver-*.log
-│       └── run.json       # 精确 argv、测试 hook、结果或错误
-├── summary.csv            # 按场景聚合的成功率、median、P95、P99
-├── summary.json
-└── report.md              # 可读报告、慢节点 A/B 与口径限制
-```
+| 场景 | 验证内容 |
+| --- | --- |
+| `distribution-clean-8` | 8 个 Receiver 无丢包完成分发 |
+| `distribution-loss-1pct-8` | 每个 Receiver 丢弃 1% 的 DATA 首次到达，再通过组播修复 |
+| `distribution-loss-3pct-8` | 每个 Receiver 丢弃 3% 的 DATA 首次到达，再通过组播修复 |
+| `distribution-loss-5pct-8` | 每个 Receiver 丢弃 5% 的 DATA 首次到达，再通过组播修复 |
+| `slow-shared-repair-8` | 2 个落后 Receiver 留在主修复组，继续参与 UDP 修复 |
+| `slow-isolated-8` | 隔离相同的 2 个落后 Receiver，通过 TCP backfill 补齐缺块 |
+| `central-resume-8` | Central 确认 4 个 Section 后断开，重连 Proxy 并从 checkpoint 继续 |
+| `proxy-crash-recovery-8` | Proxy 提交第 4 个 Section 后被 `SIGKILL`，重启 Proxy 和 Receiver 后恢复 |
 
-失败时原始日志仍会保留。默认在第一轮失败后停止；加 `--keep-going` 才会继续其余场景。最终输出文件以 SHA-256 与源文件逐一比较，任何缺失、重复输出或摘要不一致都会把该轮标成失败。
+测试记录完成时间、修复包数、TCP backfill 块数、恢复 Section 和恢复耗时，并校验所有
+Receiver 的最终文件是否与输入文件一致。
 
-## 指标定义
+## 测试结果
 
-- `duration_ms`：启动中心发送端前到该轮所有进程退出的墙钟时间，不含构建与接收端注册。
-- `receiver_completion_ms`：从启动中心到接收端最终文件原子 `rename` 可见的时间，轮询分辨率约 10 ms。
-- `normal_completion_ms`：慢节点实验中所有非落后接收端完成时间的最大值，用于同一 profile 的隔离开/关对照。
-- `repair_*_packets`、`tcp_backfill_blocks`：从代理原始日志汇总的实际执行计数。
-- `resume_section`、`recovered_blocks_per_receiver`：从中心/接收端恢复日志解析的 checkpoint 位置。
-- `recovery_ms`：第二次中心启动或崩溃后重启完成，到全部恢复完成的实测时间。
-- `crash_to_recovered_ms`：从向代理发送 `SIGKILL` 到全部接收端恢复完成，包含脚本中的 200 ms 重启间隔、进程重启和重新注册。
-- `success_rate_percent`、`sha256_success_rate_percent`：实际成功轮数除以配置轮数。
-- P95/P99：对多轮墙钟数据使用 nearest-rank；smoke 只有一轮，因此只表示采集链路正常，不是有统计意义的尾延迟。
+测试环境：2 个逻辑 CPU、3.77 GiB 内存、Linux、g++ 13.3.0、Python 3.12.3。
+以下是 `standard.json` 在同机 loopback 环境下的 5 轮结果。
 
-`cross_site_payload_bytes_protocol_derived` 是正常完成或 checkpoint 主动断线场景中按协议已知的中心文件 payload；`SIGKILL` 场景可能存在正在发送但尚未确认的 Section，因此该字段留空，不能假装精确。`direct_tcp_payload_bytes_model` 是“向每个接收端各发一份”的比较模型。它们都不是抓包得到的 wire bytes，不包含 TCP/UDP/IP 头和控制帧，报告会始终明确标为 derived/model，不能描述成“实测带宽节省”。
+| 场景 | 通过 | 完成时间中位数 | P95 | 恢复耗时中位数 | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `distribution-clean-8` | 5/5 | 17.524 s | 20.568 s | - | 100% |
+| `distribution-loss-1pct-8` | 5/5 | 21.406 s | 23.890 s | - | 100% |
+| `distribution-loss-3pct-8` | 5/5 | 21.602 s | 23.494 s | - | 100% |
+| `distribution-loss-5pct-8` | 5/5 | 23.663 s | 27.198 s | - | 100% |
+| `slow-shared-repair-8` | 5/5 | 17.187 s | 19.004 s | - | 100% |
+| `slow-isolated-8` | 5/5 | 16.926 s | 17.535 s | - | 100% |
+| `central-resume-8` | 5/5 | 16.831 s | 17.002 s | 11.867 s | 100% |
+| `proxy-crash-recovery-8` | 5/5 | 16.794 s | 16.908 s | 11.659 s | 100% |
 
-## 场景边界
+8 个场景共运行 40 轮，全部通过，所有 Receiver 的最终文件 SHA-256 校验成功。
 
-分发丢包场景通过 `SRCAST_DROP_INITIAL_BLOCKS` 确定性地让每个 receiver 丢弃指定 DATA Block 的首次到达，并在修复重传时正常接收。配置百分比以整文件 Block 数为分母，运行器还会强制核对配置数与 receiver 日志中的实际丢弃数。它是可重复的应用层测试钩子，不是随机网络丢包模拟器，不能写成“实测链路丢包率”。单机上的多个 receiver 使用同一个 IP 和 UDP 端口，针对单个 receiver 的 UDP 单播无法可靠归属，因此所有 receiver 丢同一组 Block，保证修复走组播。
+- 1% / 3% / 5% 场景中，每个 Receiver 分别实际丢弃 70 / 210 / 350 个 Block，修复后均完整输出。
+- 慢节点隔离后，正常 Receiver 完成时间中位数从 17.133 s 降至 16.745 s，下降 2.268%；
+  被隔离的 2 个 Receiver 每轮共通过 TCP backfill 恢复 256 个 Block。
+- Central 重连后从 Section 4/14 继续，恢复耗时中位数为 11.867 s。
+- Proxy 崩溃重启后从 Section 4/14 恢复，恢复耗时中位数为 11.659 s。
 
-慢节点 A/B 则使用 `SRCAST_DROP_INITIAL_BLOCKS` 让两个接收端在第一个 Section 丢相同的一组 Block：
-
-- `slow_shared` 把隔离阈值设为最大值，落后节点留在主修复组；
-- `slow_isolated` 使用 profile 中的阈值，要求日志确认隔离并执行 TCP backfill；
-- 两边输入、Section、pace、接收端数和缺块集合相同，比较正常接收端完成时间。
-
-这能验证“落后节点是否阻塞主组”的实现路径，但它模拟的是确定性缺块，不是独立主机上的真实限速。要写“1 个限速慢节点”或真实网络 P99，必须在多机环境使用 `tc/netem` 或硬件限速后重新运行，不能使用本机 smoke 数字代替。
-
-中心续传使用 `SRCAST_STOP_AFTER_SECTIONS`；崩溃恢复在日志确认 Section checkpoint 后向代理发送 `SIGKILL`，随后复用 cache 和 receiver 状态目录重启。报告中的“已保留 payload”和“已确认 payload 重传 0 字节”由恢复 Section 边界推导，真实耗时、恢复位置和最终 SHA-256 则来自本次执行。
-
-## 简历使用原则
-
-只引用与你保存的 `manifest.json`、raw logs 和 summary 对应的真实数据。推荐至少 5 轮，在机器空闲且环境固定时运行，并写清文件大小、接收端数、丢包方式和单机/多机条件。不要只选最好的一轮，不要把 payload 模型写成抓包流量，也不要把 512 KiB smoke 外推成 1 GB 结果。
+丢包由应用层测试钩子确定性注入，慢节点也由缺块模拟。这些数据验证了协议路径，不等同于多机真实网络测试。
