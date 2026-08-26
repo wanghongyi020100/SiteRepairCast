@@ -381,7 +381,7 @@ class BenchmarkRunner:
     def run_transfer(self, scenario, repeat, work, logs, processes, input_path):
         receivers = scenario["receivers"]
         total_blocks = math.ceil(input_path.stat().st_size / PAYLOAD_BYTES)
-        proxy_env = {"SRCAST_SLOW_MISSING_THRESHOLD": 4294967295}
+        proxy_env = {"SRCAST_BACKFILL_ROUNDS": 4294967295}
         receiver_envs = {}
         if scenario["kind"] == "transfer":
             percent = scenario.get("deterministic_initial_data_drop_percent", 0)
@@ -393,7 +393,7 @@ class BenchmarkRunner:
                                      self.profile["section_blocks"])))
             receiver_envs = self.receiver_envs(scenario["lagging_receiver_ids"], dropped)
             if scenario["kind"] == "slow_isolated":
-                proxy_env["SRCAST_SLOW_MISSING_THRESHOLD"] = scenario["slow_missing_threshold"]
+                proxy_env["SRCAST_BACKFILL_ROUNDS"] = scenario["backfill_rounds"]
         component = self.start_components(processes, work, logs, receivers,
                                           proxy_env, receiver_envs)
         started_ns = time.monotonic_ns()
@@ -423,7 +423,7 @@ class BenchmarkRunner:
 
     def run_resume(self, scenario, repeat, work, logs, processes, input_path):
         component = self.start_components(processes, work, logs, scenario["receivers"],
-            {"SRCAST_SLOW_MISSING_THRESHOLD": 4294967295}, {})
+            {"SRCAST_BACKFILL_ROUNDS": 4294967295}, {})
         started_ns = time.monotonic_ns()
         first = self.central(processes, input_path, component["central_port"], logs,
                              "-first", {"SRCAST_STOP_AFTER_SECTIONS":
@@ -462,7 +462,7 @@ class BenchmarkRunner:
 
     def run_crash(self, scenario, repeat, work, logs, processes, input_path):
         component = self.start_components(processes, work, logs, scenario["receivers"],
-            {"SRCAST_SLOW_MISSING_THRESHOLD": 4294967295}, {})
+            {"SRCAST_BACKFILL_ROUNDS": 4294967295}, {})
         started_ns = time.monotonic_ns()
         first = self.central(processes, input_path, component["central_port"], logs, "-first")
         self.wait_log(component["proxy_log"],
@@ -478,7 +478,7 @@ class BenchmarkRunner:
                            re.findall(r"central section cached section=(\d+)", first_proxy_text)]
         expected_resume = max(cached_sections) + 1
         resumed = self.start_components(processes, work, logs, scenario["receivers"],
-            {"SRCAST_SLOW_MISSING_THRESHOLD": 4294967295}, {}, "-resume")
+            {"SRCAST_BACKFILL_ROUNDS": 4294967295}, {}, "-resume")
         recovery_started_ns = time.monotonic_ns()
         second = self.central(processes, input_path, resumed["central_port"], logs, "-resume")
         ended_ns, completion_ms = self.monitor(

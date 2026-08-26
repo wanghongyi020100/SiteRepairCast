@@ -48,7 +48,7 @@
       "receivers": 8,
       "lagging_receiver_ids": [7, 8],
       "lagging_drop_blocks": 128,
-      "slow_missing_threshold": 32
+      "backfill_rounds": 0
     },
     {
       "id": "central-resume-8",

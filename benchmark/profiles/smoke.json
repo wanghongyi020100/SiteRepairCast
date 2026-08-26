@@ -36,7 +36,7 @@
       "receivers": 4,
       "lagging_receiver_ids": [3, 4],
       "lagging_drop_blocks": 12,
-      "slow_missing_threshold": 4
+      "backfill_rounds": 0
     },
     {
       "id": "central-resume-2",

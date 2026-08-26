@@ -10,6 +10,7 @@
 #include<arpa/inet.h>
 #include<fcntl.h>
 #include<netinet/in.h>
+#include<poll.h>
 #include<sys/epoll.h>
 #include<sys/socket.h>
 #include<sys/stat.h>
@@ -43,22 +44,30 @@ using SteadyClock=std::chrono::steady_clock;
 constexpr auto kReportTimeout=std::chrono::seconds(30);//等待接收端上报状态的最长时间
 constexpr auto kMetaReadyTimeout=std::chrono::seconds(30);//等待接收端确认元数据的最长时间
 constexpr auto kReadyTimeout=std::chrono::seconds(10);//等待接收端进入就绪状态的最长时间
+constexpr auto kBackfillTimeout=std::chrono::seconds(30);//等待TCP补传结果的最长时间
 constexpr std::uint32_t kSectionId=srcast::kSingleSectionId;//未分段流程使用的Section编号
 constexpr std::size_t kMulticastRepairThreshold=2;//至少两个目标缺块时使用组播修复
-constexpr std::uint32_t kDefaultSlowMissingThreshold=32;//超过该缺块数后隔离慢接收端
 constexpr std::size_t kBackfillThreadCount=4;//TCP补传线程池的最大线程数
+constexpr int kMaxTransferRetries=2;//最终SHA失败后的整文件重试次数
 std::mutex output_mutex;
-std::uint32_t slow_missing_threshold()
+
+enum class DeliveryResult
 {
-    const char* raw=std::getenv("SRCAST_SLOW_MISSING_THRESHOLD");
-    if(raw==nullptr||*raw=='\0')return kDefaultSlowMissingThreshold;
+    Success,
+    Sha256Mismatch,
+    Failed,
+};
+std::uint32_t backfill_rounds(int max_repair_rounds)
+{
+    const char* raw=std::getenv("SRCAST_BACKFILL_ROUNDS");
+    if(raw==nullptr||*raw=='\0')return static_cast<std::uint32_t>(max_repair_rounds);
 
     char *end=nullptr;
     errno=0;
     const auto value=std::strtoul(raw,&end,10);
     if(raw==end||*end!='\0'||errno==ERANGE||value>std::numeric_limits<std::uint32_t>::max())
     {
-        throw std::runtime_error("invalid SRCAST_SLOW_MISSING_THRESHOLD value");
+        throw std::runtime_error("invalid SRCAST_BACKFILL_ROUNDS value");
     }
     return static_cast<std::uint32_t>(value);
 }
@@ -107,6 +116,16 @@ std::uint64_t create_transfer_id()
     std::random_device device;
     std::mt19937_64 engine(device());
     return engine();
+}
+
+std::uint64_t create_transfer_id(const std::unordered_set<std::uint64_t>&used_transfer_ids)
+{
+    std::uint64_t transfer_id{};
+    do
+    {
+        transfer_id=create_transfer_id();
+    }while(used_transfer_ids.find(transfer_id)!=used_transfer_ids.end());
+    return transfer_id;
 }
 
 void send_udp_packet(int socket_fd,const sockaddr_in &destination,const std::vector<std::uint8_t>&packet)
@@ -206,6 +225,46 @@ struct ReceiverConnection
     std::vector<std::uint32_t>backfill_blocks;
     std::optional<srcast::SectionStatusMessage>status;
 };
+
+void reset_transfer_state(std::vector<ReceiverConnection>&receivers)
+{
+    for(auto &receiver:receivers)
+    {
+        receiver.meta_ready=false;
+        receiver.status_received=false;
+        receiver.complete_received=false;
+        receiver.completed=false;
+        receiver.ready_for_next_transfer=false;
+        receiver.isolated=false;
+        receiver.backfill_blocks.clear();
+        receiver.status.reset();
+    }
+}
+
+bool receiver_reported_sha_mismatch(const std::vector<ReceiverConnection>&receivers)
+{
+    return std::any_of(receivers.begin(),receivers.end(),[](const ReceiverConnection& receiver)
+    {
+        return receiver.status&&receiver.status->status==srcast::SectionStatusCode::Failed;
+    });
+}
+
+void remove_abandoned_receivers(std::vector<ReceiverConnection>&receivers)
+{
+    receivers.erase(std::remove_if(receivers.begin(),receivers.end(),
+        [](const ReceiverConnection& receiver){return receiver.control_fd.get()<0;}),receivers.end());
+}
+
+void abandon_incomplete_receivers(std::vector<ReceiverConnection>&receivers)
+{
+    for(auto &receiver:receivers)
+    {
+        if(receiver.completed)continue;
+        std::cerr<<"receiver transfer failed; abandoning receiver_id="<<receiver.receiver_id<<'\n';
+        receiver.control_fd.reset(-1);
+    }
+    remove_abandoned_receivers(receivers);
+}
 
 void usage(const char *program)
 {
@@ -576,9 +635,10 @@ void collect_round_reports(std::vector<ReceiverConnection>&receivers,std::uint64
     }
 }
 
-//缺块超过阈值转入慢节点队列，主组继续
+//达到配置修复轮数后仍缺块，转入慢节点队列
 void isolate_slow_receivers(std::vector<ReceiverConnection>&receivers,std::uint32_t total_blocks,
-     std::uint32_t section_id,std::uint32_t section_block_limit,std::uint32_t missing_threshold)
+     std::uint32_t section_id,std::uint32_t round_id,std::uint32_t section_block_limit,
+     std::uint32_t backfill_after_rounds)
 {
     const auto first_block=srcast::section_first_block(section_id,section_block_limit);
     const auto section_blocks=srcast::section_block_count(total_blocks,section_id,section_block_limit);
@@ -586,7 +646,7 @@ void isolate_slow_receivers(std::vector<ReceiverConnection>&receivers,std::uint3
     {
         if(receiver.completed||receiver.isolated||!receiver.status||
            receiver.status->status!=srcast::SectionStatusCode::Missing||
-           receiver.status->missing_count<=missing_threshold)continue;
+           round_id<backfill_after_rounds)continue;
 
         for(std::uint32_t local_block=0;local_block<section_blocks;local_block++)
         {
@@ -600,7 +660,7 @@ void isolate_slow_receivers(std::vector<ReceiverConnection>&receivers,std::uint3
         receiver.isolated=true;
         std::cout<<"receiver_id="<<receiver.receiver_id<<
         " isolated for TCP backfill missing_blocks="<<receiver.status->missing_count
-        <<" section="<<section_id<<'\n';
+        <<" section="<<section_id<<" repair_rounds="<<round_id<<'\n';
     }
 }
 
@@ -703,7 +763,7 @@ void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
 //初 DATA的故障注入只给smoke，实际环境变量为空
 bool all_receivers_completed(const std::vector<ReceiverConnection>&receivers);
 
-bool distribute_section(int udp_fd,const sockaddr_in &multicast_destination,
+DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destination,
     std::vector<ReceiverConnection>&receivers,int input_fd,const std::string &file_path,
     std::uint64_t file_size,std::uint64_t transfer_id,std::uint32_t total_blocks,
     const std::array<std::uint8_t,srcast::kSha256Size>&digest,std::uint32_t section_id,
@@ -712,7 +772,7 @@ bool distribute_section(int udp_fd,const sockaddr_in &multicast_destination,
     std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
     const auto first_block=srcast::section_first_block(section_id,section_block_limit);
     const auto section_blocks=srcast::section_block_count(total_blocks,section_id,section_block_limit);
-    const auto missing_threshold=slow_missing_threshold();
+    const auto backfill_after_rounds=backfill_rounds(max_repair_rounds);
     const auto duplicate_blocks=parse_block_set_env("SRCAST_DUPLICATE_DATA_BLOCKS");
     const auto corrupt_blocks=parse_block_set_env("SRCAST_CORRUPT_DATA_BLOCKS");
     const bool reverse_initial_data=env_flag_enabled("SRCAST_REVERSE_INITIAL_DATA");
@@ -756,7 +816,9 @@ bool distribute_section(int udp_fd,const sockaddr_in &multicast_destination,
     std::cout<<"section="<<section_id<<" initial multicast finished; collecting round 0 reports\n";
     collect_round_reports(receivers,transfer_id,section_id,0,
                           file_size,total_blocks,section_block_limit,digest);
-    isolate_slow_receivers(receivers,total_blocks,section_id,section_block_limit,missing_threshold);
+    if(receiver_reported_sha_mismatch(receivers))return DeliveryResult::Sha256Mismatch;
+    isolate_slow_receivers(receivers,total_blocks,section_id,0,section_block_limit,
+                           backfill_after_rounds);
     for(int repair_round=1;repair_round<=max_repair_rounds&&
                            !all_receivers_completed(receivers);repair_round++)
     {
@@ -766,22 +828,25 @@ bool distribute_section(int udp_fd,const sockaddr_in &multicast_destination,
                 return receiver.completed||receiver.isolated||
                       (receiver.status&&receiver.status->status==srcast::SectionStatusCode::Complete);
             });
-        if(section_done)return true;
+        if(section_done)return DeliveryResult::Success;
 
         send_repair_round(udp_fd,multicast_destination,receivers,input_fd,file_path,file_size,
                           transfer_id,total_blocks,section_id,static_cast<std::uint32_t>(repair_round),
                           pace_us,section_block_limit);
         collect_round_reports(receivers,transfer_id,section_id,static_cast<std::uint32_t>(repair_round),
                               file_size,total_blocks,section_block_limit,digest);
-        isolate_slow_receivers(receivers,total_blocks,section_id,section_block_limit,missing_threshold);
+        if(receiver_reported_sha_mismatch(receivers))return DeliveryResult::Sha256Mismatch;
+        isolate_slow_receivers(receivers,total_blocks,section_id,
+            static_cast<std::uint32_t>(repair_round),section_block_limit,backfill_after_rounds);
     }
 
-    return std::all_of(receivers.begin(),receivers.end(),
+    const bool section_delivered=std::all_of(receivers.begin(),receivers.end(),
         [](const ReceiverConnection &receiver)
         {
             return receiver.completed||receiver.isolated||(receiver.status&&
                    receiver.status->status==srcast::SectionStatusCode::Complete);
         });
+    return section_delivered?DeliveryResult::Success:DeliveryResult::Failed;
 }
 
 bool all_receivers_completed(const std::vector<ReceiverConnection>&receivers)
@@ -857,6 +922,12 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
 {
     std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
     if(!receiver.isolated||receiver.completed)return;
+    const auto abandon_receiver=[&](const char*reason)
+    {
+        std::lock_guard<std::mutex>lock(output_mutex);
+        std::cerr<<reason<<"; abandoning receiver_id="<<receiver.receiver_id<<'\n';
+        receiver.control_fd.reset(-1);
+    };
     {
         std::lock_guard<std::mutex>lock(output_mutex);
         std::cout<<"TCP backfill receiver_id="<<receiver.receiver_id
@@ -881,12 +952,54 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
 
         send_control_frame(receiver.control_fd.get(),
             srcast::encode_backfill_end({transfer_id,file_size,total_blocks,digest}));
+        const auto deadline=SteadyClock::now()+kBackfillTimeout;
         for(;;)
         {
+            const auto now=SteadyClock::now();
+            if(now>=deadline)
+            {
+                abandon_receiver("TCP backfill timed out");
+                return;
+            }
+
+            const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
+            pollfd event{};
+            event.fd=receiver.control_fd.get();
+            event.events=POLLIN;
+            const auto ready=::poll(&event,1,
+                static_cast<int>(std::max<std::int64_t>(1,remaining.count())));
+            if(ready<0)
+            {
+                if(errno==EINTR)continue;
+                system_error("poll TCP backfill result");
+            }
+            if(ready==0)
+            {
+                abandon_receiver("TCP backfill timed out");
+                return;
+            }
+            if((event.revents&(POLLERR|POLLHUP|POLLNVAL))!=0)
+            {
+                abandon_receiver("receiver control connection failed during TCP backfill");
+                return;
+            }
+            if((event.revents&POLLIN)==0)continue;
+
             const auto complete_frame=receive_control_frame(receiver.control_fd.get());
             const auto type=srcast::peek_control_type(complete_frame);
             if(type==srcast::ControlType::SectionStatus)
             {
+                const auto status=srcast::decode_section_status(complete_frame);
+                if(status.receiver_id==receiver.receiver_id&&status.transfer_id==transfer_id&&
+                   status.status==srcast::SectionStatusCode::Failed)
+                {
+                    receiver.status=status;
+                    receiver.status_received=true;
+                    std::lock_guard<std::mutex>lock(output_mutex);
+                    std::cerr<<"TCP backfill failed receiver_id="<<receiver.receiver_id
+                             <<" status=FAILED\n";
+                    return;
+                }
                 std::lock_guard<std::mutex>lock(output_mutex);
                 std::cout<<"ignore stale SECTION_STATUS during TCP backfill"
                          <<" receiver_id="<<receiver.receiver_id<<'\n';
@@ -894,14 +1007,20 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
             }
             if(type!=srcast::ControlType::ReceiverComplete)
             {
-                throw std::runtime_error("expected RECEIVER_COMPLETE after TCP backfill");
+                std::lock_guard<std::mutex>lock(output_mutex);
+                std::cerr<<"ignore unexpected message during TCP backfill receiver_id="
+                         <<receiver.receiver_id<<'\n';
+                continue;
             }
 
             const auto complete=srcast::decode_receiver_complete(complete_frame);
             if(complete.receiver_id!=receiver.receiver_id||complete.transfer_id!=transfer_id||
                complete.file_size!=file_size||complete.sha256!=digest)
             {
-                throw std::runtime_error("invalid RECEIVER_COMPLETE after TCP backfill");
+                std::lock_guard<std::mutex>lock(output_mutex);
+                std::cerr<<"ignore invalid RECEIVER_COMPLETE during TCP backfill receiver_id="
+                         <<receiver.receiver_id<<'\n';
+                continue;
             }
             break;
         }
@@ -935,6 +1054,7 @@ void backfill_isolated_receivers(std::vector<ReceiverConnection>&receivers,int i
             file_size,transfer_id,total_blocks,std::cref(digest)));
     }
     for(auto &task:tasks)task.get();
+    remove_abandoned_receivers(receivers);
 }
 
 //中心每个section都等这个 ACK，确认proxy已经落盘
@@ -947,6 +1067,61 @@ void send_central_status(int central_fd,std::uint64_t transfer_id,srcast::Centra
 void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id);
 
 void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id);
+
+void begin_receiver_transfer(std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id,
+    std::uint64_t file_size,std::uint32_t total_blocks,std::uint32_t section_block_limit,
+    const std::array<std::uint8_t,srcast::kSha256Size>&digest)
+{
+    reset_transfer_state(receivers);
+    srcast::FileMetaMessage file_meta;
+    file_meta.transfer_id=transfer_id;
+    file_meta.section_id=kSectionId;
+    file_meta.file_size=file_size;
+    file_meta.block_size=srcast::kPayloadSize;
+    file_meta.total_blocks=total_blocks;
+    file_meta.section_block_count=section_block_limit;
+    file_meta.sha256=digest;
+    const auto file_meta_frame=srcast::encode_file_meta(file_meta);
+    for(auto &receiver:receivers)send_control_frame(receiver.control_fd.get(),file_meta_frame);
+    wait_for_meta_ready(receivers,transfer_id);
+}
+
+void finish_failed_transfer(std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id)
+{
+    notify_failed_receivers(receivers,transfer_id);
+    wait_for_receivers_ready(receivers,transfer_id);
+}
+
+DeliveryResult send_file_attempt(int udp_fd,const sockaddr_in &multicast_destination,
+    std::vector<ReceiverConnection>&receivers,int input_fd,const std::string &file_path,
+    std::uint64_t file_size,std::uint64_t transfer_id,std::uint32_t total_blocks,
+    const std::array<std::uint8_t,srcast::kSha256Size>&digest,int pace_us,int max_repair_rounds,
+    std::uint32_t section_block_limit)
+{
+    begin_receiver_transfer(receivers,transfer_id,file_size,total_blocks,section_block_limit,digest);
+    DeliveryResult result=DeliveryResult::Success;
+    const auto section_count=srcast::section_count_for_blocks(total_blocks,section_block_limit);
+    for(std::uint32_t section_id=0;section_id<section_count&&!all_receivers_completed(receivers);
+                                   section_id++)
+    {
+        result=distribute_section(udp_fd,multicast_destination,receivers,input_fd,file_path,file_size,
+            transfer_id,total_blocks,digest,section_id,pace_us,max_repair_rounds,section_block_limit);
+        if(result!=DeliveryResult::Success)break;
+    }
+
+    if(result!=DeliveryResult::Sha256Mismatch)
+    {
+        backfill_isolated_receivers(receivers,input_fd,file_path,file_size,
+                                    transfer_id,total_blocks,digest);
+        if(receiver_reported_sha_mismatch(receivers))result=DeliveryResult::Sha256Mismatch;
+    }
+    if(all_receivers_completed(receivers))result=DeliveryResult::Success;
+    else if(result==DeliveryResult::Success)result=DeliveryResult::Failed;
+
+    if(result!=DeliveryResult::Success)notify_failed_receivers(receivers,transfer_id);
+    wait_for_receivers_ready(receivers,transfer_id);
+    return result;
+}
 
 std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     const std::string &cache_directory,int udp_fd,const sockaddr_in &multicast_destination,
@@ -1046,30 +1221,8 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     std::cout<<"central transfer started transfer_id="<<meta.transfer_id<<" size="<<meta.file_size
              <<" blocks="<<meta.total_blocks<<" resume_section="
              <<resume_section<<'/'<<section_count<<'\n';
-    for(auto &receiver:receivers)
-    {
-        receiver.meta_ready=false;
-        receiver.completed=false;
-        receiver.status_received=false;
-        receiver.complete_received=false;
-        receiver.ready_for_next_transfer=false;
-        receiver.isolated=false;
-        receiver.backfill_blocks.clear();
-        receiver.status.reset();
-    }
-
-    srcast::FileMetaMessage file_meta;
-    file_meta.transfer_id=meta.transfer_id;
-    file_meta.section_id=srcast::kSingleSectionId;
-    file_meta.file_size=meta.file_size;
-    file_meta.block_size=meta.block_size;
-    file_meta.total_blocks=meta.total_blocks;
-    file_meta.section_block_count=meta.section_block_count;
-    file_meta.sha256=meta.sha256;
-    const auto file_meta_frame=srcast::encode_file_meta(file_meta);
-    for(auto &receiver:receivers)
-    {send_control_frame(receiver.control_fd.get(),file_meta_frame);}
-    wait_for_meta_ready(receivers,meta.transfer_id);
+    begin_receiver_transfer(receivers,meta.transfer_id,meta.file_size,meta.total_blocks,
+                            meta.section_block_count,meta.sha256);
     send_control_frame(central_fd,srcast::encode_central_resume({meta.transfer_id,resume_section,
                        section_count,meta.file_size,std::array<std::uint8_t,srcast::kSha256Size>{}}));
 //之后只接收resume_section及后面的DATA
@@ -1148,14 +1301,15 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
         }
 
 //proxy先本地分发已缓存section，再向中心ACK
-        const bool section_delivered=distribute_section(udp_fd,multicast_destination,receivers,
+        const auto section_result=distribute_section(udp_fd,multicast_destination,receivers,
             output.get(),temporary_path,meta.file_size,meta.transfer_id,meta.total_blocks,meta.sha256,
             end.section_id,pace_us,max_repair_rounds,meta.section_block_count);
-        if(!section_delivered)
+        const bool final_section=end.section_id+1U==section_count;
+        if(section_result==DeliveryResult::Failed||
+           (section_result==DeliveryResult::Sha256Mismatch&&!final_section))
         fail_after_meta("receiver repair failed for central section",
                         std::array<std::uint8_t,srcast::kSha256Size>{});
 
-        const bool final_section=end.section_id+1U==section_count;
         if(!final_section)
         {
             const auto completed_section=end.section_id+1U;
@@ -1171,6 +1325,9 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             next_section_id=completed_section;
             continue;
         }
+
+        if(section_result==DeliveryResult::Sha256Mismatch)
+        finish_failed_transfer(receivers,meta.transfer_id);
 
         if(received_count!=meta.total_blocks)
         fail_after_meta("central transfer missing final blocks",
@@ -1201,22 +1358,49 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
         {
             system_error("open central cache for TCP backfill");
         }
-        backfill_isolated_receivers(receivers,backfill_input.get(),final_path,meta.file_size,
-                                    meta.transfer_id,meta.total_blocks,actual_digest);
-        send_central_status(central_fd,meta.transfer_id,srcast::CentralStatusCode::Cached,
-                            meta.file_size,actual_digest);
-        if(all_receivers_completed(receivers))
-        std::cout<<"file completed by all receivers: "<<final_path<<'\n';
-        else
+        auto delivery_result=section_result;
+        if(delivery_result==DeliveryResult::Success)
         {
-            notify_failed_receivers(receivers,meta.transfer_id);
+            backfill_isolated_receivers(receivers,backfill_input.get(),final_path,meta.file_size,
+                                        meta.transfer_id,meta.total_blocks,actual_digest);
+            if(receiver_reported_sha_mismatch(receivers))
+            {
+                delivery_result=DeliveryResult::Sha256Mismatch;
+                finish_failed_transfer(receivers,meta.transfer_id);
+            }else if(!all_receivers_completed(receivers))
+            {
+                delivery_result=DeliveryResult::Failed;
+                finish_failed_transfer(receivers,meta.transfer_id);
+            }
+        }
+
+        std::unordered_set<std::uint64_t>used_transfer_ids{meta.transfer_id};
+        for(int retry=0;delivery_result==DeliveryResult::Sha256Mismatch&&
+                        retry<kMaxTransferRetries;retry++)
+        {
+            const auto retry_transfer_id=create_transfer_id(used_transfer_ids);
+            used_transfer_ids.insert(retry_transfer_id);
+            delivery_result=send_file_attempt(udp_fd,multicast_destination,receivers,
+                backfill_input.get(),final_path,meta.file_size,retry_transfer_id,meta.total_blocks,
+                actual_digest,pace_us,max_repair_rounds,meta.section_block_count);
+        }
+        if(delivery_result!=DeliveryResult::Success)
+        {
             const auto completed_count=static_cast<std::size_t>(std::count_if
                 (receivers.begin(),receivers.end(),[](const ReceiverConnection &receiver)
                 {return receiver.completed;}));
             std::cout<<"file finished PARTIAL completed="<<completed_count<<'/'<<receivers.size()
-                     <<" after max repair rounds\n";
+                     <<" after transfer retries\n";
+            abandon_incomplete_receivers(receivers);
         }
+
+        send_central_status(central_fd,meta.transfer_id,srcast::CentralStatusCode::Cached,
+                            meta.file_size,actual_digest);
+        if(delivery_result==DeliveryResult::Success&&section_result==DeliveryResult::Success&&
+           used_transfer_ids.size()==1U)
         wait_for_receivers_ready(receivers,meta.transfer_id);
+        if(delivery_result==DeliveryResult::Success)
+        std::cout<<"file completed by all receivers: "<<final_path<<'\n';
         std::cout<<"central transfer cached path="<<final_path<<" duplicates="<<duplicate_count
                  <<" rejected="<<rejected_count<<'\n';
         return CachedCentralFile{final_path,meta.transfer_id,meta.file_size,
@@ -1278,17 +1462,6 @@ void send_file(int udp_fd,const sockaddr_in &multicast_destination,
     std::vector<ReceiverConnection>&receivers,const std::string &file_path,int pace_us,
     int max_repair_rounds,std::uint32_t section_block_limit)
 {
-//新文件开始前清理上一文件的接收端状态，但保留 TCP 连接。
-    for(auto &receiver:receivers)
-    {
-        receiver.meta_ready=false;
-        receiver.completed=false;
-        receiver.status_received=false;
-        receiver.complete_received=false;
-        receiver.ready_for_next_transfer=false;
-        receiver.status.reset();
-    }
-
     struct stat status{};
     if(::stat(file_path.c_str(),&status)!=0)
     {
@@ -1308,63 +1481,33 @@ void send_file(int udp_fd,const sockaddr_in &multicast_destination,
 
     const auto total_blocks=static_cast<std::uint32_t>(total_blocks64);
     const auto digest=srcast::sha256_file(file_path);
-    const auto transfer_id=create_transfer_id();
     FileDescriptor input(::open(file_path.c_str(),O_RDONLY|O_CLOEXEC));
     if(input.get()<0)
     {
         system_error("open source file "+file_path);
     }
 
-    for(auto &receiver:receivers)
+    std::unordered_set<std::uint64_t>used_transfer_ids;
+    DeliveryResult result=DeliveryResult::Failed;
+    for(int attempt=0;attempt<=kMaxTransferRetries;attempt++)
     {
-        receiver.meta_ready=false;
-        receiver.completed=false;
-        receiver.status_received=false;
-        receiver.complete_received=false;
-        receiver.ready_for_next_transfer=false;
-        receiver.isolated=false;
-        receiver.backfill_blocks.clear();
-        receiver.status.reset();
+        const auto transfer_id=create_transfer_id(used_transfer_ids);
+        used_transfer_ids.insert(transfer_id);
+        result=send_file_attempt(udp_fd,multicast_destination,receivers,input.get(),file_path,
+            file_size,transfer_id,total_blocks,digest,pace_us,max_repair_rounds,section_block_limit);
+        if(result!=DeliveryResult::Sha256Mismatch)break;
     }
 
-    srcast::FileMetaMessage file_meta;
-    file_meta.transfer_id=transfer_id;
-    file_meta.section_id=kSectionId;
-    file_meta.file_size=file_size;
-    file_meta.block_size=srcast::kPayloadSize;
-    file_meta.total_blocks=total_blocks;
-    file_meta.section_block_count=section_block_limit;
-    file_meta.sha256=digest;
-    const auto file_meta_frame=srcast::encode_file_meta(file_meta);
-//FILE_META走TCP，逐个接收端发
-    for(auto &receiver:receivers)send_control_frame(receiver.control_fd.get(),file_meta_frame);
-
-//receiver文件准备好后发UDP DATA
-    wait_for_meta_ready(receivers,transfer_id);
-    const auto section_count=srcast::section_count_for_blocks(total_blocks,section_block_limit);
-    for(std::uint32_t section_id=0;section_id<section_count&&!all_receivers_completed(receivers);
-                                   section_id++)
-    {
-        const bool section_delivered=distribute_section(udp_fd,multicast_destination,receivers,
-            input.get(),file_path,file_size,transfer_id,total_blocks,digest,section_id,pace_us,
-            max_repair_rounds,section_block_limit);
-        if(!section_delivered)break;
-    }
-
-    backfill_isolated_receivers(receivers,input.get(),file_path,file_size,
-                                transfer_id,total_blocks,digest);
-    if(all_receivers_completed(receivers))std::cout<<"file completed by all receivers:"<<file_path<<'\n';
+    if(result==DeliveryResult::Success)std::cout<<"file completed by all receivers:"<<file_path<<'\n';
     else
     {
-        notify_failed_receivers(receivers,transfer_id);
         const auto completed_count=static_cast<std::size_t>(std::count_if
             (receivers.begin(),receivers.end(),
             [](const ReceiverConnection& receiver){return receiver.completed;}));
         std::cout<<"file finished PARTIAL completed="<<completed_count<<'/'<<receivers.size()
                  <<" after max repair rounds\n";
+        abandon_incomplete_receivers(receivers);
     }
-
-    wait_for_receivers_ready(receivers,transfer_id);
 }
 }
 

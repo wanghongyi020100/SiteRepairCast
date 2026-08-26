@@ -239,6 +239,7 @@ struct TransferState
     std::optional<std::uint32_t>last_end_round;
     std::optional<std::uint32_t>last_reported_round;
     bool awaiting_complete_ack{false};
+    bool final_sha_failed{false};
     std::unordered_set<std::uint32_t>intentionally_dropped_blocks;
 };
 //正式文件旁边放 .state，重启时和 .part 一起校验
@@ -421,6 +422,7 @@ bool initialize_transfer(TransferState &state,const srcast::MetaPacket &meta,
     state.last_end_round.reset();
     state.last_reported_round.reset();
     state.awaiting_complete_ack=false;
+    state.final_sha_failed=false;
     state.intentionally_dropped_blocks.clear();
     const bool loaded_state=load_receiver_state(state,meta);
     const int fd=::open(state.temporary_path.c_str(),O_CREAT|(loaded_state?0:O_TRUNC)|O_RDWR|O_CLOEXEC,
@@ -477,6 +479,7 @@ bool finalize_transfer(TransferState &state,std::array<std::uint8_t,srcast::kSha
     std::cout<<"actual_sha256="<<srcast::hex_digest(actual_digest)<<'\n';
     if(actual_digest!=state.meta.sha256)
     {
+        state.final_sha_failed=true;
         std::cerr<<"final SHA-256 mismatch; temporary file retained at "<<state.temporary_path<<'\n';
         return false;
     }
@@ -583,7 +586,7 @@ void begin_drain_for_round(TransferState &state,std::uint32_t section_id,std::ui
     std::uint32_t total_blocks,int drain_timer_fd,bool &draining,std::uint32_t &draining_round,
     SteadyClock::time_point& hard_deadline)
 {
-    if(state.awaiting_complete_ack||total_blocks!=state.meta.total_blocks)
+    if(state.awaiting_complete_ack||state.final_sha_failed||total_blocks!=state.meta.total_blocks)
     {
         state.rejected_count++;
         return;
@@ -723,7 +726,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 //修复轮开始提示，数据走UDP
         const auto message=srcast::decode_repair_begin(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||
-            transfer->awaiting_complete_ack)return;
+            transfer->awaiting_complete_ack||transfer->final_sha_failed)return;
         try
         {
             static_cast<void>(srcast::section_block_count(transfer->meta.total_blocks,message.section_id,
@@ -741,7 +744,8 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 //慢节点被隔离后，proxy会走TCP backfill
         const auto message=srcast::decode_backfill_begin(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||
-            transfer->meta.total_blocks!=message.total_blocks||transfer->awaiting_complete_ack)return;
+            transfer->meta.total_blocks!=message.total_blocks||transfer->awaiting_complete_ack||
+            transfer->final_sha_failed)return;
         std::cout<<"TCP backfill begins\n";
         return;
     }
@@ -751,7 +755,8 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 //backfill和UDP DATA一样校验offset size crc
         const auto message=srcast::decode_backfill_data(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||
-            transfer->awaiting_complete_ack||message.block_id>=transfer->meta.total_blocks)return;
+            transfer->awaiting_complete_ack||transfer->final_sha_failed||
+            message.block_id>=transfer->meta.total_blocks)return;
 
        const auto expected_offset=static_cast<std::uint64_t>(message.block_id)*transfer->meta.block_size;
         const auto expected_size=static_cast<std::uint16_t>(std::min<std::uint64_t>(
@@ -786,7 +791,8 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         const auto message=srcast::decode_backfill_end(frame);
         if(!transfer||transfer->meta.common.transfer_id!=message.transfer_id||
            transfer->meta.file_size!=message.file_size||transfer->meta.total_blocks!=message.total_blocks
-           ||transfer->meta.sha256!=message.sha256||transfer->awaiting_complete_ack)return;
+           ||transfer->meta.sha256!=message.sha256||transfer->awaiting_complete_ack||
+           transfer->final_sha_failed)return;
 
         std::array<std::uint8_t,srcast::kSha256Size>actual_digest{};
         if(!finalize_transfer(*transfer,actual_digest))
@@ -1026,7 +1032,7 @@ int main(int argc,char**argv) try
                     const auto common=srcast::read_common(preview);
                     if(common.type==srcast::PacketType::Meta)continue;//元数据TCP，UDP META 忽略
                     if(!transfer||common.transfer_id!=transfer->meta.common.transfer_id||
-                        transfer->awaiting_complete_ack)continue;
+                        transfer->awaiting_complete_ack||transfer->final_sha_failed)continue;
                     if(common.type==srcast::PacketType::Data)
                     {
                         const auto data=srcast::decode_data(packet_buffer.data(),

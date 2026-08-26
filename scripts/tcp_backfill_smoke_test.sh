@@ -25,7 +25,7 @@ cmake --build "$BUILD_DIR" -j"$(nproc)"
 dd if=/dev/urandom of="$WORK_DIR/input.bin" bs=1024 count=256 status=none
 mkdir -p "$WORK_DIR/cache" "$WORK_DIR/receiver-1" "$WORK_DIR/receiver-2"
 
-SRCAST_SLOW_MISSING_THRESHOLD=8 "$BUILD_DIR/site_proxy_sender" \
+SRCAST_BACKFILL_ROUNDS=0 "$BUILD_DIR/site_proxy_sender" \
     239.255.42.99 5000 127.0.0.1 \
     6000 2 100 0 3 \
     --central-listen 7000 "$WORK_DIR/cache" \
