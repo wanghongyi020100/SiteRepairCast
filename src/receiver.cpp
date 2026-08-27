@@ -581,6 +581,11 @@ void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
         std::cout<<"missing bitmap sent; waiting for repair\n";
         return;
     }
+    if(::fdatasync(state.output.get())!=0)
+    {
+        system_error("fdatasync completed section");
+    }
+    save_receiver_state(state);
 
     std::array<std::uint8_t,srcast::kSha256Size>actual_digest{};
     if(!finalize_transfer(state,actual_digest))
@@ -970,7 +975,7 @@ int main(int argc,char**argv) try
         system_error("setsockopt UDP SO_REUSEADDR");
     }
 
-    int receive_buffer=4*1024*1024;
+    int receive_buffer=16*1024*1024;
     static_cast<void>(::setsockopt(udp_fd.get(),SOL_SOCKET,SO_RCVBUF,
                       &receive_buffer,sizeof(receive_buffer)));
     sockaddr_in local{};
@@ -1164,11 +1169,11 @@ int main(int argc,char**argv) try
                         write_all_at(state.output.get(),data.payload,data.payload_size,data.offset);
                         state.received[data.block_id]=1;
                         state.received_count++;
-                        if(::fsync(state.output.get())!=0)
-                        {
-                            system_error("fsync received block");
-                        }
-                        save_receiver_state(state);
+                        // if(::fsync(state.output.get())!=0)
+                        // {
+                        //     system_error("fsync received block");
+                        // }
+                        // save_receiver_state(state);
                         if(draining)arm_drain_timer(drain_timer_fd.get(),hard_deadline);
                         if(state.received_count%1000U==0U||state.received_count==state.meta.total_blocks)
                         {
