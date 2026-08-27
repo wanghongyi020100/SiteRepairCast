@@ -42,3 +42,10 @@ tempCodeRunnerFile.*
 *.swp
 .DS_Store
 Thumbs.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# temporary source dump
+site_all_code.txt
