@@ -30,6 +30,7 @@
 #include<sstream>
 #include<stdexcept>
 #include<string>
+#include<thread>
 #include<unordered_set>
 #include<vector>
 
@@ -38,6 +39,7 @@ namespace
 using SteadyClock=std::chrono::steady_clock;
 constexpr auto kDrainQuietPeriod=std::chrono::milliseconds(200);//等待UDP数据安静的时间
 constexpr auto kDrainHardTimeout=std::chrono::seconds(1);//等待缺块统计的最长时间
+constexpr auto kReconnectDelay=std::chrono::milliseconds(500);//控制连接重试间隔
 constexpr std::size_t kMaxUdpPacketsPerBatch=256;//单轮最多处理的UDP包数量
 constexpr auto kUdpBatchTimeBudget=std::chrono::milliseconds(2);//单轮处理UDP的最长时间
 
@@ -144,11 +146,20 @@ void disarm_timer(int timer_fd)
 void add_epoll_interest(int epoll_fd,int fd)
 {
     epoll_event event{};
-    event.events=EPOLLIN;
+    event.events=EPOLLIN|EPOLLRDHUP;
     event.data.fd=fd;
     if(::epoll_ctl(epoll_fd,EPOLL_CTL_ADD,fd,&event)!=0)
     {
         system_error("epoll_ctl EPOLL_CTL_ADD");
+    }
+}
+
+void remove_epoll_interest(int epoll_fd,int fd)
+{
+    if(fd<0)return;
+    if(::epoll_ctl(epoll_fd,EPOLL_CTL_DEL,fd,nullptr)!=0&&errno!=ENOENT)
+    {
+        system_error("epoll_ctl EPOLL_CTL_DEL");
     }
 }
 
@@ -242,6 +253,40 @@ struct TransferState
     bool final_sha_failed{false};
     std::unordered_set<std::uint32_t>intentionally_dropped_blocks;
 };
+
+srcast::RegisterMessage make_registration(std::uint64_t receiver_id,std::uint16_t udp_port,
+                                          const std::optional<TransferState>&transfer)
+{
+    srcast::RegisterMessage registration;
+    registration.receiver_id=receiver_id;
+    registration.udp_port=udp_port;
+    if(transfer)
+    {
+        registration.current_transfer_id=transfer->meta.common.transfer_id;
+        registration.state=transfer->awaiting_complete_ack?srcast::ReceiverState::Completed:
+                           srcast::ReceiverState::Receiving;
+    }
+    return registration;
+}
+
+FileDescriptor connect_and_register(const std::string &proxy_ip,int control_port,
+    std::uint64_t receiver_id,std::uint16_t udp_port,const std::optional<TransferState>&transfer)
+{
+    for(;;)
+    {
+        try
+        {
+            auto control_fd=connect_control(proxy_ip,control_port);
+            send_control_frame(control_fd.get(),srcast::encode_register
+                              (make_registration(receiver_id,udp_port,transfer)));
+            return control_fd;
+        }catch(const std::exception&error)
+        {
+            std::cerr<<"proxy control reconnect failed: "<<error.what()<<"; retrying\n";
+            std::this_thread::sleep_for(kReconnectDelay);
+        }
+    }
+}
 //正式文件旁边放 .state，重启时和 .part 一起校验
 std::string received_state_path(const std::string &output_path){return output_path+".state";}
 
@@ -555,16 +600,16 @@ void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
         return;
     }
 
-    send_section_status(control_fd,receiver_id,state,section_id,round_id,
-                        srcast::SectionStatusCode::Complete,0,{});
     srcast::ReceiverCompleteMessage complete;
     complete.receiver_id=receiver_id;
     complete.transfer_id=state.meta.common.transfer_id;
     complete.file_size=state.meta.file_size;
     complete.sha256=actual_digest;
-    send_control_frame(control_fd,srcast::encode_receiver_complete(complete));
     state.last_reported_round=round_id;
     state.awaiting_complete_ack=true;
+    send_section_status(control_fd,receiver_id,state,section_id,round_id,
+                        srcast::SectionStatusCode::Complete,0,{});
+    send_control_frame(control_fd,srcast::encode_receiver_complete(complete));
     std::cout<<"completion confirmation sent; waiting for COMPLETE_ACK\n";
 }
 
@@ -664,8 +709,20 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         {
             if(transfer->meta.common.transfer_id==message.transfer_id)
             {
-             send_control_frame(control_fd,srcast::encode_meta_ready({receiver_id,message.transfer_id}));
-             return;
+                if(transfer->awaiting_complete_ack)
+                {
+                    srcast::ReceiverCompleteMessage complete;
+                    complete.receiver_id=receiver_id;
+                    complete.transfer_id=message.transfer_id;
+                    complete.file_size=transfer->meta.file_size;
+                    complete.sha256=transfer->meta.sha256;
+                    send_control_frame(control_fd,srcast::encode_receiver_complete(complete));
+                }else
+                {
+                    send_control_frame(control_fd,srcast::encode_meta_ready
+                                      ({receiver_id,message.transfer_id}));
+                }
+                return;
             }
             throw std::runtime_error("FILE_META received while another ""transfer is active");
         }
@@ -808,8 +865,8 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         complete.transfer_id=transfer->meta.common.transfer_id;
         complete.file_size=transfer->meta.file_size;
         complete.sha256=actual_digest;
-        send_control_frame(control_fd,srcast::encode_receiver_complete(complete));
         transfer->awaiting_complete_ack=true;
+        send_control_frame(control_fd,srcast::encode_receiver_complete(complete));
         std::cout<<"TCP backfill completed; waiting for COMPLETE_ACK\n";
         return;
     }
@@ -933,11 +990,6 @@ int main(int argc,char**argv) try
         system_error("setsockopt IP_ADD_MEMBERSHIP");
     }
 
-    auto control_fd=connect_control(proxy_ip,control_port);
-    send_control_frame(control_fd.get(),srcast::encode_register
-                     ({receiver_id,static_cast<std::uint16_t>(udp_port)}));
-    std::cout<<"receiver_id="<<receiver_id<<" listening on "<<multicast_ip<<':'<<udp_port
-             <<" via interface "<<interface_ip<<" control="<<proxy_ip<<':'<<control_port<<'\n';
     FileDescriptor drain_timer_fd(::timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK));
     if(drain_timer_fd.get()<0)
     {
@@ -950,10 +1002,14 @@ int main(int argc,char**argv) try
         system_error("epoll_create1");
     }
 
+    std::optional<TransferState>transfer;
+    auto control_fd=connect_and_register(proxy_ip,control_port,receiver_id,
+                                         static_cast<std::uint16_t>(udp_port),transfer);
     add_epoll_interest(epoll_fd.get(),udp_fd.get());
     add_epoll_interest(epoll_fd.get(),drain_timer_fd.get());
     add_epoll_interest(epoll_fd.get(),control_fd.get());
-    std::optional<TransferState>transfer;
+    std::cout<<"receiver_id="<<receiver_id<<" listening on "<<multicast_ip<<':'<<udp_port
+             <<" via interface "<<interface_ip<<" control="<<proxy_ip<<':'<<control_port<<'\n';
     std::array<std::uint8_t,srcast::kMaxPacketSize>packet_buffer{};
     ControlStreamReader control_reader;
     const auto initial_drop_blocks=parse_initial_drop_blocks();
@@ -968,6 +1024,27 @@ int main(int argc,char**argv) try
     bool stop_requested=false;
     std::uint32_t draining_round=0;
     SteadyClock::time_point hard_deadline{};
+    auto reconnect_proxy=[&]
+    {
+        remove_epoll_interest(epoll_fd.get(),control_fd.get());
+        control_fd.reset(-1);
+        disarm_timer(drain_timer_fd.get());
+        static_cast<void>(consume_timer_expiration(drain_timer_fd.get()));
+        draining=false;
+        if(transfer&&!transfer->awaiting_complete_ack)
+        {
+            transfer->active_section_id.reset();
+            transfer->last_end_round.reset();
+            transfer->last_reported_round.reset();
+        }
+        control_reader=ControlStreamReader{};
+        control_fd=connect_and_register(proxy_ip,control_port,receiver_id,
+                                        static_cast<std::uint16_t>(udp_port),transfer);
+        add_epoll_interest(epoll_fd.get(),control_fd.get());
+        std::cout<<"proxy control reconnected; REGISTER sent state="
+                 <<(transfer?(transfer->awaiting_complete_ack?"COMPLETED":"RECEIVING"):"IDLE")
+                 <<'\n';
+    };
     std::vector<epoll_event>ready_events(3);
     while(!stop_requested)
     {
@@ -982,11 +1059,19 @@ int main(int argc,char**argv) try
         bool udp_ready=false;
         bool timer_ready=false;
         bool control_ready=false;
+        bool control_disconnected=false;
         for(int index=0;index<event_count;index++)
         {
             const auto& event=ready_events[static_cast<std::size_t>(index)];
             const int ready_fd=event.data.fd;
-            if((event.events&EPOLLERR)!=0U)
+            if(ready_fd==control_fd.get()&&
+              (event.events&(EPOLLERR|EPOLLHUP|EPOLLRDHUP))!=0U)
+            {
+                control_disconnected=true;
+                if((event.events&EPOLLIN)!=0U)control_ready=true;
+                continue;
+            }
+            if((event.events&(EPOLLERR|EPOLLHUP))!=0U)
             {
                 throw std::runtime_error("epoll descriptor error");
             }
@@ -1006,6 +1091,13 @@ int main(int argc,char**argv) try
             {
                 throw std::runtime_error("unknown descriptor returned by epoll");
             }
+        }
+
+        if(control_disconnected&&!control_ready)
+        {
+            std::cerr<<"proxy control disconnected; reconnecting\n";
+            reconnect_proxy();
+            continue;
         }
 
         if(udp_ready)
@@ -1109,22 +1201,38 @@ int main(int argc,char**argv) try
             {
                 draining=false;
 //quiet period到了，当前section round可以报状态
-                finish_drain_and_report(control_fd.get(),receiver_id,*transfer,
-                draining_round);
+                try
+                {
+                    finish_drain_and_report(control_fd.get(),receiver_id,*transfer,
+                                            draining_round);
+                }catch(const std::exception&error)
+                {
+                    std::cerr<<"proxy control send failed: "<<error.what()<<"; reconnecting\n";
+                    reconnect_proxy();
+                    continue;
+                }
             }
         }
 
         if(control_ready)
         {
-            const auto frames=control_reader.read_frames(control_fd.get());
-            for(const auto& frame:frames)
+            try
             {
-                handle_control_message(frame,control_fd.get(),receiver_id,output_directory,transfer,
-                             drain_timer_fd.get(),draining,draining_round,hard_deadline,stop_requested);
+                const auto frames=control_reader.read_frames(control_fd.get());
+                for(const auto& frame:frames)
+                {
+                    handle_control_message(frame,control_fd.get(),receiver_id,output_directory,transfer,
+                                 drain_timer_fd.get(),draining,draining_round,hard_deadline,stop_requested);
+                }
+                control_disconnected=control_disconnected||control_reader.peer_closed();
+            }catch(const std::exception&error)
+            {
+                std::cerr<<"proxy control failed: "<<error.what()<<"; reconnecting\n";
+                control_disconnected=true;
             }
-            if(control_reader.peer_closed()&&!stop_requested)
+            if(control_disconnected&&!stop_requested)
             {
-                throw std::runtime_error("proxy control connection closed");
+                reconnect_proxy();
             }
         }
     }

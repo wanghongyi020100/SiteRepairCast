@@ -337,6 +337,14 @@ namespace srcast
         Failed=3,//Section 处理失败
     };
 
+    //接收端注册时携带的最小恢复状态
+    enum class ReceiverState:std::uint16_t
+    {
+        Idle=1,
+        Receiving=2,
+        Completed=3,
+    };
+
     //整体传输结果
     enum class TransferResultCode:std::uint16_t
     {
@@ -355,7 +363,9 @@ namespace srcast
     struct RegisterMessage
     {
         std::uint64_t receiver_id{};
+        std::uint64_t current_transfer_id{};
         std::uint16_t udp_port{};
+        ReceiverState state{ReceiverState::Idle};
     };
 
     //proxy->receiver：正式任务元数据
@@ -539,17 +549,18 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_register(const RegisterMessage &message)
     {
-        PacketWriter writer(20);
+        PacketWriter writer(28);
         write_control_header(writer,ControlType::Register);
         writer.u64(message.receiver_id);
+        writer.u64(message.current_transfer_id);
         writer.u16(message.udp_port);
-        writer.u16(0);
+        writer.u16(static_cast<std::uint16_t>(message.state));
         return writer.data();
     }
 
     inline RegisterMessage decode_register(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=20)
+        if(frame.size()!=28)
         {
             throw std::runtime_error("invalid REGISTER size");
         }
@@ -560,8 +571,15 @@ namespace srcast
         }
         RegisterMessage message;
         message.receiver_id=reader.u64();
+        message.current_transfer_id=reader.u64();
         message.udp_port=reader.u16();
-        static_cast<void>(reader.u16());
+        const auto raw_state=reader.u16();
+        if(raw_state<static_cast<std::uint16_t>(ReceiverState::Idle)||
+           raw_state>static_cast<std::uint16_t>(ReceiverState::Completed))
+        {
+            throw std::runtime_error("invalid receiver state");
+        }
+        message.state=static_cast<ReceiverState>(raw_state);
         return message;
     }
 

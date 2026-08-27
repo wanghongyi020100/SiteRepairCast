@@ -50,6 +50,7 @@ constexpr std::size_t kMulticastRepairThreshold=2;//至少两个目标缺块时�
 constexpr std::size_t kBackfillThreadCount=4;//TCP补传线程池的最大线程数
 constexpr int kMaxTransferRetries=2;//最终SHA失败后的整文件重试次数
 std::mutex output_mutex;
+int receiver_listener_fd=-1;
 
 enum class DeliveryResult
 {
@@ -222,8 +223,12 @@ struct ReceiverConnection
     bool completed{false};
     bool ready_for_next_transfer{false};
     bool isolated{false};
+    bool abandoned{false};
+    srcast::ReceiverState recovery_state{srcast::ReceiverState::Idle};
+    std::uint64_t recovery_transfer_id{};
     std::vector<std::uint32_t>backfill_blocks;
     std::optional<srcast::SectionStatusMessage>status;
+    std::optional<srcast::FileMetaMessage>active_meta;
 };
 
 void reset_transfer_state(std::vector<ReceiverConnection>&receivers)
@@ -236,6 +241,7 @@ void reset_transfer_state(std::vector<ReceiverConnection>&receivers)
         receiver.completed=false;
         receiver.ready_for_next_transfer=false;
         receiver.isolated=false;
+        receiver.abandoned=false;
         receiver.backfill_blocks.clear();
         receiver.status.reset();
     }
@@ -249,10 +255,37 @@ bool receiver_reported_sha_mismatch(const std::vector<ReceiverConnection>&receiv
     });
 }
 
-void remove_abandoned_receivers(std::vector<ReceiverConnection>&receivers)
+bool send_receiver_frame(ReceiverConnection&receiver,const std::vector<std::uint8_t>&frame,
+                         const std::string&operation)
 {
-    receivers.erase(std::remove_if(receivers.begin(),receivers.end(),
-        [](const ReceiverConnection& receiver){return receiver.control_fd.get()<0;}),receivers.end());
+    if(receiver.control_fd.get()<0)return false;
+    try
+    {
+        send_control_frame(receiver.control_fd.get(),frame);
+        return true;
+    }catch(const std::exception&error)
+    {
+        std::cerr<<"receiver control connection failed during "<<operation
+                 <<" receiver_id="<<receiver.receiver_id<<": "<<error.what()<<'\n';
+        receiver.control_fd.reset(-1);
+        return false;
+    }
+}
+
+std::optional<std::vector<std::uint8_t>>receive_receiver_frame(ReceiverConnection&receiver,
+                                                               const std::string&operation)
+{
+    if(receiver.control_fd.get()<0)return std::nullopt;
+    try
+    {
+        return receive_control_frame(receiver.control_fd.get());
+    }catch(const std::exception&error)
+    {
+        std::cerr<<"receiver control connection failed during "<<operation
+                 <<" receiver_id="<<receiver.receiver_id<<": "<<error.what()<<'\n';
+        receiver.control_fd.reset(-1);
+        return std::nullopt;
+    }
 }
 
 void abandon_incomplete_receivers(std::vector<ReceiverConnection>&receivers)
@@ -261,9 +294,9 @@ void abandon_incomplete_receivers(std::vector<ReceiverConnection>&receivers)
     {
         if(receiver.completed)continue;
         std::cerr<<"receiver transfer failed; abandoning receiver_id="<<receiver.receiver_id<<'\n';
+        receiver.abandoned=true;
         receiver.control_fd.reset(-1);
     }
-    remove_abandoned_receivers(receivers);
 }
 
 void usage(const char *program)
@@ -376,62 +409,195 @@ void set_receive_timeout(int fd,std::chrono::seconds timeout)
     }
 }
 
-//等齐固定接收端，坏注册丢掉，继续等合法连接
+struct AcceptedReceiver
+{
+    srcast::RegisterMessage registration;
+    FileDescriptor control_fd;
+    sockaddr_in peer{};
+};
+
+AcceptedReceiver accept_receiver_registration(int listener_fd)
+{
+    sockaddr_in peer{};
+    socklen_t peer_size=sizeof(peer);
+    int accepted=-1;
+    for(;;)
+    {
+        accepted=::accept4(listener_fd,reinterpret_cast<sockaddr*>(&peer),&peer_size,SOCK_CLOEXEC);
+        if(accepted>=0)break;
+        if(errno==EINTR)continue;
+        system_error("accept receiver");
+    }
+
+    FileDescriptor control_fd(accepted);
+    set_receive_timeout(control_fd.get(),std::chrono::seconds(2));
+    const auto registration=srcast::decode_register(receive_control_frame(control_fd.get()));
+    set_receive_timeout(control_fd.get(),std::chrono::seconds(0));
+    if(registration.receiver_id==0)
+    {
+        throw std::runtime_error("receiver_id must not be zero");
+    }else if(registration.udp_port==0)
+    {
+        throw std::runtime_error("receiver UDP port must not be zero");
+    }else if(registration.state==srcast::ReceiverState::Idle&&
+             registration.current_transfer_id!=0)
+    {
+        throw std::runtime_error("IDLE receiver has a current transfer");
+    }else if(registration.state!=srcast::ReceiverState::Idle&&
+             registration.current_transfer_id==0)
+    {
+        throw std::runtime_error("active receiver has no current transfer");
+    }
+    return {registration,std::move(control_fd),peer};
+}
+
+void install_receiver_connection(ReceiverConnection&receiver,AcceptedReceiver accepted,bool reconnect)
+{
+    const bool was_completed=receiver.completed;
+    const bool was_abandoned=receiver.abandoned;
+    receiver.control_fd=std::move(accepted.control_fd);//新连接接管前关闭旧fd
+    receiver.udp_destination=accepted.peer;
+    receiver.udp_destination.sin_port=htons(accepted.registration.udp_port);
+    receiver.recovery_state=accepted.registration.state;
+    receiver.recovery_transfer_id=accepted.registration.current_transfer_id;
+
+    char address[INET_ADDRSTRLEN]{};
+    if(::inet_ntop(AF_INET,&accepted.peer.sin_addr,address,sizeof(address))==nullptr)
+    std::strcpy(address,"?");
+    std::cout<<(reconnect?"reconnected":"registered")<<" receiver_id="<<receiver.receiver_id
+             <<" address="<<address<<':'<<accepted.registration.udp_port<<" state=";
+    if(receiver.recovery_state==srcast::ReceiverState::Idle)std::cout<<"IDLE";
+    else if(receiver.recovery_state==srcast::ReceiverState::Receiving)std::cout<<"RECEIVING";
+    else std::cout<<"COMPLETED";
+    std::cout<<'\n';
+
+    if(!receiver.active_meta)return;
+    const auto &meta=*receiver.active_meta;
+    if(receiver.recovery_state==srcast::ReceiverState::Completed&&
+       receiver.recovery_transfer_id==meta.transfer_id)
+    {
+        receiver.abandoned=false;
+        receiver.meta_ready=true;
+        receiver.status_received=true;
+        receiver.complete_received=true;
+        receiver.completed=true;
+        send_receiver_frame(receiver,srcast::encode_complete_ack
+                           ({receiver.receiver_id,meta.transfer_id}),"recovered COMPLETE_ACK");
+        std::cout<<"recovered completed receiver_id="<<receiver.receiver_id<<'\n';
+        return;
+    }
+
+    if(receiver.recovery_state==srcast::ReceiverState::Idle&&was_completed)
+    {
+        receiver.ready_for_next_transfer=true;
+        return;
+    }
+
+    if(was_abandoned)
+    {
+        if(receiver.recovery_state==srcast::ReceiverState::Idle)
+        receiver.ready_for_next_transfer=true;
+        else send_receiver_frame(receiver,srcast::encode_transfer_result
+                                ({meta.transfer_id,srcast::TransferResultCode::Failed}),
+                                "abandoned transfer result");
+        return;
+    }
+
+    if(receiver.recovery_state==srcast::ReceiverState::Completed)
+    {
+        send_receiver_frame(receiver,srcast::encode_complete_ack
+                           ({receiver.receiver_id,receiver.recovery_transfer_id}),
+                            "stale COMPLETE_ACK");
+    }else if(receiver.recovery_state==srcast::ReceiverState::Receiving&&
+             receiver.recovery_transfer_id!=meta.transfer_id)
+    {
+        send_receiver_frame(receiver,srcast::encode_transfer_result
+                           ({receiver.recovery_transfer_id,srcast::TransferResultCode::Failed}),
+                            "stale transfer result");
+    }
+
+    receiver.meta_ready=false;
+    receiver.status_received=false;
+    receiver.complete_received=false;
+    receiver.completed=false;
+    receiver.ready_for_next_transfer=false;
+    receiver.isolated=false;
+    receiver.status.reset();
+    receiver.recovery_state=srcast::ReceiverState::Receiving;
+    receiver.recovery_transfer_id=meta.transfer_id;
+    send_receiver_frame(receiver,srcast::encode_file_meta(meta),"reconnected FILE_META");
+}
+
+//等齐固定接收端，坏注册丢掉，重复id只替换旧连接
 //注册帧 2s，防止半包TCP连接占住启动流程
 std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expected_receivers)
 {
     std::vector<ReceiverConnection>receivers;
     receivers.reserve(expected_receivers);
-    std::unordered_set<std::uint64_t>receiver_ids;
     std::cout<<"waiting for "<<expected_receivers<<" receiver control connections\n"<<std::flush;
     while(receivers.size()<expected_receivers)
     {
-        sockaddr_in peer{};
-        socklen_t peer_size=sizeof(peer);
-        const int accepted=::accept4(listener_fd,reinterpret_cast<sockaddr*>(&peer),&peer_size,
-                                     SOCK_CLOEXEC);
-        if(accepted<0)
-        {
-            if(errno==EINTR)continue;
-            system_error("accept receiver");
-        }
-
         try
         {
-            FileDescriptor control_fd(accepted);
-            set_receive_timeout(control_fd.get(),std::chrono::seconds(2));
-            const auto frame=receive_control_frame(control_fd.get());
-            const auto registration=srcast::decode_register(frame);
-            set_receive_timeout(control_fd.get(),std::chrono::seconds(0));
-            if(registration.receiver_id==0)
+            auto accepted=accept_receiver_registration(listener_fd);
+            const auto found=std::find_if(receivers.begin(),receivers.end(),[&](const auto&receiver)
             {
-                throw std::runtime_error("receiver_id must not be zero");
-            }else if(registration.udp_port==0)
+                return receiver.receiver_id==accepted.registration.receiver_id;
+            });
+            if(found!=receivers.end())install_receiver_connection(*found,std::move(accepted),true);
+            else
             {
-                throw std::runtime_error("receiver UDP port must not be zero");
-            }else if(!receiver_ids.insert(registration.receiver_id).second)
-            {
-                throw std::runtime_error("duplicate receiver_id");
+                ReceiverConnection receiver;
+                receiver.receiver_id=accepted.registration.receiver_id;
+                install_receiver_connection(receiver,std::move(accepted),false);
+                receivers.push_back(std::move(receiver));
             }
-
-            ReceiverConnection receiver;
-            receiver.receiver_id=registration.receiver_id;
-            receiver.control_fd=std::move(control_fd);
-            receiver.udp_destination=peer;
-            receiver.udp_destination.sin_port=htons(registration.udp_port);
-            char address[INET_ADDRSTRLEN]{};
-            if(::inet_ntop(AF_INET,&peer.sin_addr,address,sizeof(address))==nullptr)
-            std::strcpy(address,"?");
-
-            std::cout<<"registered receiver_id="<<receiver.receiver_id<<" address="<<address<<':'
-                     <<registration.udp_port<<'\n';
-            receivers.push_back(std::move(receiver));
         }catch(const std::exception& error)
         {
             std::cerr<<"rejected receiver registration: "<<error.what()<<'\n';
         }
     }
     return receivers;
+}
+
+void accept_receiver_reconnect(std::vector<ReceiverConnection>&receivers)
+{
+    try
+    {
+        auto accepted=accept_receiver_registration(receiver_listener_fd);
+        const auto found=std::find_if(receivers.begin(),receivers.end(),[&](const auto&receiver)
+        {
+            return receiver.receiver_id==accepted.registration.receiver_id;
+        });
+        if(found==receivers.end())
+        {
+            std::cerr<<"rejected receiver registration: receiver_id is not a fixed member\n";
+            return;
+        }
+        install_receiver_connection(*found,std::move(accepted),true);
+    }catch(const std::exception&error)
+    {
+        std::cerr<<"rejected receiver registration: "<<error.what()<<'\n';
+    }
+}
+
+void accept_pending_receiver_reconnects(std::vector<ReceiverConnection>&receivers)
+{
+    if(receiver_listener_fd<0)return;
+    for(;;)
+    {
+        pollfd event{};
+        event.fd=receiver_listener_fd;
+        event.events=POLLIN;
+        const auto ready=::poll(&event,1,0);
+        if(ready<0)
+        {
+            if(errno==EINTR)continue;
+            system_error("poll receiver listener");
+        }
+        if(ready==0||(event.revents&POLLIN)==0)return;
+        accept_receiver_reconnect(receivers);
+    }
 }
 
 //缺块位图
@@ -475,7 +641,7 @@ bool round_responses_complete(const std::vector<ReceiverConnection>&receivers,bo
 {
     for(const auto &receiver:receivers)
     {
-        if(receiver.completed||receiver.isolated)continue;
+        if(receiver.completed||receiver.isolated||receiver.abandoned)continue;
         if(!receiver.status_received)return false;
         if(final_section&&receiver.status&&receiver.status->status==srcast::SectionStatusCode::Complete
          &&!receiver.complete_received)return false;
@@ -533,8 +699,10 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
 
         receiver.complete_received=true;
         receiver.completed=true;
-        send_control_frame(receiver.control_fd.get(),srcast::encode_complete_ack
-                          ({receiver.receiver_id,transfer_id}));
+        receiver.recovery_state=srcast::ReceiverState::Completed;
+        receiver.recovery_transfer_id=transfer_id;
+        send_receiver_frame(receiver,srcast::encode_complete_ack
+                           ({receiver.receiver_id,transfer_id}),"COMPLETE_ACK");
         std::cout<<"completion acknowledged receiver_id="<<receiver.receiver_id<<'\n';
         return;
     }
@@ -543,7 +711,7 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
 }
 
 template<typename Predicate>//临时建epoll
-std::vector<std::size_t>wait_for_receiver_events(const std::vector<ReceiverConnection>&receivers,
+std::vector<std::size_t>wait_for_receiver_events(std::vector<ReceiverConnection>&receivers,
      Predicate should_watch,int timeout_ms,const std::string &operation)
 {
     FileDescriptor epoll_fd(::epoll_create1(EPOLL_CLOEXEC));
@@ -553,15 +721,30 @@ std::vector<std::size_t>wait_for_receiver_events(const std::vector<ReceiverConne
     }
 
     std::size_t watched_count=0;
+    std::vector<int>watched_fds(receivers.size(),-1);
     for(std::size_t index=0;index<receivers.size();index++)
     {
-        if(!should_watch(receivers[index]))continue;
+        if(!should_watch(receivers[index])||receivers[index].control_fd.get()<0)continue;
         epoll_event event{};
-        event.events=EPOLLIN;
+        event.events=EPOLLIN|EPOLLRDHUP;
         event.data.u64=static_cast<std::uint64_t>(index);
         if(::epoll_ctl(epoll_fd.get(),EPOLL_CTL_ADD,receivers[index].control_fd.get(),&event)!=0)
         {
             system_error("epoll_ctl add "+operation);
+        }
+        watched_fds[index]=receivers[index].control_fd.get();
+        watched_count++;
+    }
+
+    constexpr auto listener_index=std::numeric_limits<std::uint64_t>::max();
+    if(receiver_listener_fd>=0)
+    {
+        epoll_event event{};
+        event.events=EPOLLIN;
+        event.data.u64=listener_index;
+        if(::epoll_ctl(epoll_fd.get(),EPOLL_CTL_ADD,receiver_listener_fd,&event)!=0)
+        {
+            system_error("epoll_ctl add receiver listener "+operation);
         }
         watched_count++;
     }
@@ -580,16 +763,30 @@ std::vector<std::size_t>wait_for_receiver_events(const std::vector<ReceiverConne
 
     std::vector<std::size_t>indexes;
     indexes.reserve(static_cast<std::size_t>(ready));
+    bool listener_ready=false;
     for(int event_index=0;event_index<ready;event_index++)
     {
         const auto &event=events[static_cast<std::size_t>(event_index)];
-        if((event.events&(EPOLLERR|EPOLLHUP))!=0U)
+        if(event.data.u64==listener_index)
         {
-            throw std::runtime_error("receiver control connection failed during "+operation);
+            listener_ready=(event.events&EPOLLIN)!=0U;
+            continue;
         }
-        if((event.events&EPOLLIN)==0U)continue;
-        indexes.push_back(static_cast<std::size_t>(event.data.u64));
+        const auto index=static_cast<std::size_t>(event.data.u64);
+        if((event.events&EPOLLIN)!=0U)
+        {
+            indexes.push_back(index);
+            continue;
+        }
+        if((event.events&(EPOLLERR|EPOLLHUP|EPOLLRDHUP))!=0U&&
+           index<receivers.size()&&receivers[index].control_fd.get()==watched_fds[index])
+        {
+            std::cerr<<"receiver control disconnected during "<<operation
+                     <<" receiver_id="<<receivers[index].receiver_id<<'\n';
+            receivers[index].control_fd.reset(-1);
+        }
     }
+    if(listener_ready)accept_receiver_reconnect(receivers);
     return indexes;
 }
 
@@ -612,22 +809,24 @@ void collect_round_reports(std::vector<ReceiverConnection>&receivers,std::uint64
         const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
         const auto timeout_ms=static_cast<int>(std::max<std::int64_t>(1,remaining.count()));
         const auto ready_indexes=wait_for_receiver_events(receivers,
-            [](const ReceiverConnection &receiver){return !receiver.completed&&!receiver.isolated;},
+            [](const ReceiverConnection &receiver)
+            {return !receiver.completed&&!receiver.isolated&&!receiver.abandoned;},
             timeout_ms,"receiver reports");
-        if(ready_indexes.empty())break;
+        if(ready_indexes.empty())continue;
 
         for(const auto receiver_index:ready_indexes)
         {
             auto &receiver=receivers[receiver_index];
-            const auto frame=receive_control_frame(receiver.control_fd.get());
-            handle_control_frame(receiver,frame,transfer_id,section_id,
+            const auto frame=receive_receiver_frame(receiver,"receiver reports");
+            if(!frame)continue;
+            handle_control_frame(receiver,*frame,transfer_id,section_id,
                                  round_id,file_size,section_blocks,digest);
         }
     }
 
     for(const auto &receiver:receivers)
     {
-        if(!receiver.completed&&!receiver.isolated&&!receiver.status_received)
+        if(!receiver.completed&&!receiver.isolated&&!receiver.abandoned&&!receiver.status_received)
         {
             std::cout<<"section="<<section_id<<" round="<<round_id
                      <<" receiver_id="<<receiver.receiver_id<<" status=NO_REPORT\n";
@@ -644,7 +843,7 @@ void isolate_slow_receivers(std::vector<ReceiverConnection>&receivers,std::uint3
     const auto section_blocks=srcast::section_block_count(total_blocks,section_id,section_block_limit);
     for(auto &receiver:receivers)
     {
-        if(receiver.completed||receiver.isolated||!receiver.status||
+        if(receiver.completed||receiver.isolated||receiver.abandoned||!receiver.status||
            receiver.status->status!=srcast::SectionStatusCode::Missing||
            round_id<backfill_after_rounds)continue;
 
@@ -674,7 +873,7 @@ std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
     for(std::size_t receiver_index=0;receiver_index<receivers.size();receiver_index++)
     {
         const auto& receiver=receivers[receiver_index];
-        if(receiver.completed||receiver.isolated||!receiver.status||
+        if(receiver.completed||receiver.isolated||receiver.abandoned||!receiver.status||
            receiver.status->status!=srcast::SectionStatusCode::Missing)continue;
 
         for(std::uint32_t local_block=0;local_block<section_blocks;local_block++)
@@ -702,8 +901,8 @@ void send_end_round(int udp_fd,const sockaddr_in &multicast_destination,
     const auto section_end=srcast::encode_section_end({transfer_id,section_id,round_id,total_blocks});
     for(auto &receiver:receivers)
     {
-        if(!receiver.completed&&!receiver.isolated)
-        send_control_frame(receiver.control_fd.get(),section_end);
+        if(!receiver.completed&&!receiver.isolated&&!receiver.abandoned)
+        send_receiver_frame(receiver,section_end,"SECTION_END");
     }
 }
 
@@ -717,8 +916,8 @@ void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
     const auto repair_begin=srcast::encode_repair_begin({transfer_id,section_id,round_id});
     for(auto &receiver:receivers)
     {
-        if(!receiver.completed&&!receiver.isolated)
-        send_control_frame(receiver.control_fd.get(),repair_begin);
+        if(!receiver.completed&&!receiver.isolated&&!receiver.abandoned)
+        send_receiver_frame(receiver,repair_begin,"REPAIR_BEGIN");
     }
 
     const auto missing_by_block=aggregate_missing_blocks(receivers,total_blocks,
@@ -825,7 +1024,7 @@ DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destin
         const bool section_done=std::all_of(receivers.begin(),receivers.end(),
             [](const ReceiverConnection& receiver)
             {
-                return receiver.completed||receiver.isolated||
+                return receiver.completed||receiver.isolated||receiver.abandoned||
                       (receiver.status&&receiver.status->status==srcast::SectionStatusCode::Complete);
             });
         if(section_done)return DeliveryResult::Success;
@@ -843,7 +1042,7 @@ DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destin
     const bool section_delivered=std::all_of(receivers.begin(),receivers.end(),
         [](const ReceiverConnection &receiver)
         {
-            return receiver.completed||receiver.isolated||(receiver.status&&
+            return receiver.completed||receiver.isolated||receiver.abandoned||(receiver.status&&
                    receiver.status->status==srcast::SectionStatusCode::Complete);
         });
     return section_delivered?DeliveryResult::Success:DeliveryResult::Failed;
@@ -852,7 +1051,7 @@ DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destin
 bool all_receivers_completed(const std::vector<ReceiverConnection>&receivers)
 {
     return std::all_of(receivers.begin(),receivers.end(),
-    [](const ReceiverConnection &receiver){return receiver.completed;});
+    [](const ReceiverConnection &receiver){return receiver.completed||receiver.abandoned;});
 }
 
 //文件间屏障，防止下一个FILE_META和上一个收尾串在一起
@@ -864,7 +1063,8 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
     for(;;)
     {
         const bool all_ready=std::all_of(receivers.begin(),receivers.end(),
-            [](const ReceiverConnection& receiver){return receiver.ready_for_next_transfer;});
+            [](const ReceiverConnection& receiver)
+            {return receiver.abandoned||receiver.ready_for_next_transfer;});
         if(all_ready)
         {
             std::cout<<"all receivers are ready for the next transfer\n";
@@ -880,22 +1080,24 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
         const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
         const auto timeout_ms=static_cast<int>(std::max<std::int64_t>(1,remaining.count()));
         const auto ready_indexes=wait_for_receiver_events(receivers,
-            [](const ReceiverConnection& receiver){return !receiver.ready_for_next_transfer;},
+            [](const ReceiverConnection& receiver)
+            {return !receiver.abandoned&&!receiver.ready_for_next_transfer;},
             timeout_ms,"receiver ready acknowledgements");
         if(ready_indexes.empty())continue;
 
         for(const auto receiver_index:ready_indexes)
         {
             auto &receiver=receivers[receiver_index];
-            const auto frame=receive_control_frame(receiver.control_fd.get());
-            if(srcast::peek_control_type(frame)!=srcast::ControlType::ReceiverReady)
+            const auto frame=receive_receiver_frame(receiver,"receiver ready acknowledgements");
+            if(!frame)continue;
+            if(srcast::peek_control_type(*frame)!=srcast::ControlType::ReceiverReady)
             {
                 std::cerr<<"ignore unexpected message while waiting for ready"
                          <<" receiver_id="<<receiver.receiver_id<<'\n';
                 continue;
             }
 
-            const auto message=srcast::decode_receiver_ready(frame);
+            const auto message=srcast::decode_receiver_ready(*frame);
             if(message.receiver_id!=receiver.receiver_id||message.previous_transfer_id!=transfer_id)
             {
                 std::cerr<<"ignore stale RECEIVER_READY receiver_id="<<receiver.receiver_id<<'\n';
@@ -903,6 +1105,9 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
             }
 
             receiver.ready_for_next_transfer=true;
+            receiver.recovery_state=srcast::ReceiverState::Idle;
+            receiver.recovery_transfer_id=0;
+            receiver.active_meta.reset();
             std::cout<<"receiver ready receiver_id="<<receiver.receiver_id<<'\n';
         }
     }
@@ -912,7 +1117,8 @@ void notify_failed_receivers(std::vector<ReceiverConnection>&receivers,std::uint
 {
     const auto frame=srcast::encode_transfer_result({transfer_id,srcast::TransferResultCode::Failed});
     for(auto &receiver:receivers)
-    if(!receiver.completed)send_control_frame(receiver.control_fd.get(),frame);
+    if(!receiver.completed&&!receiver.abandoned)
+    send_receiver_frame(receiver,frame,"TRANSFER_RESULT");
 }
 
 //慢receiver最后TCP补齐，避免拖住UDP主组
@@ -921,11 +1127,12 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
                            const std::array<std::uint8_t,srcast::kSha256Size>&digest)
 {
     std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
-    if(!receiver.isolated||receiver.completed)return;
+    if(!receiver.isolated||receiver.completed||receiver.abandoned)return;
     const auto abandon_receiver=[&](const char*reason)
     {
         std::lock_guard<std::mutex>lock(output_mutex);
         std::cerr<<reason<<"; abandoning receiver_id="<<receiver.receiver_id<<'\n';
+        receiver.abandoned=true;
         receiver.control_fd.reset(-1);
     };
     {
@@ -933,8 +1140,12 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
         std::cout<<"TCP backfill receiver_id="<<receiver.receiver_id
                  <<" blocks="<<receiver.backfill_blocks.size()<<'\n';
     }
-        send_control_frame(receiver.control_fd.get(),
-                           srcast::encode_backfill_begin({transfer_id,total_blocks}));
+        if(!send_receiver_frame(receiver,srcast::encode_backfill_begin({transfer_id,total_blocks}),
+                                "TCP backfill begin"))
+        {
+            abandon_receiver("TCP backfill connection failed");
+            return;
+        }
         for(const auto block_id:receiver.backfill_blocks)
         {
             std::uint64_t offset{};
@@ -947,11 +1158,19 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
             data.payload_size=payload_size;
             data.crc32=srcast::crc32(buffer.data(),payload_size);
             data.payload.assign(buffer.begin(),buffer.begin()+payload_size);
-            send_control_frame(receiver.control_fd.get(),srcast::encode_backfill_data(data));
+            if(!send_receiver_frame(receiver,srcast::encode_backfill_data(data),"TCP backfill data"))
+            {
+                abandon_receiver("TCP backfill connection failed");
+                return;
+            }
         }
 
-        send_control_frame(receiver.control_fd.get(),
-            srcast::encode_backfill_end({transfer_id,file_size,total_blocks,digest}));
+        if(!send_receiver_frame(receiver,srcast::encode_backfill_end
+                               ({transfer_id,file_size,total_blocks,digest}),"TCP backfill end"))
+        {
+            abandon_receiver("TCP backfill connection failed");
+            return;
+        }
         const auto deadline=SteadyClock::now()+kBackfillTimeout;
         for(;;)
         {
@@ -985,11 +1204,16 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
             }
             if((event.revents&POLLIN)==0)continue;
 
-            const auto complete_frame=receive_control_frame(receiver.control_fd.get());
-            const auto type=srcast::peek_control_type(complete_frame);
+            const auto complete_frame=receive_receiver_frame(receiver,"TCP backfill result");
+            if(!complete_frame)
+            {
+                abandon_receiver("TCP backfill connection failed");
+                return;
+            }
+            const auto type=srcast::peek_control_type(*complete_frame);
             if(type==srcast::ControlType::SectionStatus)
             {
-                const auto status=srcast::decode_section_status(complete_frame);
+                const auto status=srcast::decode_section_status(*complete_frame);
                 if(status.receiver_id==receiver.receiver_id&&status.transfer_id==transfer_id&&
                    status.status==srcast::SectionStatusCode::Failed)
                 {
@@ -1013,7 +1237,7 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
                 continue;
             }
 
-            const auto complete=srcast::decode_receiver_complete(complete_frame);
+            const auto complete=srcast::decode_receiver_complete(*complete_frame);
             if(complete.receiver_id!=receiver.receiver_id||complete.transfer_id!=transfer_id||
                complete.file_size!=file_size||complete.sha256!=digest)
             {
@@ -1028,8 +1252,10 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
         receiver.complete_received=true;
         receiver.completed=true;
         receiver.isolated=false;
-        send_control_frame(receiver.control_fd.get(),
-            srcast::encode_complete_ack({receiver.receiver_id,transfer_id}));
+        receiver.recovery_state=srcast::ReceiverState::Completed;
+        receiver.recovery_transfer_id=transfer_id;
+        send_receiver_frame(receiver,srcast::encode_complete_ack
+                           ({receiver.receiver_id,transfer_id}),"TCP backfill COMPLETE_ACK");
     {
         std::lock_guard<std::mutex>lock(output_mutex);
         std::cout<<"TCP backfill completed receiver_id="<<receiver.receiver_id<<'\n';
@@ -1041,7 +1267,8 @@ void backfill_isolated_receivers(std::vector<ReceiverConnection>&receivers,int i
     std::uint32_t total_blocks,const std::array<std::uint8_t,srcast::kSha256Size>&digest)
 {
     std::size_t isolated_count=0;
-    for(const auto &receiver:receivers)if(receiver.isolated&&!receiver.completed)isolated_count++;
+    for(const auto &receiver:receivers)
+    if(receiver.isolated&&!receiver.completed&&!receiver.abandoned)isolated_count++;
     if(isolated_count==0)return;
 
     ThreadPool pool(std::min(kBackfillThreadCount,isolated_count));
@@ -1049,12 +1276,12 @@ void backfill_isolated_receivers(std::vector<ReceiverConnection>&receivers,int i
     tasks.reserve(isolated_count);
     for(auto &receiver:receivers)
     {
-        if(!receiver.isolated||receiver.completed)continue;
+        if(!receiver.isolated||receiver.completed||receiver.abandoned)continue;
         tasks.push_back(pool.add(backfill_one_receiver,std::ref(receiver),input_fd,std::cref(file_path),
             file_size,transfer_id,total_blocks,std::cref(digest)));
     }
     for(auto &task:tasks)task.get();
-    remove_abandoned_receivers(receivers);
+    accept_pending_receiver_reconnects(receivers);
 }
 
 //中心每个section都等这个 ACK，确认proxy已经落盘
@@ -1072,6 +1299,7 @@ void begin_receiver_transfer(std::vector<ReceiverConnection>&receivers,std::uint
     std::uint64_t file_size,std::uint32_t total_blocks,std::uint32_t section_block_limit,
     const std::array<std::uint8_t,srcast::kSha256Size>&digest)
 {
+    accept_pending_receiver_reconnects(receivers);
     reset_transfer_state(receivers);
     srcast::FileMetaMessage file_meta;
     file_meta.transfer_id=transfer_id;
@@ -1082,7 +1310,37 @@ void begin_receiver_transfer(std::vector<ReceiverConnection>&receivers,std::uint
     file_meta.section_block_count=section_block_limit;
     file_meta.sha256=digest;
     const auto file_meta_frame=srcast::encode_file_meta(file_meta);
-    for(auto &receiver:receivers)send_control_frame(receiver.control_fd.get(),file_meta_frame);
+    for(auto &receiver:receivers)
+    {
+        receiver.active_meta=file_meta;
+        if(receiver.recovery_state==srcast::ReceiverState::Completed&&
+           receiver.recovery_transfer_id==transfer_id)
+        {
+            receiver.meta_ready=true;
+            receiver.status_received=true;
+            receiver.complete_received=true;
+            receiver.completed=true;
+            send_receiver_frame(receiver,srcast::encode_complete_ack
+                               ({receiver.receiver_id,transfer_id}),"recovered COMPLETE_ACK");
+            continue;
+        }
+
+        if(receiver.recovery_state==srcast::ReceiverState::Completed)
+        {
+            send_receiver_frame(receiver,srcast::encode_complete_ack
+                               ({receiver.receiver_id,receiver.recovery_transfer_id}),
+                                "previous COMPLETE_ACK");
+        }else if(receiver.recovery_state==srcast::ReceiverState::Receiving&&
+                 receiver.recovery_transfer_id!=transfer_id)
+        {
+            send_receiver_frame(receiver,srcast::encode_transfer_result
+                               ({receiver.recovery_transfer_id,srcast::TransferResultCode::Failed}),
+                                "previous transfer result");
+        }
+        receiver.recovery_state=srcast::ReceiverState::Receiving;
+        receiver.recovery_transfer_id=transfer_id;
+        send_receiver_frame(receiver,file_meta_frame,"FILE_META");
+    }
     wait_for_meta_ready(receivers,transfer_id);
 }
 
@@ -1168,6 +1426,27 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
         const auto actual_digest=srcast::sha256_file(final_path);
         if(actual_digest==meta.sha256)
         {
+            accept_pending_receiver_reconnects(receivers);
+            srcast::FileMetaMessage file_meta;
+            file_meta.transfer_id=meta.transfer_id;
+            file_meta.section_id=kSectionId;
+            file_meta.file_size=meta.file_size;
+            file_meta.block_size=meta.block_size;
+            file_meta.total_blocks=meta.total_blocks;
+            file_meta.section_block_count=meta.section_block_count;
+            file_meta.sha256=meta.sha256;
+            for(auto &receiver:receivers)
+            {
+                receiver.active_meta=file_meta;
+                if(receiver.recovery_state!=srcast::ReceiverState::Completed||
+                   receiver.recovery_transfer_id!=meta.transfer_id)continue;
+                receiver.meta_ready=true;
+                receiver.complete_received=true;
+                receiver.completed=true;
+                send_receiver_frame(receiver,srcast::encode_complete_ack
+                                   ({receiver.receiver_id,meta.transfer_id}),
+                                    "cached transfer COMPLETE_ACK");
+            }
             const auto section_count=srcast::section_count_for_blocks(meta.total_blocks,
                                                                       meta.section_block_count);
             send_control_frame(central_fd,srcast::encode_central_resume({meta.transfer_id,section_count,
@@ -1414,7 +1693,8 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
     for(;;)
     {
         const bool all_ready=std::all_of(receivers.begin(),receivers.end(),
-            [](const ReceiverConnection &receiver){return receiver.meta_ready;});
+            [](const ReceiverConnection &receiver)
+            {return receiver.completed||receiver.abandoned||receiver.meta_ready;});
         if(all_ready)
         {
             std::cout<<"all receivers accepted FILE_META;"<<"starting UDP DATA\n";
@@ -1430,7 +1710,8 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
         const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
         const auto timeout_ms=static_cast<int>(std::max<std::int64_t>(1,remaining.count()));
         const auto ready_indexes=wait_for_receiver_events(receivers,
-            [](const ReceiverConnection &receiver){return !receiver.meta_ready;},
+            [](const ReceiverConnection &receiver)
+            {return !receiver.completed&&!receiver.abandoned&&!receiver.meta_ready;},
             timeout_ms,"META_READY");
         if(ready_indexes.empty())continue;
 
@@ -1438,20 +1719,49 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
         {
             auto &receiver=receivers[receiver_index];
 //receive_control_frame会读4字节+完整消息体
-            const auto frame=receive_control_frame(receiver.control_fd.get());
-            const auto type=srcast::peek_control_type(frame);
+            const auto frame=receive_receiver_frame(receiver,"META_READY");
+            if(!frame)continue;
+            const auto type=srcast::peek_control_type(*frame);
+            if(type==srcast::ControlType::ReceiverReady)
+            {
+                const auto message=srcast::decode_receiver_ready(*frame);
+                if(message.receiver_id==receiver.receiver_id)
+                std::cout<<"ignore previous RECEIVER_READY receiver_id="<<receiver.receiver_id<<'\n';
+                continue;
+            }
+            if(type==srcast::ControlType::ReceiverComplete)
+            {
+                const auto message=srcast::decode_receiver_complete(*frame);
+                if(message.receiver_id==receiver.receiver_id&&message.transfer_id==transfer_id&&
+                   receiver.active_meta&&message.file_size==receiver.active_meta->file_size&&
+                   message.sha256==receiver.active_meta->sha256)
+                {
+                    receiver.meta_ready=true;
+                    receiver.complete_received=true;
+                    receiver.completed=true;
+                    receiver.recovery_state=srcast::ReceiverState::Completed;
+                    receiver.recovery_transfer_id=transfer_id;
+                    send_receiver_frame(receiver,srcast::encode_complete_ack
+                                       ({receiver.receiver_id,transfer_id}),"recovered COMPLETE_ACK");
+                }
+                continue;
+            }
             if(type!=srcast::ControlType::MetaReady)
             {
-                throw std::runtime_error("unexpected control message ""while waiting for META_READY");
+                std::cerr<<"ignore unexpected control message while waiting for META_READY"
+                         <<" receiver_id="<<receiver.receiver_id<<'\n';
+                continue;
             }
 
-            const auto message=srcast::decode_meta_ready(frame);
+            const auto message=srcast::decode_meta_ready(*frame);
             if(message.receiver_id!=receiver.receiver_id||message.transfer_id!=transfer_id)
             {
                 throw std::runtime_error("invalid or stale META_READY");
             }
 
             receiver.meta_ready=true;
+            receiver.recovery_state=srcast::ReceiverState::Receiving;
+            receiver.recovery_transfer_id=transfer_id;
             std::cout<<"META_READY receiver_id="<<receiver.receiver_id<<'\n';
         }
     }
@@ -1571,6 +1881,7 @@ int main(int argc,char**argv) try
 
 //先开控制面，receiver 注册完再接中心。
     auto listener=create_control_listener(control_port);
+    receiver_listener_fd=listener.get();
     std::optional<FileDescriptor>central_listener;
     if(central_mode)
     {
@@ -1631,7 +1942,8 @@ int main(int argc,char**argv) try
     }
 
     const auto session_end=srcast::encode_session_end();
-    for(auto &receiver:receivers)send_control_frame(receiver.control_fd.get(),session_end);
+    accept_pending_receiver_reconnects(receivers);
+    for(auto &receiver:receivers)send_receiver_frame(receiver,session_end,"SESSION_END");
 
     std::cout<<"all files processed serially\n";
     return 0;

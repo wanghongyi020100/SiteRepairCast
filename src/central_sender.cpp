@@ -37,9 +37,10 @@ struct ProxySession
 {
     ProxyEndpoint endpoint;
     FileDescriptor fd;
-    bool failed{false};
     bool stopped{false};
 };
+
+constexpr auto kReconnectDelay=std::chrono::milliseconds(500);
 
 //控制4+body
 FileDescriptor connect_proxy(const std::string &proxy_ip,int central_port)
@@ -287,23 +288,49 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
 void run_proxy_session(ProxySession&session,const std::vector<std::string>&files,
                        int pace_us,std::uint32_t section_blocks)
 {
-    try
+    std::size_t file_index=0;
+    while(file_index<files.size())
     {
-        for(const auto &file:files)
+        if(session.fd.get()<0)
         {
-            if(!send_file(session.fd.get(),file,pace_us,section_blocks))
+            try
+            {
+                session.fd=connect_proxy(session.endpoint.ip,session.endpoint.port);
+                std::cout<<"proxy connected "<<session.endpoint.ip<<':'
+                         <<session.endpoint.port<<'\n';
+            }catch(const std::exception&error)
+            {
+                std::cerr<<"proxy reconnect failed "<<session.endpoint.ip<<':'
+                         <<session.endpoint.port<<": "<<error.what()<<"; retrying\n";
+                std::this_thread::sleep_for(kReconnectDelay);
+                continue;
+            }
+        }
+
+        try
+        {
+            if(!send_file(session.fd.get(),files[file_index],pace_us,section_blocks))
             {
                 session.stopped=true;
                 return;
             }
+            file_index++;
+        }catch(const std::exception&error)
+        {
+            std::cerr<<"proxy transfer interrupted "<<session.endpoint.ip<<':'
+                     <<session.endpoint.port<<": "<<error.what()<<"; reconnecting\n";
+            session.fd.reset(-1);
+            std::this_thread::sleep_for(kReconnectDelay);
         }
+    }
+
+    try
+    {
         send_control_frame(session.fd.get(),srcast::encode_central_session_end());
     }catch(const std::exception&error)
     {
-        session.failed=true;
-        std::cerr<<"proxy transfer failed "<<session.endpoint.ip<<':'
+        std::cerr<<"proxy session end failed "<<session.endpoint.ip<<':'
                  <<session.endpoint.port<<": "<<error.what()<<'\n';
-        session.fd.reset(-1);
     }
 }
 }
@@ -312,22 +339,9 @@ int main(int argc,char**argv)try
 {
     const auto options=parse_options(argc,argv);
     std::vector<ProxySession>sessions;
-    bool connection_failed=false;
     for(const auto &endpoint:options.endpoints)
     {
-        try
-        {
-            sessions.push_back({endpoint,connect_proxy(endpoint.ip,endpoint.port)});
-        }catch(const std::exception&error)
-        {
-            connection_failed=true;
-            std::cerr<<"proxy connection failed "<<endpoint.ip
-                     <<':'<<endpoint.port<<": "<<error.what()<<'\n';
-        }
-    }
-    if(sessions.empty())
-    {
-        throw std::runtime_error("no proxy connection available");
+        sessions.push_back({endpoint});
     }
 
     std::vector<std::thread>workers;
@@ -340,11 +354,10 @@ int main(int argc,char**argv)try
     for(auto &worker:workers)worker.join();
     for(const auto &session:sessions)
     {
-        connection_failed=connection_failed||session.failed;
         if(session.stopped)return 0;
     }
     std::cout<<"central session ended\n";
-    return connection_failed?1:0;
+    return 0;
 }catch(const std::exception &error)
 {
     std::cerr<<"central sender error: "<<error.what()<<'\n';

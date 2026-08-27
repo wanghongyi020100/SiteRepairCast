@@ -179,26 +179,26 @@ wait_for_log "central section cached section=1" \
     "second checkpoint"
 
 kill -9 "$PROXY_PID" 2>/dev/null || true
-kill "$RECEIVER1_PID" "$RECEIVER2_PID" 2>/dev/null || true
 wait "$PROXY_PID" 2>/dev/null || true
-wait "$RECEIVER1_PID" 2>/dev/null || true
-wait "$RECEIVER2_PID" 2>/dev/null || true
-wait "$CENTRAL_PID" 2>/dev/null || true
 
+# Receiver 和 Central 不退出，等待 Proxy 恢复。
 sleep 0.2
 
 PROXY_KILL_RESUME_LOG="$KILL_DIR/proxy-resume.log"
 start_proxy "$PROXY_KILL_RESUME_LOG" "$KILL_DIR/cache"
 PROXY_PID="$STARTED_PID"
-start_receiver 1 "$KILL_DIR/receiver-1" "$KILL_DIR/receiver-1-resume.log"
-RECEIVER1_PID="$STARTED_PID"
-start_receiver 2 "$KILL_DIR/receiver-2" "$KILL_DIR/receiver-2-resume.log"
-RECEIVER2_PID="$STARTED_PID"
-wait_for_log "registered receiver_id=2" "$PROXY_KILL_RESUME_LOG" "resume receivers"
 
-"$BUILD_DIR/central_sender" 127.0.0.1 7000 0 "$KILL_DIR/input.bin" \
-    >"$KILL_DIR/central-resume.log" 2>&1
+# Receiver 自动重新连接并 REGISTER。
+wait_for_log "registered receiver_id=2" \
+    "$PROXY_KILL_RESUME_LOG" \
+    "receivers auto reconnect"
 
+# Central 自动重新连接，根据 checkpoint 继续。
+wait_for_log "central resume transfer_id=.*next_section=2/" \
+    "$KILL_DIR/central-first.log" \
+    "central automatic resume"
+
+wait "$CENTRAL_PID"
 wait "$PROXY_PID"
 wait "$RECEIVER1_PID"
 wait "$RECEIVER2_PID"
@@ -209,11 +209,15 @@ assert_sha \
     "$KILL_DIR/receiver-1" \
     "$KILL_DIR/receiver-2"
 
+grep -q "registered receiver_id=1" "$PROXY_KILL_RESUME_LOG"
+grep -q "registered receiver_id=2" "$PROXY_KILL_RESUME_LOG"
 grep -q "resume_section=2/" "$PROXY_KILL_RESUME_LOG"
+
 grep -q "central resume transfer_id=.*next_section=2/" \
-    "$KILL_DIR/central-resume.log"
-grep -Eq "recovered_blocks=[1-9]" "$KILL_DIR/receiver-1-resume.log"
-grep -Eq "recovered_blocks=[1-9]" "$KILL_DIR/receiver-2-resume.log"
-grep -q "central confirmed cached transfer_id=" "$KILL_DIR/central-resume.log"
+    "$KILL_DIR/central-first.log"
+
+grep -q "central confirmed cached transfer_id=" \
+    "$KILL_DIR/central-first.log"
 
 echo "fault recovery smoke test passed"
+
