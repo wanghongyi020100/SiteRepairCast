@@ -21,7 +21,7 @@ site_proxy_sender
 
 - `central_sender`：计算文件摘要和 Transfer ID，按 Section 向一个或多个代理发送文件，并根据代理 checkpoint 续传。
 - `site_proxy_sender`：接收并缓存中心数据，聚合接收端缺块位图，选择组播、单播或 TCP 补传。
-- `receiver_agent`：使用 `epoll` 同时处理 UDP、TCP 和定时器事件，按 Block 偏移落盘并持久化接收状态。
+- `receiver_agent`：使用 `epoll` 同时处理 UDP、TCP 和定时器事件，按 Block 偏移写入临时文件，并以 Section 为提交粒度持久化数据与接收状态。
 
 通道划分：
 
@@ -86,6 +86,13 @@ pwrite -> fsync 数据 -> 写临时状态 -> rename 状态 -> 对外确认
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake libssl-dev python3
+```
+
+
+吞吐测试前建议提高 Linux UDP 接收缓冲区上限：
+
+```bash
+sudo sysctl -w net.core.rmem_max=33554432
 ```
 
 构建：
@@ -188,6 +195,33 @@ cmake --build build-test --target cleantest
 - 乱序、重复、CRC 损坏和非法控制帧；
 - 一个中心并发连接两个园区代理；
 - 正常、混合丢包和慢接收端三类 benchmark 场景。
+
+### 性能测试
+
+性能测试使用 Release 构建，在 2 核、4 GiB Linux 单机回环环境下进行。
+测试文件大小为 256 MiB，Section 大小为 4096 Blocks，UDP 和中心发送均不额外 sleep 限速。
+1 / 2 / 4 / 8 Receiver 各运行 5 轮，结果取端到端吞吐中位数。
+
+| Receiver 数量 | 端到端吞吐中位数 |
+| ---: | ---: |
+| 1 | 15.293 MiB/s |
+| 2 | 14.416 MiB/s |
+| 4 | 13.283 MiB/s |
+| 8 | 10.791 MiB/s |
+
+20 轮测试全部完成并通过 SHA-256 校验。Receiver 从 1 扩展至 8 时，
+端到端吞吐保持单 Receiver 的 70.6%。
+
+性能排查过程中使用 `top` 和 `nstat` 定位到 UDP 突发发送导致 Receiver
+Socket 接收队列溢出；调整 `SO_RCVBUF` 和系统 `net.core.rmem_max` 后，
+测试期间 `UdpRcvbufErrors` 不再增长，8 Receiver 吞吐由约
+0.49 MiB/s 提升至 10.79 MiB/s。
+
+运行：
+
+```bash
+python3 benchmark/throughput.py
+```
 
 ## 当前边界
 
