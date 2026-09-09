@@ -211,7 +211,7 @@ void save_central_checkpoint(const std::string &checkpoint_path,const srcast::Ce
     }
 }
 
-//一条TCP控制连接对应一个receiver
+//一tcp控制连接对应一个receiver
 struct ReceiverConnection
 {
     std::uint64_t receiver_id{};
@@ -368,7 +368,7 @@ SenderOptions parse_options(int argc,char**argv)
     return options;
 }
 
-//创建TCP控制面监听socket
+//创建tcp控制面监听socket
 FileDescriptor create_control_listener(int control_port)
 {
     FileDescriptor listener(::socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0));
@@ -430,8 +430,10 @@ AcceptedReceiver accept_receiver_registration(int listener_fd)
     }
 
     FileDescriptor control_fd(accepted);
+    //连接后等2s，接收端必须发信息
     set_receive_timeout(control_fd.get(),std::chrono::seconds(2));
     const auto registration=srcast::decode_register(receive_control_frame(control_fd.get()));
+    //tcp恢复阻塞
     set_receive_timeout(control_fd.get(),std::chrono::seconds(0));
     if(registration.receiver_id==0)
     {
@@ -439,19 +441,17 @@ AcceptedReceiver accept_receiver_registration(int listener_fd)
     }else if(registration.udp_port==0)
     {
         throw std::runtime_error("receiver UDP port must not be zero");
-    }else if(registration.state==srcast::ReceiverState::Idle&&
-             registration.current_transfer_id!=0)
+    }else if(registration.state==srcast::ReceiverState::Idle&&registration.current_transfer_id!=0)
     {
         throw std::runtime_error("IDLE receiver has a current transfer");
-    }else if(registration.state!=srcast::ReceiverState::Idle&&
-             registration.current_transfer_id==0)
+    }else if(registration.state!=srcast::ReceiverState::Idle&&registration.current_transfer_id==0)
     {
         throw std::runtime_error("active receiver has no current transfer");
     }
     return {registration,std::move(control_fd),peer};
 }
 
-void install_receiver_connection(ReceiverConnection&receiver,AcceptedReceiver accepted,bool reconnect)
+void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver accepted,bool reconnect)
 {
     const bool was_completed=receiver.completed;
     const bool was_abandoned=receiver.abandoned;
@@ -528,8 +528,8 @@ void install_receiver_connection(ReceiverConnection&receiver,AcceptedReceiver ac
     send_receiver_frame(receiver,srcast::encode_file_meta(meta),"reconnected FILE_META");
 }
 
-//等齐固定接收端，坏注册丢掉，重复id只替换旧连接
-//注册帧 2s，防止半包TCP连接占住启动流程
+//等齐固定接收端，坏注册丢，重复id只替换旧连接
+//注册2s，防止半包tcp连接占住启动流程
 std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expected_receivers)
 {
     std::vector<ReceiverConnection>receivers;
@@ -540,10 +540,11 @@ std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expe
         try
         {
             auto accepted=accept_receiver_registration(listener_fd);
-            const auto found=std::find_if(receivers.begin(),receivers.end(),[&](const auto&receiver)
+            const auto found=std::find_if(receivers.begin(),receivers.end(),[&](const auto &receiver)
             {
                 return receiver.receiver_id==accepted.registration.receiver_id;
             });
+            //出现相同可能是接收端断线重连
             if(found!=receivers.end())install_receiver_connection(*found,std::move(accepted),true);
             else
             {
@@ -552,7 +553,7 @@ std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expe
                 install_receiver_connection(receiver,std::move(accepted),false);
                 receivers.push_back(std::move(receiver));
             }
-        }catch(const std::exception& error)
+        }catch(const std::exception &error)
         {
             std::cerr<<"rejected receiver registration: "<<error.what()<<'\n';
         }
@@ -1823,21 +1824,19 @@ void send_file(int udp_fd,const sockaddr_in &multicast_destination,
 
 int main(int argc,char**argv) try
 {
-    std::cout<<std::unitbuf;
-    std::cerr<<std::unitbuf;
     const auto options=parse_options(argc,argv);
-    const auto &multicast_ip=options.multicast_ip;
-    const auto udp_port=options.udp_port;
-    const auto &interface_ip=options.interface_ip;
-    const auto control_port=options.control_port;
-    const auto receiver_count=options.receiver_count;
-    const auto pace_us=options.pace_us;
-    const auto gap_ms=options.gap_ms;
-    const auto max_repair_rounds=options.max_repair_rounds;
-    const auto section_block_limit=options.section_block_limit;
-    const auto central_mode=options.central_mode;
-    const auto central_port=options.central_port;
-    const auto &cache_directory=options.cache_directory;
+    const auto &multicast_ip=options.multicast_ip;//组播地址
+    const auto udp_port=options.udp_port;//udp端口
+    const auto &interface_ip=options.interface_ip;//本机网卡ip
+    const auto control_port=options.control_port;//tcp端口
+    const auto receiver_count=options.receiver_count;//接收端数量
+    const auto pace_us=options.pace_us;//block发送间隔
+    const auto gap_ms=options.gap_ms;//文件间隔时间
+    const auto max_repair_rounds=options.max_repair_rounds;//最大修复轮数
+    const auto section_block_limit=options.section_block_limit;//一个section的block数量
+    const auto central_mode=options.central_mode;//中心模式？不启用园区内发
+    const auto central_port=options.central_port;//中心端口
+    const auto &cache_directory=options.cache_directory;//要发的文件
 
     FileDescriptor udp_fd(::socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0));
     if(udp_fd.get()<0)
@@ -1845,8 +1844,8 @@ int main(int argc,char**argv) try
         system_error("socket UDP");
     }
 
-    const unsigned char ttl=1;
-    const unsigned char loop=1;
+    const unsigned char ttl=1;//路由器不转发
+    const unsigned char loop=1;//允许回环
     if(::setsockopt(udp_fd.get(),IPPROTO_IP,IP_MULTICAST_TTL,&ttl,sizeof(ttl))!=0)
     {
         system_error("setsockopt IP_MULTICAST_TTL");
@@ -1856,7 +1855,7 @@ int main(int argc,char**argv) try
         system_error("setsockopt IP_MULTICAST_LOOP");
     }
 
-    if(interface_ip!="0.0.0.0")
+    if(interface_ip!="0.0.0.0")//如果指定网卡ip
     {
         in_addr interface_address{};
         if(::inet_pton(AF_INET,interface_ip.c_str(),&interface_address)!=1)
@@ -1879,7 +1878,7 @@ int main(int argc,char**argv) try
         throw std::runtime_error("destination must be an IPv4 multicast address");
     }
 
-//先开控制面，receiver 注册完再接中心。
+    //先开控制面，接收端注册完再接中心。
     auto listener=create_control_listener(control_port);
     receiver_listener_fd=listener.get();
     std::optional<FileDescriptor>central_listener;

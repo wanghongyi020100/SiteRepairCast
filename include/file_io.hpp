@@ -12,19 +12,17 @@
 #include<sys/types.h>
 #include<unistd.h>
 
-//文件按block读取，中心发送端代理补传用同一套边界处理
+//文件按block读取，把文件数据搬到缓存，中心发送端代理补传用同一套边界处理
 inline void read_block(int input_fd,const std::string &file_path,std::uint64_t file_size,
                        std::uint32_t block_id,std::vector<std::uint8_t>&payload,std::uint64_t &offset)
 {
     offset=static_cast<std::uint64_t>(block_id)*srcast::kPayloadSize;
-    const auto wanted=static_cast<std::size_t>(
-        std::min<std::uint64_t>(srcast::kPayloadSize,file_size-offset));
+    const auto wanted=static_cast<std::size_t>(std::min<std::uint64_t>(srcast::kPayloadSize,file_size-offset));
     payload.assign(wanted,0);
     std::size_t received=0;
     while(received<wanted)
     {
-        const auto count=::pread(input_fd,payload.data()+received,wanted-received,
-                                 static_cast<off_t>(offset+received));
+        const auto count=::pread(input_fd,payload.data()+received,wanted-received,static_cast<off_t>(offset+received));
         if(count<0)
         {
             if(errno==EINTR)continue;
@@ -38,19 +36,15 @@ inline void read_block(int input_fd,const std::string &file_path,std::uint64_t f
     }
 }
 
-inline void read_block(int input_fd,const std::string&file_path,std::uint64_t file_size,
-                       std::uint32_t block_id,
-                       std::array<std::uint8_t,srcast::kPayloadSize>&buffer,
-                       std::uint64_t &offset,std::uint16_t &payload_size)
+inline void read_block(int input_fd,const std::string &file_path,std::uint64_t file_size,std::uint32_t block_id,
+                       std::array<std::uint8_t,srcast::kPayloadSize>&buffer,std::uint64_t &offset,std::uint16_t &payload_size)
 {
     offset=static_cast<std::uint64_t>(block_id)*srcast::kPayloadSize;
-    const auto wanted=static_cast<std::size_t>(
-        std::min<std::uint64_t>(srcast::kPayloadSize,file_size-offset));
+    const auto wanted=static_cast<std::size_t>(std::min<std::uint64_t>(srcast::kPayloadSize,file_size-offset));
     std::size_t received=0;
     while(received<wanted)
     {
-        const auto count=::pread(input_fd,buffer.data()+received,wanted-received,
-                                 static_cast<off_t>(offset+received));
+        const auto count=::pread(input_fd,buffer.data()+received,wanted-received,static_cast<off_t>(offset+received));
         if(count<0)
         {
             if(errno==EINTR)continue;
@@ -70,8 +64,7 @@ inline void write_all_at(int fd,const std::uint8_t *data,std::size_t size,std::u
     std::size_t written=0;
     while(written<size)
     {
-        const auto count=::pwrite(fd,data+written,size-written,
-                                  static_cast<off_t>(offset+written));
+        const auto count=::pwrite(fd,data+written,size-written,static_cast<off_t>(offset+written));
         if(count<0)
         {
             if(errno==EINTR)continue;

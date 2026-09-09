@@ -16,10 +16,10 @@ namespace srcast
     constexpr std::uint32_t kMagic=0x53524331U;//UDP数据包魔数
     constexpr std::uint32_t kControlMagic=0x53524343U;//TCP控制帧魔数
     constexpr std::uint16_t kVersion=8;//当前协议版本
-    constexpr std::size_t kPayloadSize=1200;//单个数据块的最大载荷
+    constexpr std::size_t kPayloadSize=1200;//单block的最大载荷
     constexpr std::size_t kSha256Size=32;//SHA-256摘要长度
     constexpr std::uint32_t kSingleSectionId=0;//未分段流程使用的Section编号
-    constexpr std::uint32_t kDefaultSectionBlockCount=64;//默认每个Section的数据块数量
+    constexpr std::uint32_t kDefaultSectionBlockCount=64;//默认每个Section的block数量
 
     constexpr std::size_t kCommonHeaderSize=16;//数据包公共头长度
     constexpr std::size_t kMetaPacketSize=kCommonHeaderSize+8+4+4+4+kSha256Size;//元数据包固定长度
@@ -55,14 +55,14 @@ namespace srcast
             bytes(&value,sizeof(value));
         }
 
-        void bytes(const void*source,std::size_t size)
+        void bytes(const void* source,std::size_t size)
         {
             if(size==0)return;
             const auto *begin=static_cast<const std::uint8_t*>(source);
             data_.insert(data_.end(),begin,begin+size);
         }
 
-        [[nodiscard]] const std::vector<std::uint8_t>&data()const{return data_;}
+        [[nodiscard]]const std::vector<std::uint8_t>&data()const{return data_;}
 
     private:
         std::vector<std::uint8_t>data_;
@@ -71,8 +71,7 @@ namespace srcast
     class PacketReader
     {
     public:
-        PacketReader(const void*data,std::size_t size):
-            data_(static_cast<const std::uint8_t*>(data)),size_(size){}
+        PacketReader(const void* data,std::size_t size):data_(static_cast<const std::uint8_t*>(data)),size_(size){}
 
         std::uint16_t u16()
         {
@@ -101,7 +100,7 @@ namespace srcast
             read(destination,size);
         }
 
-        [[nodiscard]] std::size_t remaining()const{return size_-offset_;}
+        [[nodiscard]]std::size_t remaining()const{return size_-offset_;}
 
     private:
         void read(void* destination,std::size_t size)
@@ -114,20 +113,20 @@ namespace srcast
             offset_+=size;
         }
 
-        const std::uint8_t*data_;
+        const std::uint8_t *data_;
         std::size_t size_;
         std::size_t offset_{0};
     };
 
-    // UDP 数据包类型
+    //UDP数据包类型
     enum class PacketType:std::uint16_t
     {
         Meta=1,//元数据包
         Data=2,//文件数据块
-        End=3,//当前 Section 结束提示
+        End=3,//传文件/补传等阶段的结束
     };
 
-    //UDP 数据层次包头，receiver靠transfer_id 过滤旧包。
+    //UDP数据包头，receiver靠transfer_id过滤旧包
     struct CommonHeader
     {
         PacketType type{};
@@ -489,7 +488,7 @@ namespace srcast
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
-    //proxy->receiver：慢节点独立TCP补传
+    //proxy->receiver：慢节点TCP补传
     struct BackfillBeginMessage
     {
         std::uint64_t transfer_id{};
@@ -922,8 +921,7 @@ namespace srcast
         }
     }
 
-    inline std::vector<std::uint8_t>encode_central_file_meta
-                (const CentralFileMetaMessage &message)
+    inline std::vector<std::uint8_t>encode_central_file_meta(const CentralFileMetaMessage &message)
     {
         PacketWriter writer(68);
         write_control_header(writer,ControlType::CentralFileMeta);

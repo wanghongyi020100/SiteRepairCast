@@ -975,7 +975,7 @@ int main(int argc,char**argv) try
         system_error("setsockopt UDP SO_REUSEADDR");
     }
 
-    int receive_buffer=16*1024*1024;
+    int receive_buffer=32*1024*1024;
     static_cast<void>(::setsockopt(udp_fd.get(),SOL_SOCKET,SO_RCVBUF,
                       &receive_buffer,sizeof(receive_buffer)));
     sockaddr_in local{};

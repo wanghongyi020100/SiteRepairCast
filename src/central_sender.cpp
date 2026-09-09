@@ -40,7 +40,7 @@ struct ProxySession
     bool stopped{false};
 };
 
-constexpr auto kReconnectDelay=std::chrono::milliseconds(500);
+constexpr auto kReconnectDelay=std::chrono::milliseconds(500);//0.5s一次重连
 
 //控制4+body
 FileDescriptor connect_proxy(const std::string &proxy_ip,int central_port)
@@ -72,13 +72,13 @@ std::uint64_t create_transfer_id(const std::array<std::uint8_t,srcast::kSha256Si
     return value;
 }
 
-//测试：确认若干 section 后主动断线
+//测试用，确认若干section后主动断线
 std::uint32_t stop_after_sections_for_test()
 {
-    const char* raw=std::getenv("SRCAST_STOP_AFTER_SECTIONS");
+    const char *raw=std::getenv("SRCAST_STOP_AFTER_SECTIONS");
     if(raw==nullptr||*raw=='\0')return 0;
 
-    char*end=nullptr;
+    char *end=nullptr;
     errno=0;
     const auto value=std::strtoul(raw,&end,10);
     if(raw==end||*end!='\0'||errno==ERANGE||value>std::numeric_limits<std::uint32_t>::max())
@@ -88,7 +88,7 @@ std::uint32_t stop_after_sections_for_test()
     return static_cast<std::uint32_t>(value);
 }
 
-void usage(const char* program)
+void usage(const char *program)
 {
     std::cerr
         <<"Usage: "<<program
@@ -108,7 +108,7 @@ struct CentralOptions
     std::uint32_t section_blocks{};
 };
 
-CentralOptions parse_options(int argc,char**argv)
+CentralOptions parse_options(int argc,char **argv)
 {
     if(argc<5)
     {
@@ -117,37 +117,28 @@ CentralOptions parse_options(int argc,char**argv)
     }
 
     CentralOptions options;
-    const bool multi_mode=std::string(argv[1])=="--proxy"||std::string(argv[1])=="--pace-us";
-    if(multi_mode)
+    for(int index=1;index<argc;index++)
     {
-        for(int index=1;index<argc;index++)
+        const std::string option=argv[index];
+        if(option=="--pace-us")
         {
-            const std::string option=argv[index];
-            if(option=="--pace-us")
+            if(++index>=argc)
             {
-                if(++index>=argc)
-                {
-                    throw std::runtime_error("missing --pace-us value");
-                }
-                options.pace_us=std::stoi(argv[index]);
-                continue;
+                throw std::runtime_error("missing --pace-us value");
             }
-            if(option=="--proxy")
-            {
-                if(index+2>=argc)
-                {
-                    throw std::runtime_error("missing --proxy value");
-                }
-                options.endpoints.push_back({argv[++index],std::stoi(argv[++index])});
-                continue;
-            }
-            options.files.emplace_back(option);
+            options.pace_us=std::stoi(argv[index]);
+            continue;
         }
-    }else
-    {
-        options.endpoints.push_back({argv[1],std::stoi(argv[2])});
-        options.pace_us=std::stoi(argv[3]);
-        for(int index=4;index<argc;index++)options.files.emplace_back(argv[index]);
+        if(option=="--proxy")
+        {
+            if(index+2>=argc)
+            {
+                throw std::runtime_error("missing --proxy value");
+            }
+            options.endpoints.push_back({argv[++index],std::stoi(argv[++index])});
+            continue;
+        }
+        options.files.emplace_back(option);
     }
 
     if(options.endpoints.empty()||options.files.empty()||options.pace_us<0)
@@ -165,7 +156,7 @@ CentralOptions parse_options(int argc,char**argv)
     return options;
 }
 
-//返回false表示测试hook主动断线，外层不再发送SESSION_END
+//true发送这个文件成功
 bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint32_t section_blocks)
 {
     struct stat status{};
@@ -201,16 +192,15 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
     meta.total_blocks=total_blocks;
     meta.section_block_count=section_blocks;
     meta.sha256=digest;
-    std::cout<<"central sending file="<<file_path
-              <<" transfer_id="<<transfer_id
-              <<" size="<<file_size
-              <<" blocks="<<total_blocks<<'\n';
+    std::cout<<"central sending file="<<file_path<<" transfer_id="<<transfer_id
+             <<" size="<<file_size<<" blocks="<<total_blocks<<'\n';
+
     send_control_frame(central_fd,srcast::encode_central_file_meta(meta));
     const auto section_count=srcast::section_count_for_blocks(total_blocks,section_blocks);
-    //proxy 是缓存事实来源，中心按它返回的section继续发
-    const auto resume_frame=receive_control_frame(central_fd);
-    const auto resume=srcast::decode_central_resume(resume_frame);
-    if(resume.transfer_id!=transfer_id||resume.file_size!=file_size||
+    //代理重启：中心按proxy返回的section继续发
+    const auto resume=srcast::decode_central_resume(receive_control_frame(central_fd));
+
+    if(resume.transfer_id!=transfer_id||resume.file_size!=file_size|| 
        resume.total_sections!=section_count||resume.next_section_id>section_count)
     {
         throw std::runtime_error("invalid CENTRAL_RESUME from proxy: "+file_path);
@@ -225,17 +215,15 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
         return true;
     }
 
-    std::cout<<"central resume transfer_id="<<transfer_id<<" next_section="<<resume.next_section_id
-             <<'/'<<section_count<<'\n';
+    std::cout<<"central resume transfer_id="<<transfer_id<<" next_section="<<resume.next_section_id<<'/'<<section_count<<'\n';
     std::vector<std::uint8_t>payload;
     const auto stop_after_sections=stop_after_sections_for_test();
     std::uint32_t confirmed_this_run=0;
-    //每个section发完都等proxy确认，避免中心太快
+    //每个section发完都等proxy确认，同接收端一样
     for(std::uint32_t section_id=resume.next_section_id;section_id<section_count;section_id++)
     {
         const auto first_block=srcast::section_first_block(section_id,section_blocks);
-        const auto section_block_count=srcast::section_block_count(total_blocks,section_id,
-                                               meta.section_block_count);
+        const auto section_block_count=srcast::section_block_count(total_blocks,section_id,meta.section_block_count);
         for(std::uint32_t local_block=0;local_block<section_block_count;local_block++)
         {
             const auto block_id=first_block+local_block;
@@ -256,13 +244,11 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
             }
         }
 
-        send_control_frame(central_fd,srcast::encode_central_file_end
-                          ({transfer_id,section_id,total_blocks}));
+        send_control_frame(central_fd,srcast::encode_central_file_end({transfer_id,section_id,total_blocks}));
         //只有proxy落盘并更新checkpoint后，中心才推进下一段。
         const auto response=receive_control_frame(central_fd);
         const auto result=srcast::decode_central_status(response);
-        if(result.transfer_id!=transfer_id||result.status!=srcast::CentralStatusCode::Cached||
-           result.file_size!=file_size)
+        if(result.transfer_id!=transfer_id||result.status!=srcast::CentralStatusCode::Cached||result.file_size!=file_size)
         {
             throw std::runtime_error("proxy did not confirm cached section: "+file_path);
         }
@@ -274,9 +260,8 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
         confirmed_this_run++;
         if(stop_after_sections!=0&&confirmed_this_run>=stop_after_sections&&section_id+1U<section_count)
         {
-        //模拟中心断线，proxy端checkpoint能接
-            std::cout<<"test hook closing central connection after "
-            <<confirmed_this_run<<" confirmed sections\n";
+            //测试模拟中心断线，proxy端checkpoint能接
+            std::cout<<"test hook closing central connection after "<<confirmed_this_run<<" confirmed sections\n";
             return false;
         }
     }
@@ -285,20 +270,18 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
     return true;
 }
 
-void run_proxy_session(ProxySession&session,const std::vector<std::string>&files,
-                       int pace_us,std::uint32_t section_blocks)
+void run_proxy_session(ProxySession &session,const std::vector<std::string>&files,int pace_us,std::uint32_t section_blocks)
 {
     std::size_t file_index=0;
     while(file_index<files.size())
     {
-        if(session.fd.get()<0)
+        if(session.fd.get()<0)//重连
         {
             try
             {
                 session.fd=connect_proxy(session.endpoint.ip,session.endpoint.port);
-                std::cout<<"proxy connected "<<session.endpoint.ip<<':'
-                         <<session.endpoint.port<<'\n';
-            }catch(const std::exception&error)
+                std::cout<<"proxy connected "<<session.endpoint.ip<<':'<<session.endpoint.port<<'\n';
+            }catch(const std::exception &error)
             {
                 std::cerr<<"proxy reconnect failed "<<session.endpoint.ip<<':'
                          <<session.endpoint.port<<": "<<error.what()<<"; retrying\n";
@@ -309,13 +292,14 @@ void run_proxy_session(ProxySession&session,const std::vector<std::string>&files
 
         try
         {
+            //测试用：中心断线需要手动重启中心，代理会一直尝试重连
             if(!send_file(session.fd.get(),files[file_index],pace_us,section_blocks))
             {
                 session.stopped=true;
                 return;
             }
             file_index++;
-        }catch(const std::exception&error)
+        }catch(const std::exception &error)
         {
             std::cerr<<"proxy transfer interrupted "<<session.endpoint.ip<<':'
                      <<session.endpoint.port<<": "<<error.what()<<"; reconnecting\n";
@@ -327,15 +311,14 @@ void run_proxy_session(ProxySession&session,const std::vector<std::string>&files
     try
     {
         send_control_frame(session.fd.get(),srcast::encode_central_session_end());
-    }catch(const std::exception&error)
+    }catch(const std::exception &error)
     {
-        std::cerr<<"proxy session end failed "<<session.endpoint.ip<<':'
-                 <<session.endpoint.port<<": "<<error.what()<<'\n';
+        std::cerr<<"proxy session end failed "<<session.endpoint.ip<<':'<<session.endpoint.port<<": "<<error.what()<<'\n';
     }
 }
 }
 
-int main(int argc,char**argv)try
+int main(int argc,char **argv)try
 {
     const auto options=parse_options(argc,argv);
     std::vector<ProxySession>sessions;
@@ -345,7 +328,7 @@ int main(int argc,char**argv)try
     }
 
     std::vector<std::thread>workers;
-    workers.reserve(sessions.size());
+    workers.reserve(sessions.size());//注意现在n个代理n个线程
     for(auto &session:sessions)
     {
         workers.emplace_back([&session,&options]{run_proxy_session(session,options.files,

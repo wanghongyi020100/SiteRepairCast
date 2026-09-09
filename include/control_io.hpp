@@ -10,7 +10,8 @@
 #include<stdexcept>
 #include<vector>
 
-inline void write_all(int fd,const std::uint8_t*data,std::size_t size)
+//这里是tcp阻塞
+inline void write_all(int fd,const std::uint8_t *data,std::size_t size)
 {
     std::size_t written=0;
     while(written<size)
@@ -29,7 +30,7 @@ inline void write_all(int fd,const std::uint8_t*data,std::size_t size)
     }
 }
 
-inline void read_all(int fd,std::uint8_t*data,std::size_t size)
+inline void read_all(int fd,std::uint8_t *data,std::size_t size)
 {
     std::size_t received=0;
     while(received<size)
@@ -55,8 +56,7 @@ inline void send_control_frame(int fd,const std::vector<std::uint8_t>&frame)
         throw std::runtime_error("invalid control frame size");
     }
     const auto network_size=htonl(static_cast<std::uint32_t>(frame.size()));
-    write_all(fd,reinterpret_cast<const std::uint8_t*>
-             (&network_size),sizeof(network_size));
+    write_all(fd,reinterpret_cast<const std::uint8_t*>(&network_size),sizeof(network_size));
     write_all(fd,frame.data(),frame.size());
 }
 

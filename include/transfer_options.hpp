@@ -10,8 +10,8 @@
 
 inline std::uint32_t section_blocks_from_env()
 {
-    const char *raw=std::getenv("SRCAST_SECTION_BLOCKS");
-    if(raw==nullptr||*raw=='\0')return srcast::kDefaultSectionBlockCount;
+    const char *raw=std::getenv("SRCAST_SECTION_BLOCKS");//测试用
+    if(raw==nullptr||*raw=='\0')return srcast::kDefaultSectionBlockCount;//实际走这里
     char *end=nullptr;
     errno=0;
     const auto value=std::strtoul(raw,&end,10);
