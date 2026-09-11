@@ -15,7 +15,7 @@ namespace srcast
 {
     constexpr std::uint32_t kMagic=0x53524331U;//UDP数据包魔数
     constexpr std::uint32_t kControlMagic=0x53524343U;//TCP控制帧魔数
-    constexpr std::uint16_t kVersion=8;//当前协议版本
+    constexpr std::uint16_t kVersion=9;//当前协议版本
     constexpr std::size_t kPayloadSize=1200;//单block的最大载荷
     constexpr std::size_t kSha256Size=32;//SHA-256摘要长度
     constexpr std::uint32_t kSingleSectionId=0;//未分段流程使用的Section编号
@@ -361,7 +361,6 @@ namespace srcast
     //receiver->proxy：启动时注册TCP控制连接和UDP接收端口
     struct RegisterMessage
     {
-        std::uint64_t receiver_id{};
         std::uint64_t current_transfer_id{};
         std::uint16_t udp_port{};
         ReceiverState state{ReceiverState::Idle};
@@ -382,14 +381,12 @@ namespace srcast
     //receiver->proxy：临时文件和位图都准备好了
     struct MetaReadyMessage
     {
-        std::uint64_t receiver_id{};
         std::uint64_t transfer_id{};
     };
 
     //receiver->proxy：每轮section drain后的缺块报告
     struct SectionStatusMessage
     {
-        std::uint64_t receiver_id{};
         std::uint64_t transfer_id{};
         std::uint32_t section_id{};
         std::uint32_t round_id{};
@@ -409,7 +406,6 @@ namespace srcast
     //receiver->proxy：文件校验通过后才发
     struct ReceiverCompleteMessage
     {
-        std::uint64_t receiver_id{};
         std::uint64_t transfer_id{};
         std::uint64_t file_size{};
         std::array<std::uint8_t,kSha256Size>sha256{};
@@ -417,7 +413,6 @@ namespace srcast
 
     struct CompleteAckMessage
     {
-        std::uint64_t receiver_id{};
         std::uint64_t transfer_id{};
     };
 
@@ -437,7 +432,6 @@ namespace srcast
 
     struct ReceiverReadyMessage
     {
-        std::uint64_t receiver_id{};
         std::uint64_t previous_transfer_id{};
     };
 
@@ -548,9 +542,8 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_register(const RegisterMessage &message)
     {
-        PacketWriter writer(28);
+        PacketWriter writer(20);
         write_control_header(writer,ControlType::Register);
-        writer.u64(message.receiver_id);
         writer.u64(message.current_transfer_id);
         writer.u16(message.udp_port);
         writer.u16(static_cast<std::uint16_t>(message.state));
@@ -559,7 +552,7 @@ namespace srcast
 
     inline RegisterMessage decode_register(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=28)
+        if(frame.size()!=20)
         {
             throw std::runtime_error("invalid REGISTER size");
         }
@@ -569,7 +562,6 @@ namespace srcast
             throw std::runtime_error("control message is not REGISTER");
         }
         RegisterMessage message;
-        message.receiver_id=reader.u64();
         message.current_transfer_id=reader.u64();
         message.udp_port=reader.u16();
         const auto raw_state=reader.u16();
@@ -637,18 +629,16 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_meta_ready(const MetaReadyMessage &message)
     {
-        //控制头 8+receiver_id 8+transfer_id 8=24
-        PacketWriter writer(24);
+        PacketWriter writer(16);
 
         write_control_header(writer,ControlType::MetaReady);
-        writer.u64(message.receiver_id);
         writer.u64(message.transfer_id);
         return writer.data();
     }
 
     inline MetaReadyMessage decode_meta_ready(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=24)
+        if(frame.size()!=16)
         {
             throw std::runtime_error("invalid META_READY size");
         }
@@ -660,7 +650,6 @@ namespace srcast
         }
 
         MetaReadyMessage message;
-        message.receiver_id=reader.u64();
         message.transfer_id=reader.u64();
         return message;
     }
@@ -673,9 +662,8 @@ namespace srcast
             throw std::runtime_error("missing bitmap is too large");
         }
 
-        PacketWriter writer(44+message.missing_bitmap.size());
+        PacketWriter writer(36+message.missing_bitmap.size());
         write_control_header(writer,ControlType::SectionStatus);
-        writer.u64(message.receiver_id);
         writer.u64(message.transfer_id);
         writer.u32(message.section_id);
         writer.u32(message.round_id);
@@ -689,7 +677,7 @@ namespace srcast
 
     inline SectionStatusMessage decode_section_status(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()<44)
+        if(frame.size()<36)
         {
             throw std::runtime_error("SECTION_STATUS is too short");
         }
@@ -700,7 +688,6 @@ namespace srcast
         }
 
         SectionStatusMessage message;
-        message.receiver_id=reader.u64();
         message.transfer_id=reader.u64();
         message.section_id=reader.u32();
         message.round_id=reader.u32();
@@ -756,9 +743,8 @@ namespace srcast
     inline std::vector<std::uint8_t>encode_receiver_complete(
                 const ReceiverCompleteMessage &message)
     {
-        PacketWriter writer(68);
+        PacketWriter writer(56);
         write_control_header(writer,ControlType::ReceiverComplete);
-        writer.u64(message.receiver_id);
         writer.u64(message.transfer_id);
         writer.u64(message.file_size);
         writer.bytes(message.sha256.data(),message.sha256.size());
@@ -768,7 +754,7 @@ namespace srcast
     inline ReceiverCompleteMessage decode_receiver_complete
                 (const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=64)
+        if(frame.size()!=56)
         {
             throw std::runtime_error("invalid RECEIVER_COMPLETE size");
         }
@@ -778,7 +764,6 @@ namespace srcast
             throw std::runtime_error("control message is not RECEIVER_COMPLETE");
         }
         ReceiverCompleteMessage message;
-        message.receiver_id=reader.u64();
         message.transfer_id=reader.u64();
         message.file_size=reader.u64();
         reader.bytes(message.sha256.data(),message.sha256.size());
@@ -787,16 +772,15 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_complete_ack(const CompleteAckMessage &message)
     {
-        PacketWriter writer(24);
+        PacketWriter writer(16);
         write_control_header(writer,ControlType::CompleteAck);
-        writer.u64(message.receiver_id);
         writer.u64(message.transfer_id);
         return writer.data();
     }
 
     inline CompleteAckMessage decode_complete_ack(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=24)
+        if(frame.size()!=16)
         {
             throw std::runtime_error("invalid COMPLETE_ACK size");
         }
@@ -806,7 +790,6 @@ namespace srcast
             throw std::runtime_error("control message is not COMPLETE_ACK");
         }
         CompleteAckMessage message;
-        message.receiver_id=reader.u64();
         message.transfer_id=reader.u64();
         return message;
     }
@@ -877,16 +860,15 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_receiver_ready(const ReceiverReadyMessage &message)
     {
-        PacketWriter writer(24);
+        PacketWriter writer(16);
         write_control_header(writer,ControlType::ReceiverReady);
-        writer.u64(message.receiver_id);
         writer.u64(message.previous_transfer_id);
         return writer.data();
     }
 
     inline ReceiverReadyMessage decode_receiver_ready(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=24)
+        if(frame.size()!=16)
         {
             throw std::runtime_error("invalid RECEIVER_READY size");
         }
@@ -896,7 +878,6 @@ namespace srcast
             throw std::runtime_error("control message is not RECEIVER_READY");
         }
         ReceiverReadyMessage message;
-        message.receiver_id=reader.u64();
         message.previous_transfer_id=reader.u64();
         return message;
     }

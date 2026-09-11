@@ -130,11 +130,11 @@ mkdir -p proxy-cache received-1 received-2
 ### 2. 启动接收端
 
 ```bash
-./build-debug/receiver_agent 239.255.42.99 5000 received-1 127.0.0.1 6000 1 127.0.0.1
-./build-debug/receiver_agent 239.255.42.99 5000 received-2 127.0.0.1 6000 2 127.0.0.1
+./build-debug/receiver_agent 239.255.42.99 5000 received-1 127.0.0.1 6000 127.0.0.2
+./build-debug/receiver_agent 239.255.42.99 5000 received-2 127.0.0.1 6000 127.0.0.3
 ```
 
-参数依次为组播地址、UDP 端口、输出目录、代理控制面 IP、代理控制端口、接收端 ID、接收网卡地址。接收端 ID 需要和代理期望的接收端数量对应，并且每个接收端保持唯一。
+参数依次为组播地址、UDP 端口、输出目录、代理控制面 IP、代理控制端口、接收网卡地址。接收端不再传入独立 ID，代理使用接收端控制连接来源 IP 和注册的 UDP 端口组成 `ip:port` 标识；同一台机器启动多个接收端时，应为它们配置不同的 loopback 地址。
 
 ### 3. 启动中心
 
@@ -155,7 +155,7 @@ dd if=/dev/urandom of=input.bin bs=1024 count=256 status=none
 
 ## 完整传输流程
 
-1. 先启动代理再启动接收端连接代理并发送 `REGISTER`，代理确认接收端数量和 ID。
+1. 先启动代理再启动接收端连接代理并发送 `REGISTER`，代理按 `ip:port` 标识确认接收端数量。
 2. 启动中心连接代理，计算文件大小、Block 数量、SHA-256 和 Transfer ID。
 3. 中心发送 `CENTRAL_FILE_META`。
 4. 代理检查正式缓存、`.part` 和 checkpoint，返回 `CENTRAL_RESUME`。

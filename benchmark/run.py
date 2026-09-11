@@ -114,9 +114,9 @@ def validate_profile(profile):
             raise ValueError("%s.deterministic_initial_data_drop_percent must be in [0, 100)" %
                              scenario_id)
         if kind.startswith("slow_"):
-            laggers = scenario.get("lagging_receiver_ids", [])
+            laggers = scenario.get("lagging_receiver_indexes", [])
             if len(laggers) < 2 or any(item < 1 or item > receivers for item in laggers):
-                raise ValueError("%s needs at least two valid lagging receiver ids" % scenario_id)
+                raise ValueError("%s needs at least two valid lagging receiver indexes" % scenario_id)
             if scenario.get("lagging_drop_blocks", 0) <= 0:
                 raise ValueError("%s.lagging_drop_blocks must be positive" % scenario_id)
         if kind == "central_resume":
@@ -257,21 +257,25 @@ class BenchmarkRunner:
         self.wait_log(proxy_log, r"waiting for central sender on port", 10, proxy)
         receiver_items = []
         receiver_dirs = []
-        for receiver_id in range(1, receivers + 1):
-            receiver_dir = work / ("receiver-%d" % receiver_id)
+        receiver_endpoints = []
+        for receiver_index in range(1, receivers + 1):
+            receiver_dir = work / ("receiver-%d" % receiver_index)
             receiver_dir.mkdir(exist_ok=True)
             receiver_dirs.append(receiver_dir)
+            receiver_ip = "127.0.0.%d" % (receiver_index + 1)
+            receiver_endpoints.append("%s:%s" % (receiver_ip, udp_port))
             command = [self.build_dir / "receiver_agent", "239.255.42.99", udp_port,
-                       receiver_dir, "127.0.0.1", control_port, receiver_id, "127.0.0.1"]
-            item = processes.spawn("receiver-%d%s" % (receiver_id, suffix), command,
-                                   logs / ("receiver-%d%s.log" % (receiver_id, suffix)),
-                                   self.env(**(receiver_envs or {}).get(receiver_id, {})))
+                       receiver_dir, "127.0.0.1", control_port, receiver_ip]
+            item = processes.spawn("receiver-%d%s" % (receiver_index, suffix), command,
+                                   logs / ("receiver-%d%s.log" % (receiver_index, suffix)),
+                                   self.env(**(receiver_envs or {}).get(receiver_index, {})))
             receiver_items.append(item)
-        self.wait_log(proxy_log, r"registered receiver_id=", 15, proxy, receivers)
+        self.wait_log(proxy_log, r"registered receiver=", 15, proxy, receivers)
         return {
             "proxy": proxy,
             "receivers": receiver_items,
             "receiver_dirs": receiver_dirs,
+            "receiver_endpoints": receiver_endpoints,
             "cache": cache,
             "central_port": central_port,
             "proxy_log": proxy_log,
@@ -324,11 +328,11 @@ class BenchmarkRunner:
     def base_metrics(self, scenario, repeat, logs, input_path, component, started_ns,
                      ended_ns, completion_ms):
         proxy_text = read_text(component["proxy_log"])
-        receiver_texts = [read_text(logs / ("receiver-%d.log" % receiver_id))
-                          for receiver_id in range(1, scenario["receivers"] + 1)]
+        receiver_texts = [read_text(logs / ("receiver-%d.log" % receiver_index))
+                          for receiver_index in range(1, scenario["receivers"] + 1)]
         file_bytes = input_path.stat().st_size
         duration_ms = (ended_ns - started_ns) / 1e6
-        laggers = scenario.get("lagging_receiver_ids", [])
+        laggers = scenario.get("lagging_receiver_indexes", [])
         normal = [value for index, value in enumerate(completion_ms, 1)
                   if index not in laggers and value is not None]
         lagging = [value for index, value in enumerate(completion_ms, 1)
@@ -353,11 +357,10 @@ class BenchmarkRunner:
                 (duration_ms / 1000), 6),
             "repair_multicast_packets": count_values(r"multicast_packets=(\d+)", proxy_text),
             "repair_unicast_packets": count_values(r"unicast_packets=(\d+)", proxy_text),
-            "tcp_backfill_blocks": count_values(r"TCP backfill receiver_id=\d+ blocks=(\d+)",
+            "tcp_backfill_blocks": count_values(r"TCP backfill receiver=[^ ]+ blocks=(\d+)",
                                                  proxy_text),
-            "isolated_receiver_ids": [int(value) for value in
-                                      re.findall(r"receiver_id=(\d+) isolated for TCP backfill",
-                                                 proxy_text)],
+            "isolated_receivers": re.findall(r"receiver=([^ ]+) isolated for TCP backfill",
+                                             proxy_text),
             "intentional_drops": sum(count_values(r"intentional_drops=(\d+)", text)
                                      for text in receiver_texts),
             "duplicates": sum(count_values(r"duplicates=(\d+)", text)
@@ -375,8 +378,8 @@ class BenchmarkRunner:
 
     def receiver_envs(self, receivers, block_ids):
         value = ",".join(str(item) for item in block_ids)
-        return {receiver_id: {"SRCAST_DROP_INITIAL_BLOCKS": value}
-                for receiver_id in receivers if value}
+        return {receiver_index: {"SRCAST_DROP_INITIAL_BLOCKS": value}
+                for receiver_index in receivers if value}
 
     def run_transfer(self, scenario, repeat, work, logs, processes, input_path):
         receivers = scenario["receivers"]
@@ -391,7 +394,7 @@ class BenchmarkRunner:
         else:
             dropped = list(range(min(scenario["lagging_drop_blocks"],
                                      self.profile["section_blocks"])))
-            receiver_envs = self.receiver_envs(scenario["lagging_receiver_ids"], dropped)
+            receiver_envs = self.receiver_envs(scenario["lagging_receiver_indexes"], dropped)
             if scenario["kind"] == "slow_isolated":
                 proxy_env["SRCAST_BACKFILL_ROUNDS"] = scenario["backfill_rounds"]
         component = self.start_components(processes, work, logs, receivers,
@@ -408,10 +411,12 @@ class BenchmarkRunner:
             "deterministic_initial_data_drop_percent")
         metrics["effective_initial_data_drop_percent"] = round(
             len(dropped) / total_blocks * 100, 6)
-        if scenario["kind"] == "slow_shared" and metrics["isolated_receiver_ids"]:
+        if scenario["kind"] == "slow_shared" and metrics["isolated_receivers"]:
             raise RuntimeError("shared-repair case unexpectedly isolated receivers")
         if scenario["kind"] == "slow_isolated":
-            if sorted(metrics["isolated_receiver_ids"]) != sorted(scenario["lagging_receiver_ids"]):
+            expected = [component["receiver_endpoints"][item - 1]
+                        for item in scenario["lagging_receiver_indexes"]]
+            if sorted(metrics["isolated_receivers"]) != sorted(expected):
                 raise RuntimeError("isolation case did not isolate the configured lagging receivers")
             if metrics["tcp_backfill_blocks"] == 0:
                 raise RuntimeError("isolation case did not execute TCP backfill")
@@ -495,8 +500,8 @@ class BenchmarkRunner:
             raise RuntimeError("crash recovery resumed at %d, checkpoint says %d" %
                                (resume_section, expected_resume))
         recovered = []
-        for receiver_id in range(1, scenario["receivers"] + 1):
-            text = read_text(logs / ("receiver-%d-resume.log" % receiver_id))
+        for receiver_index in range(1, scenario["receivers"] + 1):
+            text = read_text(logs / ("receiver-%d-resume.log" % receiver_index))
             found = re.search(r"recovered_blocks=(\d+)", text)
             recovered.append(int(found.group(1)) if found else 0)
         retained = min(input_path.stat().st_size,
@@ -813,7 +818,7 @@ def main():
                       "lagging_completion_ms", "lagging_minus_normal_ms", "recovery_ms",
                       "crash_to_recovered_ms",
                       "repair_multicast_packets", "repair_unicast_packets", "tcp_backfill_blocks",
-                      "intentional_drops", "duplicates", "rejected", "isolated_receiver_ids",
+                      "intentional_drops", "duplicates", "rejected", "isolated_receivers",
                       "configured_dropped_blocks_per_receiver",
                       "effective_initial_data_drop_percent", "resume_section", "total_sections",
                       "checkpoint_payload_bytes_retained_protocol_derived",

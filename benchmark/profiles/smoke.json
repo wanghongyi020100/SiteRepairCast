@@ -26,7 +26,7 @@
       "kind": "slow_shared",
       "comparison_group": "lagging-pair-4",
       "receivers": 4,
-      "lagging_receiver_ids": [3, 4],
+      "lagging_receiver_indexes": [3, 4],
       "lagging_drop_blocks": 12
     },
     {
@@ -34,7 +34,7 @@
       "kind": "slow_isolated",
       "comparison_group": "lagging-pair-4",
       "receivers": 4,
-      "lagging_receiver_ids": [3, 4],
+      "lagging_receiver_indexes": [3, 4],
       "lagging_drop_blocks": 12,
       "backfill_rounds": 0
     },

@@ -57,6 +57,23 @@ wait_for_log() {
     return 1
 }
 
+wait_for_registration_count() {
+    local expected="$1"
+    local file="$2"
+    local label="$3"
+    for _ in {1..150}; do
+        local count
+        count="$(grep -c 'registered receiver=' "$file" 2>/dev/null || true)"
+        if ((count >= expected)); then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "timed out waiting for $label" >&2
+    cat "$file" >&2 || true
+    return 1
+}
+
 sum_matches() {
     local pattern="$1"
     local file="$2"
@@ -140,20 +157,21 @@ start_proxy() {
 }
 
 start_receiver() {
-    local receiver_id="$1"
+    local receiver_index="$1"
     local output_dir="$2"
     local log_file="$3"
+    local receiver_ip="127.0.0.$((receiver_index + 1))"
     shift 3
 
     if (($# > 0)); then
         env "$@" "$BUILD_DIR/receiver_agent" \
             "$MCAST_ADDR" "$MCAST_PORT" "$output_dir" \
-            "$IFACE_ADDR" "$CONTROL_PORT" "$receiver_id" "$IFACE_ADDR" \
+            "$IFACE_ADDR" "$CONTROL_PORT" "$receiver_ip" \
             >"$log_file" 2>&1 &
     else
         "$BUILD_DIR/receiver_agent" \
             "$MCAST_ADDR" "$MCAST_PORT" "$output_dir" \
-            "$IFACE_ADDR" "$CONTROL_PORT" "$receiver_id" "$IFACE_ADDR" \
+            "$IFACE_ADDR" "$CONTROL_PORT" "$receiver_ip" \
             >"$log_file" 2>&1 &
     fi
     STARTED_PID="$!"
@@ -184,25 +202,23 @@ run_scenario() {
 
     local receiver_dirs=()
     local receiver_pids=()
-    for receiver_id in $(seq 1 "$receiver_count"); do
-        local receiver_dir="$scenario_dir/receiver-$receiver_id"
-        local receiver_log="$scenario_dir/receiver-$receiver_id.log"
+    for receiver_index in $(seq 1 "$receiver_count"); do
+        local receiver_dir="$scenario_dir/receiver-$receiver_index"
+        local receiver_log="$scenario_dir/receiver-$receiver_index.log"
         mkdir -p "$receiver_dir"
         local receiver_env="${1:-}"
         shift || true
         if [[ -n "$receiver_env" ]]; then
             # shellcheck disable=SC2086
-            start_receiver "$receiver_id" "$receiver_dir" "$receiver_log" $receiver_env
+            start_receiver "$receiver_index" "$receiver_dir" "$receiver_log" $receiver_env
         else
-            start_receiver "$receiver_id" "$receiver_dir" "$receiver_log"
+            start_receiver "$receiver_index" "$receiver_dir" "$receiver_log"
         fi
         receiver_dirs+=("$receiver_dir")
         receiver_pids+=("$STARTED_PID")
     done
 
-    wait_for_log "registered receiver_id=$receiver_count" \
-        "$proxy_log" \
-        "$name receivers"
+    wait_for_registration_count "$receiver_count" "$proxy_log" "$name receivers"
 
     local started_ms
     started_ms="$(date +%s%3N)"
@@ -230,7 +246,7 @@ run_scenario() {
     local backfill_blocks
     backfill_blocks="$(
         sum_line_matches \
-            'TCP backfill receiver_id=' \
+            'TCP backfill receiver=' \
             'blocks=[0-9]+' \
             "$proxy_log"
     )"

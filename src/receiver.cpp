@@ -168,9 +168,9 @@ void usage(const char *program)
     std::cerr
         <<"Usage: "<<program
         <<" <multicast_ip> <udp_port> <output_directory>"
-        <<" <proxy_ip> <control_port> <receiver_id> [interface_ip]\n"
+        <<" <proxy_ip> <control_port> [interface_ip]\n"
         <<"Example: "<<program
-        <<" 239.255.42.99 5000 received 127.0.0.1 6000 1 127.0.0.1\n";
+        <<" 239.255.42.99 5000 received 127.0.0.1 6000 127.0.0.1\n";
 }
 
 struct ReceiverOptions
@@ -180,13 +180,12 @@ struct ReceiverOptions
     std::string output_directory;
     std::string proxy_ip;
     int control_port{};
-    std::uint64_t receiver_id{};
     std::string interface_ip;
 };
 
 ReceiverOptions parse_options(int argc,char**argv)
 {
-    if(argc<7||argc>8)
+    if(argc<6||argc>7)
     {
         usage(argv[0]);
         throw std::runtime_error("invalid receiver arguments");
@@ -198,17 +197,17 @@ ReceiverOptions parse_options(int argc,char**argv)
     options.output_directory=argv[3];
     options.proxy_ip=argv[4];
     options.control_port=std::stoi(argv[5]);
-    options.receiver_id=std::stoull(argv[6]);
-    options.interface_ip=argc==8?argv[7]:"0.0.0.0";
+    options.interface_ip=argc==7?argv[6]:"0.0.0.0";
     if(options.udp_port<1||options.udp_port>65535||
-       options.control_port<1||options.control_port>65535||options.receiver_id==0)
+       options.control_port<1||options.control_port>65535)
     {
         throw std::runtime_error("invalid command-line argument");
     }
     return options;
 }
 
-FileDescriptor connect_control(const std::string &proxy_ip,int control_port)
+FileDescriptor connect_control(const std::string &proxy_ip,int control_port,
+                               const std::string &interface_ip)
 {
     FileDescriptor control_fd(::socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0));
     if(control_fd.get()<0)
@@ -222,6 +221,21 @@ FileDescriptor connect_control(const std::string &proxy_ip,int control_port)
     if(::inet_pton(AF_INET,proxy_ip.c_str(),&proxy.sin_addr)!=1)
     {
         throw std::runtime_error("invalid proxy IPv4 address");
+    }
+
+    if(interface_ip!="0.0.0.0")
+    {
+        sockaddr_in local{};
+        local.sin_family=AF_INET;
+        local.sin_port=0;
+        if(::inet_pton(AF_INET,interface_ip.c_str(),&local.sin_addr)!=1)
+        {
+            throw std::runtime_error("invalid interface IPv4 address");
+        }
+        if(::bind(control_fd.get(),reinterpret_cast<sockaddr*>(&local),sizeof(local))!=0)
+        {
+            system_error("bind TCP control");
+        }
     }
 
     for(;;)
@@ -254,31 +268,29 @@ struct TransferState
     std::unordered_set<std::uint32_t>intentionally_dropped_blocks;
 };
 
-srcast::RegisterMessage make_registration(std::uint64_t receiver_id,std::uint16_t udp_port,
-                                          const std::optional<TransferState>&transfer)
+srcast::RegisterMessage make_registration(std::uint16_t udp_port,const std::optional<TransferState>&transfer)
 {
     srcast::RegisterMessage registration;
-    registration.receiver_id=receiver_id;
     registration.udp_port=udp_port;
     if(transfer)
     {
         registration.current_transfer_id=transfer->meta.common.transfer_id;
-        registration.state=transfer->awaiting_complete_ack?srcast::ReceiverState::Completed:
-                           srcast::ReceiverState::Receiving;
+        registration.state=transfer->awaiting_complete_ack?srcast::ReceiverState::Completed:srcast::ReceiverState::Receiving;
     }
     return registration;
 }
 
 FileDescriptor connect_and_register(const std::string &proxy_ip,int control_port,
-    std::uint64_t receiver_id,std::uint16_t udp_port,const std::optional<TransferState>&transfer)
+    const std::string &interface_ip,std::uint16_t udp_port,
+    const std::optional<TransferState>&transfer)
 {
     for(;;)
     {
         try
         {
-            auto control_fd=connect_control(proxy_ip,control_port);
+            auto control_fd=connect_control(proxy_ip,control_port,interface_ip);
             send_control_frame(control_fd.get(),srcast::encode_register
-                              (make_registration(receiver_id,udp_port,transfer)));
+                              (make_registration(udp_port,transfer)));
             return control_fd;
         }catch(const std::exception&error)
         {
@@ -545,12 +557,11 @@ bool finalize_transfer(TransferState &state,std::array<std::uint8_t,srcast::kSha
 }
 
 //缺块，完成状态都从TCP控制回 proxy
-void send_section_status(int control_fd,std::uint64_t receiver_id,const TransferState& state,
-                        std::uint32_t section_id,std::uint32_t round_id,srcast::SectionStatusCode status,
-                        std::uint32_t missing_count,std::vector<std::uint8_t>missing_bitmap)
+void send_section_status(int control_fd,const TransferState& state,std::uint32_t section_id,
+                         std::uint32_t round_id,srcast::SectionStatusCode status,
+                         std::uint32_t missing_count,std::vector<std::uint8_t>missing_bitmap)
 {
     srcast::SectionStatusMessage message;
-    message.receiver_id=receiver_id;
     message.transfer_id=state.meta.common.transfer_id;
     message.section_id=section_id;
     message.round_id=round_id;
@@ -561,8 +572,7 @@ void send_section_status(int control_fd,std::uint64_t receiver_id,const Transfer
 }
 
 //DATA结束后等quiet period，内核处理UDP队列里的包
-void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
-                             TransferState &state,std::uint32_t round_id)
+void finish_drain_and_report(int control_fd,TransferState &state,std::uint32_t round_id)
 {
     if(!state.active_section_id)
     {
@@ -575,7 +585,7 @@ void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
              <<" missing_blocks="<<missing_count<<'\n';
     if(missing_count!=0)
     {
-        send_section_status(control_fd,receiver_id,state,section_id,round_id,
+        send_section_status(control_fd,state,section_id,round_id,
                             srcast::SectionStatusCode::Missing,missing_count,std::move(missing_bitmap));
         state.last_reported_round=round_id;
         std::cout<<"missing bitmap sent; waiting for repair\n";
@@ -592,27 +602,26 @@ void finish_drain_and_report(int control_fd,std::uint64_t receiver_id,
     {
         if(state.received_count!=state.meta.total_blocks)
         {
-            send_section_status(control_fd,receiver_id,state,section_id,round_id,
+            send_section_status(control_fd,state,section_id,round_id,
                                 srcast::SectionStatusCode::Complete,0,{});
             state.last_reported_round=round_id;
             std::cout<<"section complete; waiting for next section\n";
             return;
         }
 
-        send_section_status(control_fd,receiver_id,state,section_id,round_id,
+        send_section_status(control_fd,state,section_id,round_id,
                             srcast::SectionStatusCode::Failed,0,{});
         state.last_reported_round=round_id;
         return;
     }
 
     srcast::ReceiverCompleteMessage complete;
-    complete.receiver_id=receiver_id;
     complete.transfer_id=state.meta.common.transfer_id;
     complete.file_size=state.meta.file_size;
     complete.sha256=actual_digest;
     state.last_reported_round=round_id;
     state.awaiting_complete_ack=true;
-    send_section_status(control_fd,receiver_id,state,section_id,round_id,
+    send_section_status(control_fd,state,section_id,round_id,
                         srcast::SectionStatusCode::Complete,0,{});
     send_control_frame(control_fd,srcast::encode_receiver_complete(complete));
     std::cout<<"completion confirmation sent; waiting for COMPLETE_ACK\n";
@@ -673,8 +682,8 @@ void begin_drain_for_round(TransferState &state,std::uint32_t section_id,std::ui
 
 //proxy的TCP控制消息都从这里进，UDP DATA 只负责文件块
 void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd,
-    std::uint64_t receiver_id,const std::string &output_directory,std::optional<TransferState>&transfer,
-    int drain_timer_fd,bool &draining,std::uint32_t &draining_round,
+    const std::string &output_directory,std::optional<TransferState>&transfer,int drain_timer_fd,
+    bool &draining,std::uint32_t &draining_round,
     SteadyClock::time_point &hard_deadline,bool &stop_requested)
 {
     const auto type=srcast::peek_control_type(frame);
@@ -717,7 +726,6 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
                 if(transfer->awaiting_complete_ack)
                 {
                     srcast::ReceiverCompleteMessage complete;
-                    complete.receiver_id=receiver_id;
                     complete.transfer_id=message.transfer_id;
                     complete.file_size=transfer->meta.file_size;
                     complete.sha256=transfer->meta.sha256;
@@ -725,7 +733,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
                 }else
                 {
                     send_control_frame(control_fd,srcast::encode_meta_ready
-                                      ({receiver_id,message.transfer_id}));
+                                      ({message.transfer_id}));
                 }
                 return;
             }
@@ -768,7 +776,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         disarm_timer(drain_timer_fd);
         static_cast<void>(consume_timer_expiration(drain_timer_fd));
         draining=false;
-        send_control_frame(control_fd,srcast::encode_meta_ready({receiver_id,message.transfer_id}));
+        send_control_frame(control_fd,srcast::encode_meta_ready({message.transfer_id}));
         std::cout<<"FILE_META accepted;"<<"META_READY sent\n";
         return;
     }
@@ -859,14 +867,13 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         std::array<std::uint8_t,srcast::kSha256Size>actual_digest{};
         if(!finalize_transfer(*transfer,actual_digest))
         {
-            send_section_status(control_fd,receiver_id,*transfer,transfer->active_section_id.value_or(0),
+            send_section_status(control_fd,*transfer,transfer->active_section_id.value_or(0),
                     transfer->last_reported_round.value_or(0),srcast::SectionStatusCode::Failed,0,{});
             transfer->last_reported_round=transfer->last_reported_round.value_or(0);
             return;
         }
 
         srcast::ReceiverCompleteMessage complete;
-        complete.receiver_id=receiver_id;
         complete.transfer_id=transfer->meta.common.transfer_id;
         complete.file_size=transfer->meta.file_size;
         complete.sha256=actual_digest;
@@ -880,8 +887,8 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
     {
 //proxy ACK后，receiver才清理当前TransferState
         const auto message=srcast::decode_complete_ack(frame);
-        if(!transfer||message.receiver_id!=receiver_id||
-            message.transfer_id!=transfer->meta.common.transfer_id||!transfer->awaiting_complete_ack)
+        if(!transfer||message.transfer_id!=transfer->meta.common.transfer_id||
+           !transfer->awaiting_complete_ack)
         return;
 
         const auto completed_transfer_id=message.transfer_id;
@@ -889,7 +896,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         static_cast<void>(consume_timer_expiration(drain_timer_fd));
         transfer.reset();
         draining=false;
-       send_control_frame(control_fd,srcast::encode_receiver_ready({receiver_id,completed_transfer_id}));
+        send_control_frame(control_fd,srcast::encode_receiver_ready({completed_transfer_id}));
         std::cout<<"COMPLETE_ACK received; RECEIVER_READY sent\n";
         return;
     }
@@ -903,7 +910,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
             if(message.result==srcast::TransferResultCode::Failed)
             {
                 send_control_frame(control_fd,srcast::encode_receiver_ready
-                                 ({receiver_id,message.transfer_id}));
+                                 ({message.transfer_id}));
             }
             return;
         }
@@ -919,7 +926,7 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
             transfer.reset();
             draining=false;
             send_control_frame(control_fd,srcast::encode_receiver_ready
-                             ({receiver_id,failed_transfer_id}));
+                             ({failed_transfer_id}));
             std::cout<<"RECEIVER_READY sent for next transfer\n";
         }
         return;
@@ -932,13 +939,12 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 int main(int argc,char**argv) try
 {
     const auto options=parse_options(argc,argv);
-    const auto &multicast_ip=options.multicast_ip;
-    const auto udp_port=options.udp_port;
-    const auto &output_directory=options.output_directory;
-    const auto &proxy_ip=options.proxy_ip;
-    const auto control_port=options.control_port;
-    const auto receiver_id=options.receiver_id;
-    const auto &interface_ip=options.interface_ip;
+    const auto &multicast_ip=options.multicast_ip;//组播ip
+    const auto udp_port=options.udp_port;//udp端口
+    const auto &output_directory=options.output_directory;//保存文件的目录
+    const auto &proxy_ip=options.proxy_ip;//代理ip
+    const auto control_port=options.control_port;//tcp端口
+    const auto &interface_ip=options.interface_ip;//网卡ip
 
     std::error_code directory_error;
     std::filesystem::create_directories(output_directory,directory_error);
@@ -953,8 +959,7 @@ int main(int argc,char**argv) try
 
     in_addr group_address{};
     in_addr interface_address{};
-    if(::inet_pton(AF_INET,multicast_ip.c_str(),&group_address)!=1||
-       !IN_MULTICAST(ntohl(group_address.s_addr)))
+    if(::inet_pton(AF_INET,multicast_ip.c_str(),&group_address)!=1||!IN_MULTICAST(ntohl(group_address.s_addr)))
     {
         throw std::runtime_error("group must be an IPv4 multicast address");
     }
@@ -976,8 +981,7 @@ int main(int argc,char**argv) try
     }
 
     int receive_buffer=32*1024*1024;
-    static_cast<void>(::setsockopt(udp_fd.get(),SOL_SOCKET,SO_RCVBUF,
-                      &receive_buffer,sizeof(receive_buffer)));
+    static_cast<void>(::setsockopt(udp_fd.get(),SOL_SOCKET,SO_RCVBUF,&receive_buffer,sizeof(receive_buffer)));
     sockaddr_in local{};
     local.sin_family=AF_INET;
     local.sin_port=htons(static_cast<std::uint16_t>(udp_port));
@@ -1008,12 +1012,12 @@ int main(int argc,char**argv) try
     }
 
     std::optional<TransferState>transfer;
-    auto control_fd=connect_and_register(proxy_ip,control_port,receiver_id,
+    auto control_fd=connect_and_register(proxy_ip,control_port,interface_ip,
                                          static_cast<std::uint16_t>(udp_port),transfer);
     add_epoll_interest(epoll_fd.get(),udp_fd.get());
     add_epoll_interest(epoll_fd.get(),drain_timer_fd.get());
     add_epoll_interest(epoll_fd.get(),control_fd.get());
-    std::cout<<"receiver_id="<<receiver_id<<" listening on "<<multicast_ip<<':'<<udp_port
+    std::cout<<"receiver listening on "<<multicast_ip<<':'<<udp_port
              <<" via interface "<<interface_ip<<" control="<<proxy_ip<<':'<<control_port<<'\n';
     std::array<std::uint8_t,srcast::kMaxPacketSize>packet_buffer{};
     ControlStreamReader control_reader;
@@ -1043,7 +1047,7 @@ int main(int argc,char**argv) try
             transfer->last_reported_round.reset();
         }
         control_reader=ControlStreamReader{};
-        control_fd=connect_and_register(proxy_ip,control_port,receiver_id,
+        control_fd=connect_and_register(proxy_ip,control_port,interface_ip,
                                         static_cast<std::uint16_t>(udp_port),transfer);
         add_epoll_interest(epoll_fd.get(),control_fd.get());
         std::cout<<"proxy control reconnected; REGISTER sent state="
@@ -1208,8 +1212,7 @@ int main(int argc,char**argv) try
 //quiet period到了，当前section round可以报状态
                 try
                 {
-                    finish_drain_and_report(control_fd.get(),receiver_id,*transfer,
-                                            draining_round);
+                    finish_drain_and_report(control_fd.get(),*transfer,draining_round);
                 }catch(const std::exception&error)
                 {
                     std::cerr<<"proxy control send failed: "<<error.what()<<"; reconnecting\n";
@@ -1226,8 +1229,8 @@ int main(int argc,char**argv) try
                 const auto frames=control_reader.read_frames(control_fd.get());
                 for(const auto& frame:frames)
                 {
-                    handle_control_message(frame,control_fd.get(),receiver_id,output_directory,transfer,
-                                 drain_timer_fd.get(),draining,draining_round,hard_deadline,stop_requested);
+                    handle_control_message(frame,control_fd.get(),output_directory,transfer,
+                        drain_timer_fd.get(),draining,draining_round,hard_deadline,stop_requested);
                 }
                 control_disconnected=control_disconnected||control_reader.peer_closed();
             }catch(const std::exception&error)

@@ -47,19 +47,19 @@ done
 
 "$BUILD_DIR/receiver_agent" \
     239.255.42.99 5000 "$WORK_DIR/receiver-1" \
-    127.0.0.1 6000 1 127.0.0.1 \
+    127.0.0.1 6000 127.0.0.2 \
     >"$WORK_DIR/receiver-1.log" 2>&1 &
 RECEIVER1_PID="$!"
 
 DROP_MANY="$(seq -s, 0 39)"
 SRCAST_DROP_INITIAL_BLOCKS="$DROP_MANY" "$BUILD_DIR/receiver_agent" \
     239.255.42.99 5000 "$WORK_DIR/receiver-2" \
-    127.0.0.1 6000 2 127.0.0.1 \
+    127.0.0.1 6000 127.0.0.3 \
     >"$WORK_DIR/receiver-2.log" 2>&1 &
 RECEIVER2_PID="$!"
 
 for _ in {1..50}; do
-    if grep -q "registered receiver_id=2" "$WORK_DIR/proxy.log"; then
+    if [[ "$(grep -c 'registered receiver=' "$WORK_DIR/proxy.log" 2>/dev/null || true)" -ge 2 ]]; then
         break
     fi
     if ! kill -0 "$PROXY_PID" 2>/dev/null; then
@@ -98,9 +98,9 @@ fi
 [[ "$(sha256sum "$OUTPUT1" | awk '{print $1}')" == "$INPUT_SHA" ]]
 [[ "$(sha256sum "$OUTPUT2" | awk '{print $1}')" == "$INPUT_SHA" ]]
 
-grep -q "receiver_id=2 isolated for TCP backfill" "$WORK_DIR/proxy.log"
-grep -q "TCP backfill receiver_id=2 blocks=" "$WORK_DIR/proxy.log"
-grep -q "TCP backfill completed receiver_id=2" "$WORK_DIR/proxy.log"
+grep -q "receiver=127.0.0.3:5000 isolated for TCP backfill" "$WORK_DIR/proxy.log"
+grep -q "TCP backfill receiver=127.0.0.3:5000 blocks=" "$WORK_DIR/proxy.log"
+grep -q "TCP backfill completed receiver=127.0.0.3:5000" "$WORK_DIR/proxy.log"
 grep -q "TCP backfill begins" "$WORK_DIR/receiver-2.log"
 grep -q "TCP backfill completed; waiting for COMPLETE_ACK" \
     "$WORK_DIR/receiver-2.log"

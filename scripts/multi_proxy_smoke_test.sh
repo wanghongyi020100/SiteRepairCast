@@ -55,18 +55,18 @@ wait_for_log "waiting for central sender on port 7001" "$WORK_DIR/proxy-2.log"
 
 "$BUILD_DIR/receiver_agent" \
     239.255.42.99 5000 "$WORK_DIR/receiver-1" \
-    127.0.0.1 6000 1 127.0.0.1 \
+    127.0.0.1 6000 127.0.0.2 \
     >"$WORK_DIR/receiver-1.log" 2>&1 &
 PIDS+=("$!")
 
 "$BUILD_DIR/receiver_agent" \
     239.255.42.99 5000 "$WORK_DIR/receiver-2" \
-    127.0.0.1 6001 1 127.0.0.1 \
+    127.0.0.1 6001 127.0.0.3 \
     >"$WORK_DIR/receiver-2.log" 2>&1 &
 PIDS+=("$!")
 
-wait_for_log "registered receiver_id=1" "$WORK_DIR/proxy-1.log"
-wait_for_log "registered receiver_id=1" "$WORK_DIR/proxy-2.log"
+wait_for_log "registered receiver=127.0.0.2:5000" "$WORK_DIR/proxy-1.log"
+wait_for_log "registered receiver=127.0.0.3:5000" "$WORK_DIR/proxy-2.log"
 
 "$BUILD_DIR/central_sender" \
     --pace-us 0 \

@@ -214,7 +214,7 @@ void save_central_checkpoint(const std::string &checkpoint_path,const srcast::Ce
 //一tcp控制连接对应一个receiver
 struct ReceiverConnection
 {
-    std::uint64_t receiver_id{};
+    std::string receiver_endpoint;
     FileDescriptor control_fd;
     sockaddr_in udp_destination{};
     bool meta_ready{false};
@@ -230,6 +230,18 @@ struct ReceiverConnection
     std::optional<srcast::SectionStatusMessage>status;
     std::optional<srcast::FileMetaMessage>active_meta;
 };
+
+std::string ipv4_address_string(const in_addr &address)
+{
+    char buffer[INET_ADDRSTRLEN]{};
+    if(::inet_ntop(AF_INET,&address,buffer,sizeof(buffer))==nullptr)return "?";
+    return buffer;
+}
+
+std::string receiver_endpoint_key(const sockaddr_in &peer,std::uint16_t udp_port)
+{
+    return ipv4_address_string(peer.sin_addr)+":"+std::to_string(udp_port);
+}
 
 void reset_transfer_state(std::vector<ReceiverConnection>&receivers)
 {
@@ -266,7 +278,7 @@ bool send_receiver_frame(ReceiverConnection&receiver,const std::vector<std::uint
     }catch(const std::exception&error)
     {
         std::cerr<<"receiver control connection failed during "<<operation
-                 <<" receiver_id="<<receiver.receiver_id<<": "<<error.what()<<'\n';
+                 <<" receiver="<<receiver.receiver_endpoint<<": "<<error.what()<<'\n';
         receiver.control_fd.reset(-1);
         return false;
     }
@@ -282,7 +294,7 @@ std::optional<std::vector<std::uint8_t>>receive_receiver_frame(ReceiverConnectio
     }catch(const std::exception&error)
     {
         std::cerr<<"receiver control connection failed during "<<operation
-                 <<" receiver_id="<<receiver.receiver_id<<": "<<error.what()<<'\n';
+                 <<" receiver="<<receiver.receiver_endpoint<<": "<<error.what()<<'\n';
         receiver.control_fd.reset(-1);
         return std::nullopt;
     }
@@ -293,7 +305,7 @@ void abandon_incomplete_receivers(std::vector<ReceiverConnection>&receivers)
     for(auto &receiver:receivers)
     {
         if(receiver.completed)continue;
-        std::cerr<<"receiver transfer failed; abandoning receiver_id="<<receiver.receiver_id<<'\n';
+        std::cerr<<"receiver transfer failed; abandoning receiver="<<receiver.receiver_endpoint<<'\n';
         receiver.abandoned=true;
         receiver.control_fd.reset(-1);
     }
@@ -414,6 +426,7 @@ struct AcceptedReceiver
     srcast::RegisterMessage registration;
     FileDescriptor control_fd;
     sockaddr_in peer{};
+    std::string receiver_endpoint;
 };
 
 AcceptedReceiver accept_receiver_registration(int listener_fd)
@@ -435,10 +448,7 @@ AcceptedReceiver accept_receiver_registration(int listener_fd)
     const auto registration=srcast::decode_register(receive_control_frame(control_fd.get()));
     //tcp恢复阻塞
     set_receive_timeout(control_fd.get(),std::chrono::seconds(0));
-    if(registration.receiver_id==0)
-    {
-        throw std::runtime_error("receiver_id must not be zero");
-    }else if(registration.udp_port==0)
+    if(registration.udp_port==0)
     {
         throw std::runtime_error("receiver UDP port must not be zero");
     }else if(registration.state==srcast::ReceiverState::Idle&&registration.current_transfer_id!=0)
@@ -448,7 +458,7 @@ AcceptedReceiver accept_receiver_registration(int listener_fd)
     {
         throw std::runtime_error("active receiver has no current transfer");
     }
-    return {registration,std::move(control_fd),peer};
+    return {registration,std::move(control_fd),peer,receiver_endpoint_key(peer,registration.udp_port)};
 }
 
 void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver accepted,bool reconnect)
@@ -456,16 +466,14 @@ void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver a
     const bool was_completed=receiver.completed;
     const bool was_abandoned=receiver.abandoned;
     receiver.control_fd=std::move(accepted.control_fd);//新连接接管前关闭旧fd
+    receiver.receiver_endpoint=accepted.receiver_endpoint;
     receiver.udp_destination=accepted.peer;
     receiver.udp_destination.sin_port=htons(accepted.registration.udp_port);
     receiver.recovery_state=accepted.registration.state;
     receiver.recovery_transfer_id=accepted.registration.current_transfer_id;
 
-    char address[INET_ADDRSTRLEN]{};
-    if(::inet_ntop(AF_INET,&accepted.peer.sin_addr,address,sizeof(address))==nullptr)
-    std::strcpy(address,"?");
-    std::cout<<(reconnect?"reconnected":"registered")<<" receiver_id="<<receiver.receiver_id
-             <<" address="<<address<<':'<<accepted.registration.udp_port<<" state=";
+    std::cout<<(reconnect?"reconnected":"registered")<<" receiver="
+             <<receiver.receiver_endpoint<<" state=";
     if(receiver.recovery_state==srcast::ReceiverState::Idle)std::cout<<"IDLE";
     else if(receiver.recovery_state==srcast::ReceiverState::Receiving)std::cout<<"RECEIVING";
     else std::cout<<"COMPLETED";
@@ -482,8 +490,8 @@ void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver a
         receiver.complete_received=true;
         receiver.completed=true;
         send_receiver_frame(receiver,srcast::encode_complete_ack
-                           ({receiver.receiver_id,meta.transfer_id}),"recovered COMPLETE_ACK");
-        std::cout<<"recovered completed receiver_id="<<receiver.receiver_id<<'\n';
+                           ({meta.transfer_id}),"recovered COMPLETE_ACK");
+        std::cout<<"recovered completed receiver="<<receiver.receiver_endpoint<<'\n';
         return;
     }
 
@@ -506,7 +514,7 @@ void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver a
     if(receiver.recovery_state==srcast::ReceiverState::Completed)
     {
         send_receiver_frame(receiver,srcast::encode_complete_ack
-                           ({receiver.receiver_id,receiver.recovery_transfer_id}),
+                           ({receiver.recovery_transfer_id}),
                             "stale COMPLETE_ACK");
     }else if(receiver.recovery_state==srcast::ReceiverState::Receiving&&
              receiver.recovery_transfer_id!=meta.transfer_id)
@@ -528,8 +536,8 @@ void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver a
     send_receiver_frame(receiver,srcast::encode_file_meta(meta),"reconnected FILE_META");
 }
 
-//等齐固定接收端，坏注册丢，重复id只替换旧连接
-//注册2s，防止半包tcp连接占住启动流程
+//等齐固定接收端，坏注册丢，重复身份只替换旧连接
+//注册2s，防止tcp连接占启动流程
 std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expected_receivers)
 {
     std::vector<ReceiverConnection>receivers;
@@ -542,14 +550,14 @@ std::vector<ReceiverConnection>accept_receivers(int listener_fd,std::size_t expe
             auto accepted=accept_receiver_registration(listener_fd);
             const auto found=std::find_if(receivers.begin(),receivers.end(),[&](const auto &receiver)
             {
-                return receiver.receiver_id==accepted.registration.receiver_id;
+                return receiver.receiver_endpoint==accepted.receiver_endpoint;
             });
-            //出现相同可能是接收端断线重连
+            //出现相同身份可能是接收端断线重连
             if(found!=receivers.end())install_receiver_connection(*found,std::move(accepted),true);
             else
             {
                 ReceiverConnection receiver;
-                receiver.receiver_id=accepted.registration.receiver_id;
+                receiver.receiver_endpoint=accepted.receiver_endpoint;
                 install_receiver_connection(receiver,std::move(accepted),false);
                 receivers.push_back(std::move(receiver));
             }
@@ -568,11 +576,11 @@ void accept_receiver_reconnect(std::vector<ReceiverConnection>&receivers)
         auto accepted=accept_receiver_registration(receiver_listener_fd);
         const auto found=std::find_if(receivers.begin(),receivers.end(),[&](const auto&receiver)
         {
-            return receiver.receiver_id==accepted.registration.receiver_id;
+            return receiver.receiver_endpoint==accepted.receiver_endpoint;
         });
         if(found==receivers.end())
         {
-            std::cerr<<"rejected receiver registration: receiver_id is not a fixed member\n";
+            std::cerr<<"rejected receiver registration: receiver is not a fixed member\n";
             return;
         }
         install_receiver_connection(*found,std::move(accepted),true);
@@ -650,7 +658,7 @@ bool round_responses_complete(const std::vector<ReceiverConnection>&receivers,bo
     return true;
 }
 
-//控制消息可能晚到，先按transfer/round/receiver_id过滤
+//控制消息可能晚到，先按transfer/round过滤
 //收到COMPLETE时才回COMPLETE_ACK，receiver可以安全退出当前文件
 void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::uint8_t>&frame,
                           std::uint64_t transfer_id,std::uint32_t section_id,std::uint32_t round_id,
@@ -661,23 +669,23 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
     if(type==srcast::ControlType::SectionStatus)
     {
         const auto status=srcast::decode_section_status(frame);
-        if(status.receiver_id!=receiver.receiver_id||status.transfer_id!=transfer_id||
-           status.section_id!=section_id||status.round_id!=round_id)
+        if(status.transfer_id!=transfer_id||status.section_id!=section_id||
+           status.round_id!=round_id)
         {
-            std::cerr<<"ignore stale or mismatched SECTION_STATUS from receiver_id="
-                     <<receiver.receiver_id<<'\n';
+            std::cerr<<"ignore stale or mismatched SECTION_STATUS from receiver="
+                     <<receiver.receiver_endpoint<<'\n';
             return;
         }
         if(!validate_missing_bitmap(status,section_blocks))
         {
-            std::cerr<<"reject invalid missing bitmap from receiver_id="<<receiver.receiver_id<<'\n';
+            std::cerr<<"reject invalid missing bitmap from receiver="<<receiver.receiver_endpoint<<'\n';
             return;
         }
 
         receiver.status=status;
         receiver.status_received=true;
         std::cout<<"section="<<section_id<<" round="<<round_id
-                 <<" receiver_id="<<receiver.receiver_id<<" status=";
+                 <<" receiver="<<receiver.receiver_endpoint<<" status=";
         if(status.status==srcast::SectionStatusCode::Complete)std::cout<<"COMPLETE";
         else if(status.status==srcast::SectionStatusCode::Missing)
         std::cout<<"MISSING missing_blocks="<<status.missing_count;
@@ -691,10 +699,10 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
         const auto complete=srcast::decode_receiver_complete(frame);
         if(!receiver.status_received||!receiver.status||
             receiver.status->status!=srcast::SectionStatusCode::Complete||
-            complete.receiver_id!=receiver.receiver_id||complete.transfer_id!=transfer_id||
-            complete.file_size!=file_size||complete.sha256!=digest)
+            complete.transfer_id!=transfer_id||complete.file_size!=file_size||
+            complete.sha256!=digest)
         {
-            std::cerr<<"reject invalid RECEIVER_COMPLETE from receiver_id="<<receiver.receiver_id<<'\n';
+            std::cerr<<"reject invalid RECEIVER_COMPLETE from receiver="<<receiver.receiver_endpoint<<'\n';
             return;
         }
 
@@ -703,12 +711,12 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
         receiver.recovery_state=srcast::ReceiverState::Completed;
         receiver.recovery_transfer_id=transfer_id;
         send_receiver_frame(receiver,srcast::encode_complete_ack
-                           ({receiver.receiver_id,transfer_id}),"COMPLETE_ACK");
-        std::cout<<"completion acknowledged receiver_id="<<receiver.receiver_id<<'\n';
+                           ({transfer_id}),"COMPLETE_ACK");
+        std::cout<<"completion acknowledged receiver="<<receiver.receiver_endpoint<<'\n';
         return;
     }
 
-    std::cerr<<"ignore unexpected control message from receiver_id="<<receiver.receiver_id<<'\n';
+    std::cerr<<"ignore unexpected control message from receiver="<<receiver.receiver_endpoint<<'\n';
 }
 
 template<typename Predicate>//临时建epoll
@@ -783,7 +791,7 @@ std::vector<std::size_t>wait_for_receiver_events(std::vector<ReceiverConnection>
            index<receivers.size()&&receivers[index].control_fd.get()==watched_fds[index])
         {
             std::cerr<<"receiver control disconnected during "<<operation
-                     <<" receiver_id="<<receivers[index].receiver_id<<'\n';
+                     <<" receiver="<<receivers[index].receiver_endpoint<<'\n';
             receivers[index].control_fd.reset(-1);
         }
     }
@@ -830,7 +838,7 @@ void collect_round_reports(std::vector<ReceiverConnection>&receivers,std::uint64
         if(!receiver.completed&&!receiver.isolated&&!receiver.abandoned&&!receiver.status_received)
         {
             std::cout<<"section="<<section_id<<" round="<<round_id
-                     <<" receiver_id="<<receiver.receiver_id<<" status=NO_REPORT\n";
+                     <<" receiver="<<receiver.receiver_endpoint<<" status=NO_REPORT\n";
         }
     }
 }
@@ -858,7 +866,7 @@ void isolate_slow_receivers(std::vector<ReceiverConnection>&receivers,std::uint3
         receiver.backfill_blocks.erase(std::unique(receiver.backfill_blocks.begin(),
                    receiver.backfill_blocks.end()),receiver.backfill_blocks.end());
         receiver.isolated=true;
-        std::cout<<"receiver_id="<<receiver.receiver_id<<
+        std::cout<<"receiver="<<receiver.receiver_endpoint<<
         " isolated for TCP backfill missing_blocks="<<receiver.status->missing_count
         <<" section="<<section_id<<" repair_rounds="<<round_id<<'\n';
     }
@@ -1094,14 +1102,14 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
             if(srcast::peek_control_type(*frame)!=srcast::ControlType::ReceiverReady)
             {
                 std::cerr<<"ignore unexpected message while waiting for ready"
-                         <<" receiver_id="<<receiver.receiver_id<<'\n';
+                         <<" receiver="<<receiver.receiver_endpoint<<'\n';
                 continue;
             }
 
             const auto message=srcast::decode_receiver_ready(*frame);
-            if(message.receiver_id!=receiver.receiver_id||message.previous_transfer_id!=transfer_id)
+            if(message.previous_transfer_id!=transfer_id)
             {
-                std::cerr<<"ignore stale RECEIVER_READY receiver_id="<<receiver.receiver_id<<'\n';
+                std::cerr<<"ignore stale RECEIVER_READY receiver="<<receiver.receiver_endpoint<<'\n';
                 continue;
             }
 
@@ -1109,7 +1117,7 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
             receiver.recovery_state=srcast::ReceiverState::Idle;
             receiver.recovery_transfer_id=0;
             receiver.active_meta.reset();
-            std::cout<<"receiver ready receiver_id="<<receiver.receiver_id<<'\n';
+            std::cout<<"receiver ready receiver="<<receiver.receiver_endpoint<<'\n';
         }
     }
 }
@@ -1132,13 +1140,13 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
     const auto abandon_receiver=[&](const char*reason)
     {
         std::lock_guard<std::mutex>lock(output_mutex);
-        std::cerr<<reason<<"; abandoning receiver_id="<<receiver.receiver_id<<'\n';
+        std::cerr<<reason<<"; abandoning receiver="<<receiver.receiver_endpoint<<'\n';
         receiver.abandoned=true;
         receiver.control_fd.reset(-1);
     };
     {
         std::lock_guard<std::mutex>lock(output_mutex);
-        std::cout<<"TCP backfill receiver_id="<<receiver.receiver_id
+        std::cout<<"TCP backfill receiver="<<receiver.receiver_endpoint
                  <<" blocks="<<receiver.backfill_blocks.size()<<'\n';
     }
         if(!send_receiver_frame(receiver,srcast::encode_backfill_begin({transfer_id,total_blocks}),
@@ -1215,36 +1223,35 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
             if(type==srcast::ControlType::SectionStatus)
             {
                 const auto status=srcast::decode_section_status(*complete_frame);
-                if(status.receiver_id==receiver.receiver_id&&status.transfer_id==transfer_id&&
-                   status.status==srcast::SectionStatusCode::Failed)
+                if(status.transfer_id==transfer_id&&status.status==srcast::SectionStatusCode::Failed)
                 {
                     receiver.status=status;
                     receiver.status_received=true;
                     std::lock_guard<std::mutex>lock(output_mutex);
-                    std::cerr<<"TCP backfill failed receiver_id="<<receiver.receiver_id
+                    std::cerr<<"TCP backfill failed receiver="<<receiver.receiver_endpoint
                              <<" status=FAILED\n";
                     return;
                 }
                 std::lock_guard<std::mutex>lock(output_mutex);
                 std::cout<<"ignore stale SECTION_STATUS during TCP backfill"
-                         <<" receiver_id="<<receiver.receiver_id<<'\n';
+                         <<" receiver="<<receiver.receiver_endpoint<<'\n';
                 continue;
             }
             if(type!=srcast::ControlType::ReceiverComplete)
             {
                 std::lock_guard<std::mutex>lock(output_mutex);
-                std::cerr<<"ignore unexpected message during TCP backfill receiver_id="
-                         <<receiver.receiver_id<<'\n';
+                std::cerr<<"ignore unexpected message during TCP backfill receiver="
+                         <<receiver.receiver_endpoint<<'\n';
                 continue;
             }
 
             const auto complete=srcast::decode_receiver_complete(*complete_frame);
-            if(complete.receiver_id!=receiver.receiver_id||complete.transfer_id!=transfer_id||
-               complete.file_size!=file_size||complete.sha256!=digest)
+            if(complete.transfer_id!=transfer_id||complete.file_size!=file_size||
+               complete.sha256!=digest)
             {
                 std::lock_guard<std::mutex>lock(output_mutex);
-                std::cerr<<"ignore invalid RECEIVER_COMPLETE during TCP backfill receiver_id="
-                         <<receiver.receiver_id<<'\n';
+                std::cerr<<"ignore invalid RECEIVER_COMPLETE during TCP backfill receiver="
+                         <<receiver.receiver_endpoint<<'\n';
                 continue;
             }
             break;
@@ -1256,10 +1263,10 @@ void backfill_one_receiver(ReceiverConnection &receiver,int input_fd,const std::
         receiver.recovery_state=srcast::ReceiverState::Completed;
         receiver.recovery_transfer_id=transfer_id;
         send_receiver_frame(receiver,srcast::encode_complete_ack
-                           ({receiver.receiver_id,transfer_id}),"TCP backfill COMPLETE_ACK");
+                           ({transfer_id}),"TCP backfill COMPLETE_ACK");
     {
         std::lock_guard<std::mutex>lock(output_mutex);
-        std::cout<<"TCP backfill completed receiver_id="<<receiver.receiver_id<<'\n';
+        std::cout<<"TCP backfill completed receiver="<<receiver.receiver_endpoint<<'\n';
     }
 }
 
@@ -1322,14 +1329,14 @@ void begin_receiver_transfer(std::vector<ReceiverConnection>&receivers,std::uint
             receiver.complete_received=true;
             receiver.completed=true;
             send_receiver_frame(receiver,srcast::encode_complete_ack
-                               ({receiver.receiver_id,transfer_id}),"recovered COMPLETE_ACK");
+                               ({transfer_id}),"recovered COMPLETE_ACK");
             continue;
         }
 
         if(receiver.recovery_state==srcast::ReceiverState::Completed)
         {
             send_receiver_frame(receiver,srcast::encode_complete_ack
-                               ({receiver.receiver_id,receiver.recovery_transfer_id}),
+                               ({receiver.recovery_transfer_id}),
                                 "previous COMPLETE_ACK");
         }else if(receiver.recovery_state==srcast::ReceiverState::Receiving&&
                  receiver.recovery_transfer_id!=transfer_id)
@@ -1445,7 +1452,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
                 receiver.complete_received=true;
                 receiver.completed=true;
                 send_receiver_frame(receiver,srcast::encode_complete_ack
-                                   ({receiver.receiver_id,meta.transfer_id}),
+                                   ({meta.transfer_id}),
                                     "cached transfer COMPLETE_ACK");
             }
             const auto section_count=srcast::section_count_for_blocks(meta.total_blocks,
@@ -1726,15 +1733,15 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
             if(type==srcast::ControlType::ReceiverReady)
             {
                 const auto message=srcast::decode_receiver_ready(*frame);
-                if(message.receiver_id==receiver.receiver_id)
-                std::cout<<"ignore previous RECEIVER_READY receiver_id="<<receiver.receiver_id<<'\n';
+                if(message.previous_transfer_id==transfer_id)
+                std::cout<<"ignore previous RECEIVER_READY receiver="<<receiver.receiver_endpoint<<'\n';
                 continue;
             }
             if(type==srcast::ControlType::ReceiverComplete)
             {
                 const auto message=srcast::decode_receiver_complete(*frame);
-                if(message.receiver_id==receiver.receiver_id&&message.transfer_id==transfer_id&&
-                   receiver.active_meta&&message.file_size==receiver.active_meta->file_size&&
+                if(message.transfer_id==transfer_id&&receiver.active_meta&&
+                   message.file_size==receiver.active_meta->file_size&&
                    message.sha256==receiver.active_meta->sha256)
                 {
                     receiver.meta_ready=true;
@@ -1743,19 +1750,19 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
                     receiver.recovery_state=srcast::ReceiverState::Completed;
                     receiver.recovery_transfer_id=transfer_id;
                     send_receiver_frame(receiver,srcast::encode_complete_ack
-                                       ({receiver.receiver_id,transfer_id}),"recovered COMPLETE_ACK");
+                                       ({transfer_id}),"recovered COMPLETE_ACK");
                 }
                 continue;
             }
             if(type!=srcast::ControlType::MetaReady)
             {
                 std::cerr<<"ignore unexpected control message while waiting for META_READY"
-                         <<" receiver_id="<<receiver.receiver_id<<'\n';
+                         <<" receiver="<<receiver.receiver_endpoint<<'\n';
                 continue;
             }
 
             const auto message=srcast::decode_meta_ready(*frame);
-            if(message.receiver_id!=receiver.receiver_id||message.transfer_id!=transfer_id)
+            if(message.transfer_id!=transfer_id)
             {
                 throw std::runtime_error("invalid or stale META_READY");
             }
@@ -1763,7 +1770,7 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
             receiver.meta_ready=true;
             receiver.recovery_state=srcast::ReceiverState::Receiving;
             receiver.recovery_transfer_id=transfer_id;
-            std::cout<<"META_READY receiver_id="<<receiver.receiver_id<<'\n';
+            std::cout<<"META_READY receiver="<<receiver.receiver_endpoint<<'\n';
         }
     }
 }
@@ -1878,7 +1885,7 @@ int main(int argc,char**argv) try
         throw std::runtime_error("destination must be an IPv4 multicast address");
     }
 
-    //先开控制面，接收端注册完再接中心。
+    //先开控制面，接收端注册完再接中心
     auto listener=create_control_listener(control_port);
     receiver_listener_fd=listener.get();
     std::optional<FileDescriptor>central_listener;

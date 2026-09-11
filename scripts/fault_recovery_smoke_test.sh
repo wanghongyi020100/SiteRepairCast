@@ -77,19 +77,20 @@ start_proxy() {
 }
 
 start_receiver() {
-    local receiver_id="$1"
+    local receiver_index="$1"
     local out_dir="$2"
     local log="$3"
+    local receiver_ip="127.0.0.$((receiver_index + 1))"
     shift 3
     if (($# > 0)); then
         env "$@" "$BUILD_DIR/receiver_agent" \
             239.255.42.99 5000 "$out_dir" \
-            127.0.0.1 6000 "$receiver_id" 127.0.0.1 \
+            127.0.0.1 6000 "$receiver_ip" \
             >"$log" 2>&1 &
     else
         "$BUILD_DIR/receiver_agent" \
             239.255.42.99 5000 "$out_dir" \
-            127.0.0.1 6000 "$receiver_id" 127.0.0.1 \
+            127.0.0.1 6000 "$receiver_ip" \
             >"$log" 2>&1 &
     fi
     STARTED_PID="$!"
@@ -114,7 +115,7 @@ start_receiver 1 "$FAULT_DIR/receiver-1" "$FAULT_DIR/receiver-1.log"
 RECEIVER1_PID="$STARTED_PID"
 start_receiver 2 "$FAULT_DIR/receiver-2" "$FAULT_DIR/receiver-2.log"
 RECEIVER2_PID="$STARTED_PID"
-wait_for_log "registered receiver_id=2" "$PROXY_FAULT_LOG" "fault receivers"
+wait_for_log "registered receiver=127.0.0.3:5000" "$PROXY_FAULT_LOG" "fault receivers"
 
 "$BUILD_DIR/central_sender" 127.0.0.1 7000 0 "$FAULT_DIR/input.bin" \
     >"$FAULT_DIR/central.log" 2>&1
@@ -167,7 +168,7 @@ start_receiver 1 "$KILL_DIR/receiver-1" "$KILL_DIR/receiver-1-first.log"
 RECEIVER1_PID="$STARTED_PID"
 start_receiver 2 "$KILL_DIR/receiver-2" "$KILL_DIR/receiver-2-first.log"
 RECEIVER2_PID="$STARTED_PID"
-wait_for_log "registered receiver_id=2" "$PROXY_KILL_FIRST_LOG" "kill receivers"
+wait_for_log "registered receiver=127.0.0.3:5000" "$PROXY_KILL_FIRST_LOG" "kill receivers"
 
 "$BUILD_DIR/central_sender" 127.0.0.1 7000 0 "$KILL_DIR/input.bin" \
     >"$KILL_DIR/central-first.log" 2>&1 &
@@ -189,7 +190,7 @@ start_proxy "$PROXY_KILL_RESUME_LOG" "$KILL_DIR/cache"
 PROXY_PID="$STARTED_PID"
 
 # Receiver 自动重新连接并 REGISTER。
-wait_for_log "registered receiver_id=2" \
+wait_for_log "registered receiver=127.0.0.3:5000" \
     "$PROXY_KILL_RESUME_LOG" \
     "receivers auto reconnect"
 
@@ -209,8 +210,8 @@ assert_sha \
     "$KILL_DIR/receiver-1" \
     "$KILL_DIR/receiver-2"
 
-grep -q "registered receiver_id=1" "$PROXY_KILL_RESUME_LOG"
-grep -q "registered receiver_id=2" "$PROXY_KILL_RESUME_LOG"
+grep -q "registered receiver=127.0.0.2:5000" "$PROXY_KILL_RESUME_LOG"
+grep -q "registered receiver=127.0.0.3:5000" "$PROXY_KILL_RESUME_LOG"
 grep -q "resume_section=2/" "$PROXY_KILL_RESUME_LOG"
 
 grep -q "central resume transfer_id=.*next_section=2/" \
@@ -220,4 +221,3 @@ grep -q "central confirmed cached transfer_id=" \
     "$KILL_DIR/central-first.log"
 
 echo "fault recovery smoke test passed"
-

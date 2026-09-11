@@ -54,13 +54,13 @@ fi
 
 SRCAST_DROP_INITIAL_BLOCKS=3 "$BUILD_DIR/receiver_agent" \
     239.255.42.99 5000 "$WORK_DIR/receiver-1" \
-    127.0.0.1 6000 1 127.0.0.1 \
+    127.0.0.1 6000 127.0.0.2 \
     >"$WORK_DIR/receiver-1.log" 2>&1 &
 RECEIVER1_PID="$!"
 
 SRCAST_DROP_INITIAL_BLOCKS=3 "$BUILD_DIR/receiver_agent" \
     239.255.42.99 5000 "$WORK_DIR/receiver-2" \
-    127.0.0.1 6000 2 127.0.0.1 \
+    127.0.0.1 6000 127.0.0.3 \
     >"$WORK_DIR/receiver-2.log" 2>&1 &
 RECEIVER2_PID="$!"
 
