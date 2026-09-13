@@ -117,41 +117,45 @@ CentralOptions parse_options(int argc,char **argv)
     }
 
     CentralOptions options;
-    for(int index=1;index<argc;index++)
+    const bool flag_mode=std::string(argv[1])=="--proxy"||
+                         std::string(argv[1])=="--pace-us";
+
+    if(flag_mode)
     {
-        const std::string option=argv[index];
-        if(option=="--pace-us")
+        for(int index=1;index<argc;index++)
         {
-            if(++index>=argc)
+            const std::string option=argv[index];
+            if(option=="--pace-us")
             {
-                throw std::runtime_error("missing --pace-us value");
+                if(++index>=argc)throw std::runtime_error("missing --pace-us value");
+                options.pace_us=std::stoi(argv[index]);
+                continue;
             }
-            options.pace_us=std::stoi(argv[index]);
-            continue;
-        }
-        if(option=="--proxy")
-        {
-            if(index+2>=argc)
+            if(option=="--proxy")
             {
-                throw std::runtime_error("missing --proxy value");
+                if(index+2>=argc)throw std::runtime_error("missing --proxy value");
+                options.endpoints.push_back({argv[++index],std::stoi(argv[++index])});
+                continue;
             }
-            options.endpoints.push_back({argv[++index],std::stoi(argv[++index])});
-            continue;
+            options.files.emplace_back(option);
         }
-        options.files.emplace_back(option);
+    }
+    else
+    {
+        options.endpoints.push_back({argv[1],std::stoi(argv[2])});
+        options.pace_us=std::stoi(argv[3]);
+        for(int index=4;index<argc;index++)options.files.emplace_back(argv[index]);
     }
 
     if(options.endpoints.empty()||options.files.empty()||options.pace_us<0)
-    {
         throw std::runtime_error("invalid command-line argument");
-    }
+
     for(const auto &endpoint:options.endpoints)
     {
         if(endpoint.port<1||endpoint.port>65535||endpoint.ip.empty())
-        {
             throw std::runtime_error("invalid proxy endpoint");
-        }
     }
+
     options.section_blocks=section_blocks_from_env();
     return options;
 }

@@ -33,6 +33,30 @@ wait_for_log() {
     return 1
 }
 
+wait_for_checkpoint_section() {
+    local cache_dir="$1"
+    local expected_next_section="$2"
+    local label="$3"
+    local state_file
+    local next_section
+    for _ in {1..100}; do
+        state_file="$(find "$cache_dir" -maxdepth 1 -name '*.state' -print -quit)"
+        if [[ -n "$state_file" ]]; then
+            next_section="$(tail -n 1 "$state_file" 2>/dev/null || true)"
+            if [[ "$next_section" =~ ^[0-9]+$ ]] && ((next_section >= expected_next_section)); then
+                return 0
+            fi
+        fi
+        sleep 0.05
+    done
+    echo "timed out waiting for $label" >&2
+    find "$cache_dir" -maxdepth 1 -type f -print >&2 || true
+    if [[ -n "${state_file:-}" ]]; then
+        cat "$state_file" >&2 || true
+    fi
+    return 1
+}
+
 assert_sha() {
     local input="$1"
     local cache_dir="$2"
@@ -170,13 +194,12 @@ start_receiver 2 "$KILL_DIR/receiver-2" "$KILL_DIR/receiver-2-first.log"
 RECEIVER2_PID="$STARTED_PID"
 wait_for_log "registered receiver=127.0.0.3:5000" "$PROXY_KILL_FIRST_LOG" "kill receivers"
 
-"$BUILD_DIR/central_sender" 127.0.0.1 7000 0 "$KILL_DIR/input.bin" \
+"$BUILD_DIR/central_sender" 127.0.0.1 7000 1000 "$KILL_DIR/input.bin" \
     >"$KILL_DIR/central-first.log" 2>&1 &
 CENTRAL_PID="$!"
 PIDS+=("$CENTRAL_PID")
 
-wait_for_log "central section cached section=1" \
-    "$PROXY_KILL_FIRST_LOG" \
+wait_for_checkpoint_section "$KILL_DIR/cache" 2 \
     "second checkpoint"
 
 kill -9 "$PROXY_PID" 2>/dev/null || true

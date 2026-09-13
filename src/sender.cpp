@@ -477,7 +477,7 @@ void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver a
     if(receiver.recovery_state==srcast::ReceiverState::Idle)std::cout<<"IDLE";
     else if(receiver.recovery_state==srcast::ReceiverState::Receiving)std::cout<<"RECEIVING";
     else std::cout<<"COMPLETED";
-    std::cout<<'\n';
+    std::cout<<'\n'<<std::flush;
 
     if(!receiver.active_meta)return;
     const auto &meta=*receiver.active_meta;
