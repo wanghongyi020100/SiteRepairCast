@@ -17,7 +17,7 @@ Release 版的 Central、Proxy 和 Receiver，启动各场景所需的进程，�
 python3 benchmark/run.py --profile benchmark/profiles/smoke.json
 ```
 
-结果保存在 `artifacts/validation/<时间>-<profile>/`：
+结果保存在 `test-runs/artifacts/validation/<时间>-<profile>/`：
 
 - `report.md` 保存汇总结果
 - `summary.csv` 和 `summary.json` 保存各场景统计值
@@ -63,5 +63,42 @@ Receiver 的最终文件是否与输入文件一致。
   被隔离的 2 个 Receiver 每轮共通过 TCP backfill 恢复 256 个 Block。
 - Central 重连后从 Section 4/14 继续，恢复耗时中位数为 11.867 s。
 - Proxy 崩溃重启后从 Section 4/14 恢复，恢复耗时中位数为 11.659 s。
+
+## 四机 Baseline / Peer 校准
+
+先在各机器的仓库中构建。然后在 Machine A（Central）填写
+`benchmark/distributed_config.json` 并运行控制器：
+
+```bash
+cmake -S . -B test-runs/builds/distributed -DCMAKE_BUILD_TYPE=Release
+cmake --build test-runs/builds/distributed -j 4
+python3 benchmark/distributed_compare.py \
+  --config benchmark/distributed_config.json \
+  --output test-runs/artifacts/distributed \
+  --receivers 20 --modes baseline peer \
+  --repetitions 1 --file-size 134217728
+```
+
+配置中的两个 Receiver Host 会均分进程，20 Receiver 即每台 10 个。所有 Receiver 使用
+同一个组播地址和端口，同机进程依靠自动分配的 `peer_udp_port` 唯一寻址。每个 Receiver
+使用固定且互不重叠的 sparse-loss block 集合，Baseline 与 Peer 的缺块集合完全一致。
+
+控制器采集最后一个 Receiver 完成 SHA-256 和原子 rename 为止的总时间，并只读取
+`site_proxy_sender` 的 `/proc/<pid>/stat` 计算 CPU-seconds 和进程平均 CPU。结果写入：
+
+- `raw.csv`：每轮原始数据；
+- `summary.csv`：按模式和 Receiver 数量汇总 Median/P95；
+- `raw/<run>/`：Central、Proxy、Receiver 日志和注册 endpoint。
+
+生成图表：
+
+```bash
+python3 benchmark/plot_distributed.py test-runs/artifacts/distributed/summary.csv
+```
+
+脚本生成 `transfer_time.png`、`proxy_cpu.png`、`proxy_cpu_seconds.png` 和
+`proxy_repair_bytes.png`。测试默认结束清理实际传输文件、Proxy cache、Receiver 输出和
+临时状态；日志和 CSV 保留。超过 20 Receiver、128 MiB 或单轮的命令必须显式加
+`--allow-large-run`，避免误启动大规模矩阵。
 
 丢包由应用层测试钩子确定性注入，慢节点也由缺块模拟。这些数据验证了协议路径，不等同于多机真实网络测试。

@@ -2,9 +2,11 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${1:-"$ROOT_DIR/build-benchmark-smoke"}"
-ARTIFACT_DIR="${2:-"$ROOT_DIR/artifacts/benchmark"}"
-WORK_DIR="$(mktemp -d)"
+BUILD_DIR="${1:-"$ROOT_DIR/test-runs/builds/smoke/benchmark"}"
+ARTIFACT_DIR="${2:-"$ROOT_DIR/test-runs/artifacts/benchmark"}"
+TEST_TMP_DIR="${TMPDIR:-"$ROOT_DIR/test-runs/tmp/smoke"}"
+mkdir -p "$TEST_TMP_DIR"
+WORK_DIR="$(mktemp -d "$TEST_TMP_DIR/benchmark.XXXXXX")"
 
 MCAST_ADDR="239.255.42.99"
 MCAST_PORT=5000
@@ -138,15 +140,19 @@ start_proxy() {
 
     if (($# > 0)); then
         env "$@" "$BUILD_DIR/site_proxy_sender" \
-            "$MCAST_ADDR" "$MCAST_PORT" "$IFACE_ADDR" \
-            "$CONTROL_PORT" "$receiver_count" "$BLOCKS_PER_SECTION" 0 "$MAX_ROUNDS" \
-            --central-listen "$CENTRAL_PORT" "$cache_dir" \
+            --multicast-ip "$MCAST_ADDR" --udp-port "$MCAST_PORT" \
+            --interface-ip "$IFACE_ADDR" --control-port "$CONTROL_PORT" \
+            --receiver-count "$receiver_count" --pace-us "$BLOCKS_PER_SECTION" \
+            --gap-ms 0 --max-repair-rounds "$MAX_ROUNDS" \
+            --central-listen "$CENTRAL_PORT" --cache-dir "$cache_dir" \
             >"$log_file" 2>&1 &
     else
         "$BUILD_DIR/site_proxy_sender" \
-            "$MCAST_ADDR" "$MCAST_PORT" "$IFACE_ADDR" \
-            "$CONTROL_PORT" "$receiver_count" "$BLOCKS_PER_SECTION" 0 "$MAX_ROUNDS" \
-            --central-listen "$CENTRAL_PORT" "$cache_dir" \
+            --multicast-ip "$MCAST_ADDR" --udp-port "$MCAST_PORT" \
+            --interface-ip "$IFACE_ADDR" --control-port "$CONTROL_PORT" \
+            --receiver-count "$receiver_count" --pace-us "$BLOCKS_PER_SECTION" \
+            --gap-ms 0 --max-repair-rounds "$MAX_ROUNDS" \
+            --central-listen "$CENTRAL_PORT" --cache-dir "$cache_dir" \
             >"$log_file" 2>&1 &
     fi
     STARTED_PID="$!"
@@ -165,13 +171,15 @@ start_receiver() {
 
     if (($# > 0)); then
         env "$@" "$BUILD_DIR/receiver_agent" \
-            "$MCAST_ADDR" "$MCAST_PORT" "$output_dir" \
-            "$IFACE_ADDR" "$CONTROL_PORT" "$receiver_ip" \
+            --multicast-ip "$MCAST_ADDR" --udp-port "$MCAST_PORT" \
+            --output-dir "$output_dir" --proxy-ip "$IFACE_ADDR" \
+            --control-port "$CONTROL_PORT" --interface-ip "$receiver_ip" \
             >"$log_file" 2>&1 &
     else
         "$BUILD_DIR/receiver_agent" \
-            "$MCAST_ADDR" "$MCAST_PORT" "$output_dir" \
-            "$IFACE_ADDR" "$CONTROL_PORT" "$receiver_ip" \
+            --multicast-ip "$MCAST_ADDR" --udp-port "$MCAST_PORT" \
+            --output-dir "$output_dir" --proxy-ip "$IFACE_ADDR" \
+            --control-port "$CONTROL_PORT" --interface-ip "$receiver_ip" \
             >"$log_file" 2>&1 &
     fi
     STARTED_PID="$!"
@@ -222,7 +230,8 @@ run_scenario() {
 
     local started_ms
     started_ms="$(date +%s%3N)"
-    "$BUILD_DIR/central_sender" "$IFACE_ADDR" "$CENTRAL_PORT" 0 "$input" \
+    "$BUILD_DIR/central_sender" --proxy "$IFACE_ADDR" "$CENTRAL_PORT" \
+        --pace-us 0 --file "$input" \
         >"$scenario_dir/central.log" 2>&1
     wait "$proxy_pid"
     local receiver_pid

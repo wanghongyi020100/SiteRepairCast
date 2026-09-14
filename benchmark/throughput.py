@@ -396,12 +396,12 @@ def parse_args():
     )
     parser.add_argument(
         "--build-dir", type=Path,
-        default=ROOT / "build-benchmark-validation",
+        default=ROOT / "test-runs" / "builds" / "benchmark-validation",
         help="build directory used by benchmark/run.py"
     )
     parser.add_argument(
         "--output", type=Path,
-        help="output directory; default: artifacts/throughput/<timestamp>"
+        help="output directory; default: test-runs/artifacts/throughput/<timestamp>"
     )
     return parser.parse_args()
 
@@ -426,7 +426,7 @@ def main():
     output_dir = (
         args.output.resolve()
         if args.output
-        else (ROOT / "artifacts" / "throughput" / timestamp).resolve()
+        else (ROOT / "test-runs" / "artifacts" / "throughput" / timestamp).resolve()
     )
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)

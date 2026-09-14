@@ -1,0 +1,36 @@
+{
+  "central": {
+    "host": "local",
+    "repo": "/home/s/share/site"
+  },
+  "proxy": {
+    "host": "PROXY_SSH_HOST",
+    "interface_ip": "PROXY_LAN_IP",
+    "central_connect_ip": "PROXY_LAN_IP",
+    "receiver_connect_ip": "PROXY_LAN_IP",
+    "repo": "/home/s/share/site"
+  },
+  "receiver_hosts": [
+    {
+      "host": "RECEIVER_HOST_1_SSH_HOST",
+      "interface_ip": "RECEIVER_HOST_1_LAN_IP",
+      "repo": "/home/s/share/site"
+    },
+    {
+      "host": "RECEIVER_HOST_2_SSH_HOST",
+      "interface_ip": "RECEIVER_HOST_2_LAN_IP",
+      "repo": "/home/s/share/site"
+    }
+  ],
+  "build_dir": "test-runs/builds/distributed",
+  "work_root": "test-runs/perf_test_17_1_5/runs/distributed",
+  "multicast_ip": "239.255.42.99",
+  "udp_port": 5000,
+  "control_port": 6000,
+  "central_port": 7000,
+  "section_blocks": 4096,
+  "udp_pace_us": 100,
+  "central_pace_us": 0,
+  "max_repair_rounds": 3,
+  "drop_blocks_per_receiver": 32
+}

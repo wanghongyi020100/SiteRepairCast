@@ -110,6 +110,28 @@ build-debug/site_proxy_sender
 build-debug/receiver_agent
 ```
 
+## Quick Start: Four Physical Hosts
+
+四台主机需要位于支持组播的同一 LAN/VLAN。示例地址：Machine A Central `192.168.1.10`、Machine B Proxy `192.168.1.20`、Machine C/D Receiver `192.168.1.31`/`192.168.1.32`。按 B、C、D、A 的顺序启动：
+
+```bash
+# Machine B: Proxy
+./scripts/run_proxy.sh --interface-ip 192.168.1.20 --receivers 2
+
+# Machine C: Receiver 1
+./scripts/run_receiver.sh --interface-ip 192.168.1.31 \
+  --proxy-ip 192.168.1.20 --output-dir ./received
+
+# Machine D: Receiver 2
+./scripts/run_receiver.sh --interface-ip 192.168.1.32 \
+  --proxy-ip 192.168.1.20 --output-dir ./received
+
+# Machine A: Central（最后启动）
+./scripts/run_central.sh --proxy-ip 192.168.1.20 --file ./input.bin
+```
+
+也可复制 `config/four-host/*.env.example` 后使用各脚本的 `--config`。真实主机必须填写各自 LAN IPv4，不能使用本机 smoke test 的 `127.0.0.x`。端口、防火墙、连通性检查和 SHA-256 验证见 [四台物理主机测试指南](docs/FOUR_HOST_TEST.md)。
+
 ## 运行顺序
 
 中心模式按代理、接收端、中心的顺序启动。
@@ -120,35 +142,49 @@ build-debug/receiver_agent
 
 ```bash
 mkdir -p proxy-cache received-1 received-2
-./build-debug/site_proxy_sender 239.255.42.99 5000 127.0.0.1 6000 2 200 0 3 --central-listen 7000 proxy-cache
+./build-debug/site_proxy_sender \
+  --multicast-ip 239.255.42.99 --udp-port 5000 \
+  --interface-ip 127.0.0.1 --control-port 6000 \
+  --receiver-count 2 --pace-us 200 --gap-ms 0 \
+  --max-repair-rounds 3 --section-blocks 4096 \
+  --repair-mode peer --central-listen 7000 --cache-dir proxy-cache
 ```
 
-参数依次为组播地址、UDP 端口、发送网卡地址、控制端口、接收端数量、包间隔微秒、多文件间隔毫秒、最大修复轮数，以及中心监听端口和缓存目录。
-
 `--central-listen 7000` 是一个开关加端口，表示代理进入中心模式并在 TCP `7000` 端口等待中心连接。不写会退回普通发送模式：代理拿本地文件直接往接收端发。
+
+代理默认使用 Peer-assisted Repair。可用 `--repair-mode baseline` 切换到 Proxy Repair baseline；未传 CLI 时仍兼容 `SRCAST_REPAIR_MODE=baseline|peer`，优先级是 CLI、环境变量、默认值。
+代理启动日志会打印 `repair_mode=baseline` 或 `repair_mode=peer`。
 
 ### 2. 启动接收端
 
 ```bash
-./build-debug/receiver_agent 239.255.42.99 5000 received-1 127.0.0.1 6000 127.0.0.2
-./build-debug/receiver_agent 239.255.42.99 5000 received-2 127.0.0.1 6000 127.0.0.3
+./build-debug/receiver_agent --multicast-ip 239.255.42.99 --udp-port 5000 \
+  --interface-ip 127.0.0.2 --proxy-ip 127.0.0.1 \
+  --control-port 6000 --output-dir received-1
+./build-debug/receiver_agent --multicast-ip 239.255.42.99 --udp-port 5000 \
+  --interface-ip 127.0.0.3 --proxy-ip 127.0.0.1 \
+  --control-port 6000 --output-dir received-2
 ```
 
-参数依次为组播地址、UDP 端口、输出目录、代理控制面 IP、代理控制端口、接收网卡地址。接收端不再传入独立 ID，代理使用接收端控制连接来源 IP 和注册的 UDP 端口组成 `ip:port` 标识；同一台机器启动多个接收端时，应为它们配置不同的 loopback 地址。
+同一台 Receiver Host 上的所有进程使用相同组播端口；每个进程还会在指定网卡地址上
+自动绑定一个随机 Peer UDP 端口。代理以 TCP 来源 IP 和该 `peer_udp_port` 组成唯一身份，
+所以同机多个 Receiver 可以使用同一个真实网卡 IP，不需要伪造不同的 loopback 地址。
 
 ### 3. 启动中心
 
 ```bash
 dd if=/dev/urandom of=input.bin bs=1024 count=256 status=none
-./build-debug/central_sender 127.0.0.1 7000 0 input.bin
+./build-debug/central_sender --proxy 127.0.0.1 7000 \
+  --pace-us 0 --section-blocks 4096 --file input.bin
 ```
 
-普通中心模式的参数依次为代理 IP、代理中心监听端口、发送间隔微秒、待分发文件。这里 `7000` 要和代理启动时的 `--central-listen 7000` 对上。
+这里 `7000` 要和代理启动时的 `--central-listen 7000` 对上。`--file` 和 `--proxy` 都可重复。
 
 多园区时重复使用 `--proxy`：
 
 ```bash
-./build-debug/central_sender --pace-us 0 --proxy 127.0.0.1 7000 --proxy 127.0.0.1 7001 input.bin
+./build-debug/central_sender --pace-us 0 --section-blocks 4096 \
+  --proxy 127.0.0.1 7000 --proxy 127.0.0.1 7001 --file input.bin
 ```
 
 `--pace-us 0` 表示中心向代理发送数据时不额外 sleep 限速；每个 `--proxy <ip> <port>` 表示一个园区代理。多个代理会并行接收中心数据，每个园区内部仍由自己的代理负责组播、修复和缓存。
@@ -181,12 +217,13 @@ bash scripts/all_smoke_test.sh
 可以通过 CMake 目标执行：
 
 ```bash
-cmake -S . -B build-test -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-test --target test
-cmake --build build-test --target cleantest
+cmake -S . -B test-runs/builds/cmake-test -DCMAKE_BUILD_TYPE=Debug
+cmake --build test-runs/builds/cmake-test --target test
+cmake --build test-runs/builds/cmake-test --target cleantest
 ```
 
-`cleantest` 会删除各测试构建目录和 `artifacts/benchmark`，再运行完整测试。测试覆盖：
+所有测试构建、临时文件和结果统一放在 `test-runs/`。`cleantest` 会删除其中的
+smoke 构建、临时目录和 benchmark smoke 结果，再运行完整测试。测试覆盖：
 
 - 初始丢包与缺块位图；
 - 组播修复、UDP 单播修复和 TCP 补传；
@@ -222,6 +259,23 @@ Socket 接收队列溢出；调整 `SO_RCVBUF` 和系统 `net.core.rmem_max` 后
 ```bash
 python3 benchmark/throughput.py
 ```
+
+四机 Baseline/Peer 校准前，先在各机器的仓库中构建，再在 Central 机器运行控制器：
+
+```bash
+cmake -S . -B test-runs/builds/distributed -DCMAKE_BUILD_TYPE=Release
+cmake --build test-runs/builds/distributed -j 4
+python3 benchmark/distributed_compare.py \
+  --config benchmark/distributed_config.json \
+  --receivers 20 --modes baseline peer --repetitions 1 \
+  --file-size 134217728
+python3 benchmark/plot_distributed.py test-runs/artifacts/distributed/summary.csv
+```
+
+先把配置文件中的 SSH Host 和真实 LAN IP 替换为实际值。控制器应在 Central 机器运行；
+默认命令只允许 20 Receiver、128 MiB、单轮校准。每轮会验证所有 Receiver 的 SHA-256，
+保存 `raw.csv`、`summary.csv` 和日志，然后删除四台机器上的源文件、cache、Receiver 输出及
+`.part/.state`。大于这个范围的测试必须显式传 `--allow-large-run`。
 
 ## 当前边界
 

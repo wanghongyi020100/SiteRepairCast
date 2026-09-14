@@ -1,6 +1,8 @@
 # build output
 /build-*/
 /artifacts/
+/test-runs/
+/perf_test_17_1_5/
 /build/
 /cmake-build-*/
 CMakeCache.txt

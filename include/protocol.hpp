@@ -27,6 +27,7 @@ namespace srcast
     constexpr std::size_t kEndPacketSize=kCommonHeaderSize+4+4+4;//结束包长度
     constexpr std::size_t kMaxPacketSize=kDataHeaderSize+kPayloadSize;//UDP数据包最大长度
     constexpr std::size_t kMaxControlFrameSize=1024*1024;//TCP控制帧最大长度
+    constexpr std::size_t kMaxPeerRepairBlocks=64;//接收端互传block最大数量
 
     inline std::uint64_t host_to_network64(std::uint64_t value){return htobe64(value);}
 
@@ -303,7 +304,7 @@ namespace srcast
         return packet;
     }
 
-    //TCP 控制帧类型
+    //TCP控制类型
     enum class ControlType:std::uint16_t
     {
         Register=1,//接收端注册
@@ -326,6 +327,7 @@ namespace srcast
         BackfillBegin=18,//TCP补传开始
         BackfillData=19,//TCP补传数据块
         BackfillEnd=20,//TCP补传结束
+        PeerRepairTask=21,//Proxy通知Receiver给另一个Receiver发缺块
     };
 
     //接收端上报的Section状态
@@ -363,6 +365,7 @@ namespace srcast
     {
         std::uint64_t current_transfer_id{};
         std::uint16_t udp_port{};
+        std::uint16_t peer_udp_port{};
         ReceiverState state{ReceiverState::Idle};
     };
 
@@ -507,6 +510,18 @@ namespace srcast
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
+    struct PeerRepairTaskMessage
+    {
+        std::uint64_t transfer_id{};
+        std::uint32_t section_id{};
+        std::uint32_t round_id{};
+        std::uint64_t task_id{};
+        std::uint32_t target_ipv4{};
+        std::uint16_t target_port{};
+
+        std::vector<std::uint32_t>block_ids;
+    };
+
     inline void write_control_header(PacketWriter &writer,ControlType type)
     {
         writer.u32(kControlMagic);
@@ -527,7 +542,7 @@ namespace srcast
         {
             throw std::runtime_error("unsupported control protocol version");
         }else if(raw_type<static_cast<std::uint16_t>(ControlType::Register)||
-                 raw_type>static_cast<std::uint16_t>(ControlType::BackfillEnd))
+                 raw_type>static_cast<std::uint16_t>(ControlType::PeerRepairTask))
         {
             throw std::runtime_error("invalid control message type");
         }
@@ -542,17 +557,18 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_register(const RegisterMessage &message)
     {
-        PacketWriter writer(20);
+        PacketWriter writer(22);
         write_control_header(writer,ControlType::Register);
         writer.u64(message.current_transfer_id);
         writer.u16(message.udp_port);
+        writer.u16(message.peer_udp_port);
         writer.u16(static_cast<std::uint16_t>(message.state));
         return writer.data();
     }
 
     inline RegisterMessage decode_register(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=20)
+        if(frame.size()!=22)
         {
             throw std::runtime_error("invalid REGISTER size");
         }
@@ -564,6 +580,7 @@ namespace srcast
         RegisterMessage message;
         message.current_transfer_id=reader.u64();
         message.udp_port=reader.u16();
+        message.peer_udp_port=reader.u16();
         const auto raw_state=reader.u16();
         if(raw_state<static_cast<std::uint16_t>(ReceiverState::Idle)||
            raw_state>static_cast<std::uint16_t>(ReceiverState::Completed))
@@ -1195,6 +1212,85 @@ namespace srcast
         reader.bytes(message.sha256.data(),message.sha256.size());
         return message;
     }
+
+inline std::vector<std::uint8_t>encode_peer_repair_task(
+    const PeerRepairTaskMessage &message)
+    {
+        if(message.block_ids.empty()||
+        message.block_ids.size()>kMaxPeerRepairBlocks)
+        {
+            throw std::runtime_error("invalid PEER_REPAIR_TASK block count");
+        }
+
+        PacketWriter writer(44+message.block_ids.size()*sizeof(std::uint32_t));
+
+        write_control_header(writer,ControlType::PeerRepairTask);
+
+        writer.u64(message.transfer_id);
+        writer.u32(message.section_id);
+        writer.u32(message.round_id);
+        writer.u64(message.task_id);
+
+        writer.u32(message.target_ipv4);
+        writer.u16(message.target_port);
+        writer.u16(0);
+
+        writer.u32(static_cast<std::uint32_t>(message.block_ids.size()));
+
+        for(const auto block_id:message.block_ids)
+        {
+            writer.u32(block_id);
+        }
+
+        return writer.data();
+    }
+
+    inline PeerRepairTaskMessage decode_peer_repair_task(
+        const std::vector<std::uint8_t>&frame)
+    {
+        if(frame.size()<44)
+        {
+            throw std::runtime_error("PEER_REPAIR_TASK is too short");
+        }
+
+        PacketReader reader(frame.data(),frame.size());
+
+        if(read_control_header(reader)!=ControlType::PeerRepairTask)
+        {
+            throw std::runtime_error("control message is not PEER_REPAIR_TASK");
+        }
+
+        PeerRepairTaskMessage message;
+
+        message.transfer_id=reader.u64();
+        message.section_id=reader.u32();
+        message.round_id=reader.u32();
+        message.task_id=reader.u64();
+
+        message.target_ipv4=reader.u32();
+        message.target_port=reader.u16();
+
+        static_cast<void>(reader.u16());
+
+        const auto block_count=reader.u32();
+
+        if(block_count==0||
+        block_count>kMaxPeerRepairBlocks||
+        reader.remaining()!=static_cast<std::size_t>(block_count)*sizeof(std::uint32_t))
+        {
+            throw std::runtime_error("invalid PEER_REPAIR_TASK block list");
+        }
+
+        message.block_ids.resize(block_count);
+
+        for(auto &block_id:message.block_ids)
+        {
+            block_id=reader.u32();
+        }
+
+        return message;
+    }
+
 
     inline std::vector<std::uint8_t>encode_central_session_end()
     {

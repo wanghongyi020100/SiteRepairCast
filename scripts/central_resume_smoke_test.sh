@@ -2,8 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${1:-"$ROOT_DIR/build-central-resume-smoke"}"
-WORK_DIR="$(mktemp -d)"
+BUILD_DIR="${1:-"$ROOT_DIR/test-runs/builds/smoke/central-resume-smoke"}"
+TEST_TMP_DIR="${TMPDIR:-"$ROOT_DIR/test-runs/tmp/smoke"}"
+mkdir -p "$TEST_TMP_DIR"
+WORK_DIR="$(mktemp -d "$TEST_TMP_DIR/central-resume.XXXXXX")"
 
 PROXY_PID=""
 RECEIVER1_PID=""
@@ -26,9 +28,10 @@ dd if=/dev/urandom of="$WORK_DIR/input.bin" bs=1024 count=256 status=none
 mkdir -p "$WORK_DIR/cache" "$WORK_DIR/receiver-1" "$WORK_DIR/receiver-2"
 
 "$BUILD_DIR/site_proxy_sender" \
-    239.255.42.99 5000 127.0.0.1 \
-    6000 2 100 0 3 \
-    --central-listen 7000 "$WORK_DIR/cache" \
+    --multicast-ip 239.255.42.99 --udp-port 5000 \
+    --interface-ip 127.0.0.1 --control-port 6000 \
+    --receiver-count 2 --pace-us 100 --gap-ms 0 --max-repair-rounds 3 \
+    --central-listen 7000 --cache-dir "$WORK_DIR/cache" \
     >"$WORK_DIR/proxy.log" 2>&1 &
 PROXY_PID="$!"
 
@@ -46,14 +49,16 @@ for _ in {1..50}; do
 done
 
 SRCAST_DROP_INITIAL_BLOCKS=3 "$BUILD_DIR/receiver_agent" \
-    239.255.42.99 5000 "$WORK_DIR/receiver-1" \
-    127.0.0.1 6000 127.0.0.2 \
+    --multicast-ip 239.255.42.99 --udp-port 5000 \
+    --output-dir "$WORK_DIR/receiver-1" --proxy-ip 127.0.0.1 \
+    --control-port 6000 --interface-ip 127.0.0.2 \
     >"$WORK_DIR/receiver-1.log" 2>&1 &
 RECEIVER1_PID="$!"
 
 SRCAST_DROP_INITIAL_BLOCKS=3 "$BUILD_DIR/receiver_agent" \
-    239.255.42.99 5000 "$WORK_DIR/receiver-2" \
-    127.0.0.1 6000 127.0.0.3 \
+    --multicast-ip 239.255.42.99 --udp-port 5000 \
+    --output-dir "$WORK_DIR/receiver-2" --proxy-ip 127.0.0.1 \
+    --control-port 6000 --interface-ip 127.0.0.3 \
     >"$WORK_DIR/receiver-2.log" 2>&1 &
 RECEIVER2_PID="$!"
 
@@ -70,7 +75,8 @@ for _ in {1..50}; do
 done
 
 SRCAST_STOP_AFTER_SECTIONS=2 \
-    "$BUILD_DIR/central_sender" 127.0.0.1 7000 0 "$WORK_DIR/input.bin" \
+    "$BUILD_DIR/central_sender" --proxy 127.0.0.1 7000 --pace-us 0 \
+    --file "$WORK_DIR/input.bin" \
     >"$WORK_DIR/central-first.log" 2>&1
 
 for _ in {1..50}; do
@@ -80,7 +86,8 @@ for _ in {1..50}; do
     sleep 0.1
 done
 
-"$BUILD_DIR/central_sender" 127.0.0.1 7000 0 "$WORK_DIR/input.bin" \
+"$BUILD_DIR/central_sender" --proxy 127.0.0.1 7000 --pace-us 0 \
+    --file "$WORK_DIR/input.bin" \
     >"$WORK_DIR/central-resume.log" 2>&1
 
 wait "$PROXY_PID"

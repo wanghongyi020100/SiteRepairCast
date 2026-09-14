@@ -1,4 +1,5 @@
 #include"checksum.hpp"
+#include"cli_utils.hpp"
 #include"control_io.hpp"
 #include"file_descriptor.hpp"
 #include"file_io.hpp"
@@ -23,6 +24,7 @@
 #include<stdexcept>
 #include<string>
 #include<thread>
+#include<utility>
 #include<vector>
 
 namespace
@@ -88,16 +90,28 @@ std::uint32_t stop_after_sections_for_test()
     return static_cast<std::uint32_t>(value);
 }
 
-void usage(const char *program)
+void usage(std::ostream &output,const char *program)
 {
-    std::cerr
-        <<"Usage: "<<program
-        <<" <proxy_ip> <central_port> <pace_us> <file1> [file2 ...]\n"
-        <<"   or: "<<program
-        <<" --pace-us <pace_us> --proxy <proxy_ip> <central_port>"
-        <<" [--proxy <proxy_ip> <central_port> ...] <file1> [file2 ...]\n"
-        <<"Example: "<<program
-        <<" 127.0.0.1 7000 0 input-a.bin input-b.bin\n";
+    output
+        <<"SiteRepairCast - ROLE: CENTRAL\n\n"
+        <<"Usage:\n"
+        <<"  "<<program<<" --proxy <IPv4> <port> [--proxy <IPv4> <port> ...]\n"
+        <<"      [--pace-us <N>] [--section-blocks <N>]\n"
+        <<"      --file <path> [--file <path> ...]\n"
+        <<"  "<<program<<" <proxy_ip> <central_port> <pace_us> <file1> [file2 ...]\n\n"
+        <<"Required options (named mode):\n"
+        <<"  --proxy <IPv4> <port>   Proxy Central TCP endpoint; repeatable.\n"
+        <<"  --file <path>           Source file; repeatable.\n\n"
+        <<"Optional options and defaults:\n"
+        <<"  --pace-us <N>           Per-block delay, default 0.\n"
+        <<"  --section-blocks <N>    Blocks per section; CLI overrides"
+        <<" SRCAST_SECTION_BLOCKS, default "<<srcast::kDefaultSectionBlockCount<<".\n"
+        <<"  -h, --help              Show this help.\n\n"
+        <<"Examples:\n"
+        <<"  "<<program<<" --proxy 192.168.1.20 7000 --pace-us 0"
+        <<" --section-blocks 4096 --file ./input.bin\n"
+        <<"  "<<program<<" --proxy 192.168.1.20 7000 --proxy 192.168.1.21 7000"
+        <<" --file ./a.bin --file ./b.bin\n";
 }
 
 struct CentralOptions
@@ -110,15 +124,11 @@ struct CentralOptions
 
 CentralOptions parse_options(int argc,char **argv)
 {
-    if(argc<5)
-    {
-        usage(argv[0]);
-        throw std::runtime_error("not enough command-line arguments");
-    }
-
     CentralOptions options;
-    const bool flag_mode=std::string(argv[1])=="--proxy"||
-                         std::string(argv[1])=="--pace-us";
+    options.pace_us=0;
+    options.section_blocks=section_blocks_from_env();
+    if(argc<2)throw std::runtime_error("missing arguments; use --help");
+    const bool flag_mode=argv[1][0]=='-';
 
     if(flag_mode)
     {
@@ -128,35 +138,50 @@ CentralOptions parse_options(int argc,char **argv)
             if(option=="--pace-us")
             {
                 if(++index>=argc)throw std::runtime_error("missing --pace-us value");
-                options.pace_us=std::stoi(argv[index]);
+                options.pace_us=srcast::cli::parse_nonnegative_int("--pace-us",argv[index]);
                 continue;
             }
             if(option=="--proxy")
             {
-                if(index+2>=argc)throw std::runtime_error("missing --proxy value");
-                options.endpoints.push_back({argv[++index],std::stoi(argv[++index])});
+                if(index+2>=argc)throw std::runtime_error("missing --proxy values");
+                const std::string ip=argv[++index];
+                srcast::cli::parse_ipv4("--proxy",ip);
+                const auto port=srcast::cli::parse_port("--proxy port",argv[++index]);
+                options.endpoints.push_back({ip,port});
                 continue;
             }
-            options.files.emplace_back(option);
+            if(option=="--section-blocks")
+            {
+                if(++index>=argc)throw std::runtime_error("missing --section-blocks value");
+                options.section_blocks=srcast::cli::parse_positive_u32(
+                    "--section-blocks",argv[index]);
+                continue;
+            }
+            if(option=="--file")
+            {
+                if(++index>=argc)throw std::runtime_error("missing --file value");
+                options.files.emplace_back(argv[index]);
+                continue;
+            }
+            if(option.rfind("--",0)==0||option=="-h")
+            {
+                throw std::runtime_error("unknown option: "+option);
+            }
+            options.files.emplace_back(option);//兼容原有flag模式的裸文件参数
         }
     }
     else
     {
-        options.endpoints.push_back({argv[1],std::stoi(argv[2])});
-        options.pace_us=std::stoi(argv[3]);
+        if(argc<5)throw std::runtime_error("legacy mode requires proxy, port, pace, and file");
+        const std::string ip=argv[1];
+        srcast::cli::parse_ipv4("proxy_ip",ip);
+        options.endpoints.push_back({ip,srcast::cli::parse_port("central_port",argv[2])});
+        options.pace_us=srcast::cli::parse_nonnegative_int("pace_us",argv[3]);
         for(int index=4;index<argc;index++)options.files.emplace_back(argv[index]);
     }
 
-    if(options.endpoints.empty()||options.files.empty()||options.pace_us<0)
-        throw std::runtime_error("invalid command-line argument");
-
-    for(const auto &endpoint:options.endpoints)
-    {
-        if(endpoint.port<1||endpoint.port>65535||endpoint.ip.empty())
-            throw std::runtime_error("invalid proxy endpoint");
-    }
-
-    options.section_blocks=section_blocks_from_env();
+    if(options.endpoints.empty())throw std::runtime_error("--proxy is required");
+    if(options.files.empty())throw std::runtime_error("--file is required");
     return options;
 }
 
@@ -324,11 +349,36 @@ void run_proxy_session(ProxySession &session,const std::vector<std::string>&file
 
 int main(int argc,char **argv)try
 {
+    if(argc==2&&(std::string(argv[1])=="--help"||std::string(argv[1])=="-h"))
+    {
+        usage(std::cout,argv[0]);
+        return 0;
+    }
     const auto options=parse_options(argc,argv);
+    std::cout
+        <<"========================================\n"
+        <<"SiteRepairCast\n"
+        <<"ROLE: CENTRAL\n"
+        <<"========================================\n";
+    for(std::size_t index=0;index<options.endpoints.size();index++)
+    {
+        std::cout<<"proxy["<<index<<"]="<<options.endpoints[index].ip<<':'
+                 <<options.endpoints[index].port<<'\n';
+    }
+    std::cout<<"pace_us="<<options.pace_us<<'\n'
+             <<"section_blocks="<<options.section_blocks<<'\n'
+             <<"files="<<options.files.size()<<'\n';
+    for(std::size_t index=0;index<options.files.size();index++)
+    {
+        std::cout<<"file["<<index<<"]="<<options.files[index]<<'\n';
+    }
+    std::cout<<std::flush;
     std::vector<ProxySession>sessions;
     for(const auto &endpoint:options.endpoints)
     {
-        sessions.push_back({endpoint});
+        ProxySession session;
+        session.endpoint=endpoint;
+        sessions.push_back(std::move(session));
     }
 
     std::vector<std::thread>workers;

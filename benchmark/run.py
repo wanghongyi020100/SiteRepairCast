@@ -247,11 +247,18 @@ class BenchmarkRunner:
         cache = work / "cache"
         cache.mkdir(exist_ok=True)
         proxy_log = logs / ("proxy%s.log" % suffix)
-        proxy_command = [self.build_dir / "site_proxy_sender", "239.255.42.99", udp_port,
-                         "127.0.0.1", control_port, receivers,
-                         self.profile.get("udp_pace_us", 100), 0,
-                         self.profile.get("max_repair_rounds", 3),
-                         "--central-listen", central_port, cache]
+        proxy_command = [self.build_dir / "site_proxy_sender",
+                         "--multicast-ip", "239.255.42.99",
+                         "--udp-port", udp_port,
+                         "--interface-ip", "127.0.0.1",
+                         "--control-port", control_port,
+                         "--receiver-count", receivers,
+                         "--pace-us", self.profile.get("udp_pace_us", 100),
+                         "--gap-ms", 0,
+                         "--max-repair-rounds", self.profile.get("max_repair_rounds", 3),
+                         "--section-blocks", self.profile.get("section_blocks", 64),
+                         "--central-listen", central_port,
+                         "--cache-dir", cache]
         proxy = processes.spawn("proxy" + suffix, proxy_command, proxy_log,
                                 self.env(**(proxy_env or {})))
         self.wait_log(proxy_log, r"waiting for central sender on port", 10, proxy)
@@ -263,9 +270,14 @@ class BenchmarkRunner:
             receiver_dir.mkdir(exist_ok=True)
             receiver_dirs.append(receiver_dir)
             receiver_ip = "127.0.0.%d" % (receiver_index + 1)
-            receiver_endpoints.append("%s:%s" % (receiver_ip, udp_port))
-            command = [self.build_dir / "receiver_agent", "239.255.42.99", udp_port,
-                       receiver_dir, "127.0.0.1", control_port, receiver_ip]
+            receiver_endpoints.append(receiver_ip)
+            command = [self.build_dir / "receiver_agent",
+                       "--multicast-ip", "239.255.42.99",
+                       "--udp-port", udp_port,
+                       "--output-dir", receiver_dir,
+                       "--proxy-ip", "127.0.0.1",
+                       "--control-port", control_port,
+                       "--interface-ip", receiver_ip]
             item = processes.spawn("receiver-%d%s" % (receiver_index, suffix), command,
                                    logs / ("receiver-%d%s.log" % (receiver_index, suffix)),
                                    self.env(**(receiver_envs or {}).get(receiver_index, {})))
@@ -282,8 +294,11 @@ class BenchmarkRunner:
         }
 
     def central(self, processes, input_path, central_port, logs, suffix="", extra_env=None):
-        command = [self.build_dir / "central_sender", "127.0.0.1", central_port,
-                   self.profile.get("central_pace_us", 0), input_path]
+        command = [self.build_dir / "central_sender",
+                   "--proxy", "127.0.0.1", central_port,
+                   "--pace-us", self.profile.get("central_pace_us", 0),
+                   "--section-blocks", self.profile.get("section_blocks", 64),
+                   "--file", input_path]
         return processes.spawn("central" + suffix, command,
                                logs / ("central%s.log" % suffix), self.env(**(extra_env or {})))
 
@@ -416,7 +431,8 @@ class BenchmarkRunner:
         if scenario["kind"] == "slow_isolated":
             expected = [component["receiver_endpoints"][item - 1]
                         for item in scenario["lagging_receiver_indexes"]]
-            if sorted(metrics["isolated_receivers"]) != sorted(expected):
+            actual = [value.rsplit(":", 1)[0] for value in metrics["isolated_receivers"]]
+            if sorted(actual) != sorted(expected):
                 raise RuntimeError("isolation case did not isolate the configured lagging receivers")
             if metrics["tcp_backfill_blocks"] == 0:
                 raise RuntimeError("isolation case did not execute TCP backfill")
@@ -743,8 +759,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
     parser.add_argument("--output", type=Path,
-                        help="new output directory (default: artifacts/validation/<timestamp>-<profile>)")
-    parser.add_argument("--build-dir", type=Path, default=ROOT / "build-benchmark-validation")
+                        help="new output directory (default: test-runs/artifacts/validation/<timestamp>-<profile>)")
+    parser.add_argument("--build-dir", type=Path,
+                        default=ROOT / "test-runs" / "builds" / "benchmark-validation")
     parser.add_argument("--no-build", action="store_true", help="reuse existing binaries")
     parser.add_argument("--repetitions", type=int, help="override profile repetitions")
     parser.add_argument("--scenario", action="append", help="only run this scenario id; repeatable")
@@ -768,14 +785,15 @@ def main():
             raise SystemExit("unknown scenario(s): " + ", ".join(sorted(missing)))
     validate_profile(profile)
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output = args.output or ROOT / "artifacts" / "validation" / (timestamp + "-" + profile["name"])
+    output = args.output or (ROOT / "test-runs" / "artifacts" / "validation" /
+                             (timestamp + "-" + profile["name"]))
     output = output.resolve()
     try:
         output.mkdir(parents=True, exist_ok=False)
     except FileExistsError:
         raise SystemExit("output directory already exists; choose a new --output: %s" % output)
     (output / "raw").mkdir()
-    lock_path = ROOT / "artifacts" / "validation" / ".run.lock"
+    lock_path = ROOT / "test-runs" / "artifacts" / "validation" / ".run.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as lock:
         try:

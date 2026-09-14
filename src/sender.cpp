@@ -1,4 +1,5 @@
 #include"checksum.hpp"
+#include"cli_utils.hpp"
 #include"control_io.hpp"
 #include"file_descriptor.hpp"
 #include"file_io.hpp"
@@ -20,9 +21,12 @@
 #include<array>
 #include<cerrno>
 #include<chrono>
+#include<condition_variable>
 #include<cstdlib>
 #include<cstdint>
 #include<cstring>
+#include<deque>
+#include<exception>
 #include<filesystem>
 #include<fstream>
 #include<iostream>
@@ -51,6 +55,33 @@ constexpr std::size_t kBackfillThreadCount=4;//TCP补传线程池的最大线程
 constexpr int kMaxTransferRetries=2;//最终SHA失败后的整文件重试次数
 std::mutex output_mutex;
 int receiver_listener_fd=-1;
+
+enum class RepairMode
+{
+    Baseline,
+    Peer,
+};
+
+RepairMode active_repair_mode=RepairMode::Peer;
+
+RepairMode parse_repair_mode(const std::string &value,const std::string &source)
+{
+    if(value=="peer")return RepairMode::Peer;
+    if(value=="baseline")return RepairMode::Baseline;
+    throw std::runtime_error("invalid "+source+": "+value+" (expected baseline or peer)");
+}
+
+RepairMode repair_mode_from_env()
+{
+    const char *raw=std::getenv("SRCAST_REPAIR_MODE");
+    if(raw==nullptr||*raw=='\0')return RepairMode::Peer;
+    return parse_repair_mode(raw,"SRCAST_REPAIR_MODE");
+}
+
+const char *repair_mode_name(RepairMode mode)
+{
+    return mode==RepairMode::Baseline?"baseline":"peer";
+}
 
 enum class DeliveryResult
 {
@@ -105,7 +136,7 @@ std::unordered_set<std::uint32_t>parse_block_set_env(const char *name)
     return blocks;
 }
 
-//环境变量非空且不是 0，认为打开
+//环境变量非空且不是0，认为打开
 bool env_flag_enabled(const char*name)
 {
     const char *raw=std::getenv(name);
@@ -147,6 +178,12 @@ struct CachedCentralFile
     std::uint64_t file_size{};
     std::uint32_t total_blocks{};
     std::array<std::uint8_t,srcast::kSha256Size>sha256{};
+};
+
+struct SectionDispatchTask
+{
+    std::uint32_t section_id{};
+    std::uint64_t bytes{};
 };
 //proxy的checkpoint跟最终缓存文件放一起，重启扫描
 std::string central_checkpoint_path(const std::string &final_path){return final_path+".state";}
@@ -217,6 +254,7 @@ struct ReceiverConnection
     std::string receiver_endpoint;
     FileDescriptor control_fd;
     sockaddr_in udp_destination{};
+    sockaddr_in peer_destination{};
     bool meta_ready{false};
     bool status_received{false};
     bool complete_received{false};
@@ -238,9 +276,9 @@ std::string ipv4_address_string(const in_addr &address)
     return buffer;
 }
 
-std::string receiver_endpoint_key(const sockaddr_in &peer,std::uint16_t udp_port)
+std::string receiver_endpoint_key(const sockaddr_in &peer,std::uint16_t endpoint_port)
 {
-    return ipv4_address_string(peer.sin_addr)+":"+std::to_string(udp_port);
+    return ipv4_address_string(peer.sin_addr)+":"+std::to_string(endpoint_port);
 }
 
 void reset_transfer_state(std::vector<ReceiverConnection>&receivers)
@@ -267,15 +305,15 @@ bool receiver_reported_sha_mismatch(const std::vector<ReceiverConnection>&receiv
     });
 }
 
-bool send_receiver_frame(ReceiverConnection&receiver,const std::vector<std::uint8_t>&frame,
-                         const std::string&operation)
+bool send_receiver_frame(ReceiverConnection &receiver,const std::vector<std::uint8_t>&frame,
+                         const std::string &operation)
 {
     if(receiver.control_fd.get()<0)return false;
     try
     {
         send_control_frame(receiver.control_fd.get(),frame);
         return true;
-    }catch(const std::exception&error)
+    }catch(const std::exception &error)
     {
         std::cerr<<"receiver control connection failed during "<<operation
                  <<" receiver="<<receiver.receiver_endpoint<<": "<<error.what()<<'\n';
@@ -311,20 +349,40 @@ void abandon_incomplete_receivers(std::vector<ReceiverConnection>&receivers)
     }
 }
 
-void usage(const char *program)
+void usage(std::ostream &output,const char *program)
 {
-    std::cerr
-        <<"Usage: "<<program
-        <<" <multicast_ip> <udp_port> <interface_ip> <control_port>"
-        <<" <receiver_count> <pace_us> <gap_ms> <max_repair_rounds>"
-        <<" <file1> [file2 ...]\n"
-        <<"   or: "<<program
-        <<" <multicast_ip> <udp_port> <interface_ip> <control_port>"
-        <<" <receiver_count> <pace_us> <gap_ms> <max_repair_rounds>"
-        <<" --central-listen <central_port> <cache_dir>\n"
-        <<"Example: "<<program
-        <<" 239.255.42.99 5000 127.0.0.1 6000 3 200 1500 3"
-        <<" input-a.bin input-b.bin\n";
+    output
+        <<"SiteRepairCast - ROLE: PROXY\n\n"
+        <<"Usage:\n"
+        <<"  "<<program<<" --interface-ip <IPv4> --receiver-count <N> [options]"
+        <<" --central-listen <port> --cache-dir <dir>\n"
+        <<"  "<<program<<" --interface-ip <IPv4> --receiver-count <N> [options]"
+        <<" --file <path> [--file <path> ...]\n"
+        <<"  "<<program<<" <multicast_ip> <udp_port> <interface_ip> <control_port>"
+        <<" <receiver_count> <pace_us> <gap_ms> <max_repair_rounds> ...\n\n"
+        <<"Required options (named mode):\n"
+        <<"  --interface-ip <IPv4>       Local IPv4 used for multicast output.\n"
+        <<"  --receiver-count <N>        Fixed Receiver process count.\n"
+        <<"  --central-listen <port>     Central TCP listener; requires --cache-dir.\n"
+        <<"    or --file <path>          Standalone source file; repeatable.\n\n"
+        <<"Optional options and defaults:\n"
+        <<"  --multicast-ip <IPv4>       Multicast group, default 239.255.42.99.\n"
+        <<"  --udp-port <port>            Multicast UDP port, default 5000.\n"
+        <<"  --control-port <port>        TCP listener for Receivers, default 6000.\n"
+        <<"  --pace-us <N>                UDP block delay, default 0.\n"
+        <<"  --gap-ms <N>                 Standalone file gap, default 0.\n"
+        <<"  --max-repair-rounds <N>      Repair rounds, default 3.\n"
+        <<"  --section-blocks <N>         CLI overrides SRCAST_SECTION_BLOCKS, default "
+        <<srcast::kDefaultSectionBlockCount<<".\n"
+        <<"  --repair-mode baseline|peer  CLI overrides SRCAST_REPAIR_MODE; default peer.\n"
+        <<"  --cache-dir <dir>            Cache directory in Central mode.\n"
+        <<"  -h, --help                   Show this help.\n\n"
+        <<"Examples:\n"
+        <<"  "<<program<<" --multicast-ip 239.255.42.99 --udp-port 5000"
+        <<" --interface-ip 192.168.1.20 --control-port 6000 --receiver-count 2"
+        <<" --central-listen 7000 --cache-dir ./proxy-cache\n"
+        <<"  "<<program<<" --interface-ip 192.168.1.20 --receiver-count 2"
+        <<" --section-blocks 4096 --repair-mode peer --file ./input.bin\n";
 }
 
 struct SenderOptions
@@ -339,6 +397,7 @@ struct SenderOptions
     int max_repair_rounds{};
     std::vector<std::string>files;
     std::uint32_t section_block_limit{};
+    RepairMode repair_mode{RepairMode::Peer};
     bool central_mode{};
     int central_port{};
     std::string cache_directory;
@@ -346,37 +405,105 @@ struct SenderOptions
 
 SenderOptions parse_options(int argc,char**argv)
 {
-    if(argc<10)
+    SenderOptions options;
+    options.multicast_ip="239.255.42.99";
+    options.udp_port=5000;
+    options.control_port=6000;
+    options.pace_us=0;
+    options.gap_ms=0;
+    options.max_repair_rounds=3;
+    options.section_block_limit=section_blocks_from_env();
+    options.repair_mode=repair_mode_from_env();
+    if(argc<2)throw std::runtime_error("missing arguments; use --help");
+
+    if(argv[1][0]=='-')
     {
-        usage(argv[0]);
-        throw std::runtime_error("not enough command-line arguments");
+        bool interface_set=false;
+        bool receiver_count_set=false;
+        for(int index=1;index<argc;index++)
+        {
+            const std::string option=argv[index];
+            const auto value=[&]() -> std::string
+            {
+                if(++index>=argc)throw std::runtime_error("missing "+option+" value");
+                return argv[index];
+            };
+
+            if(option=="--multicast-ip")options.multicast_ip=value();
+            else if(option=="--udp-port")
+                options.udp_port=srcast::cli::parse_port(option,value());
+            else if(option=="--interface-ip")
+            {
+                options.interface_ip=value();
+                interface_set=true;
+            }
+            else if(option=="--control-port")
+                options.control_port=srcast::cli::parse_port(option,value());
+            else if(option=="--receiver-count")
+            {
+                options.receiver_count=srcast::cli::parse_positive_int(option,value());
+                receiver_count_set=true;
+            }
+            else if(option=="--pace-us")
+                options.pace_us=srcast::cli::parse_nonnegative_int(option,value());
+            else if(option=="--gap-ms")
+                options.gap_ms=srcast::cli::parse_nonnegative_int(option,value());
+            else if(option=="--max-repair-rounds")
+                options.max_repair_rounds=srcast::cli::parse_nonnegative_int(option,value());
+            else if(option=="--section-blocks")
+                options.section_block_limit=srcast::cli::parse_positive_u32(option,value());
+            else if(option=="--central-listen")
+            {
+                options.central_port=srcast::cli::parse_port(option,value());
+                options.central_mode=true;
+            }
+            else if(option=="--cache-dir")options.cache_directory=value();
+            else if(option=="--repair-mode")
+                options.repair_mode=parse_repair_mode(value(),option);
+            else if(option=="--file")options.files.push_back(value());
+            else throw std::runtime_error("unknown option: "+option);
+        }
+
+        if(!interface_set)throw std::runtime_error("--interface-ip is required");
+        if(!receiver_count_set)throw std::runtime_error("--receiver-count is required");
+    }else
+    {
+        if(argc<10)throw std::runtime_error("legacy mode requires at least 9 arguments");
+        options.multicast_ip=argv[1];
+        options.udp_port=srcast::cli::parse_port("udp_port",argv[2]);
+        options.interface_ip=argv[3];
+        options.control_port=srcast::cli::parse_port("control_port",argv[4]);
+        options.receiver_count=srcast::cli::parse_positive_int("receiver_count",argv[5]);
+        options.pace_us=srcast::cli::parse_nonnegative_int("pace_us",argv[6]);
+        options.gap_ms=srcast::cli::parse_nonnegative_int("gap_ms",argv[7]);
+        options.max_repair_rounds=srcast::cli::parse_nonnegative_int(
+            "max_repair_rounds",argv[8]);
+        if(std::string(argv[9])=="--central-listen")
+        {
+            if(argc!=12)throw std::runtime_error("invalid legacy --central-listen arguments");
+            options.central_mode=true;
+            options.central_port=srcast::cli::parse_port("central_port",argv[10]);
+            options.cache_directory=argv[11];
+        }else
+        {
+            for(int index=9;index<argc;index++)options.files.emplace_back(argv[index]);
+        }
     }
 
-    SenderOptions options;
-    options.multicast_ip=argv[1];
-    options.udp_port=std::stoi(argv[2]);
-    options.interface_ip=argv[3];
-    options.control_port=std::stoi(argv[4]);
-    options.receiver_count=std::stoi(argv[5]);
-    options.pace_us=std::stoi(argv[6]);
-    options.gap_ms=std::stoi(argv[7]);
-    options.max_repair_rounds=std::stoi(argv[8]);
-    options.central_mode=argc==12&&std::string(argv[9])=="--central-listen";
-    options.central_port=options.central_mode?std::stoi(argv[10]):0;
-    options.cache_directory=options.central_mode?argv[11]:"";
-    if(!options.central_mode&&std::string(argv[9])=="--central-listen")
+    srcast::cli::parse_multicast_ipv4("--multicast-ip",options.multicast_ip);
+    srcast::cli::parse_ipv4("--interface-ip",options.interface_ip);
+    if(options.central_mode)
     {
-        usage(argv[0]);
-        throw std::runtime_error("invalid central-listen arguments");
-    }
-    for(int index=9;index<argc;index++)options.files.emplace_back(argv[index]);
-    if(options.udp_port<1||options.udp_port>65535||options.control_port<1||options.control_port>65535||
-       options.receiver_count<1||options.pace_us<0||options.gap_ms<0||options.max_repair_rounds<0||
-      (options.central_mode&&(options.central_port<1||options.central_port>65535)))
+        if(options.cache_directory.empty())
+            throw std::runtime_error("--cache-dir is required with --central-listen");
+        if(!options.files.empty())
+            throw std::runtime_error("--file cannot be used with --central-listen");
+    }else
     {
-        throw std::runtime_error("invalid command-line argument");
+        if(options.files.empty())throw std::runtime_error("--file is required in standalone mode");
+        if(!options.cache_directory.empty())
+            throw std::runtime_error("--cache-dir requires --central-listen");
     }
-    options.section_block_limit=section_blocks_from_env();
     return options;
 }
 
@@ -448,9 +575,11 @@ AcceptedReceiver accept_receiver_registration(int listener_fd)
     const auto registration=srcast::decode_register(receive_control_frame(control_fd.get()));
     //tcp恢复阻塞
     set_receive_timeout(control_fd.get(),std::chrono::seconds(0));
-    if(registration.udp_port==0)
+    if(registration.udp_port==0||
+       registration.peer_udp_port==0)
     {
-        throw std::runtime_error("receiver UDP port must not be zero");
+        throw std::runtime_error(
+            "receiver UDP ports must not be zero");
     }else if(registration.state==srcast::ReceiverState::Idle&&registration.current_transfer_id!=0)
     {
         throw std::runtime_error("IDLE receiver has a current transfer");
@@ -458,7 +587,8 @@ AcceptedReceiver accept_receiver_registration(int listener_fd)
     {
         throw std::runtime_error("active receiver has no current transfer");
     }
-    return {registration,std::move(control_fd),peer,receiver_endpoint_key(peer,registration.udp_port)};
+    return {registration,std::move(control_fd),peer,
+            receiver_endpoint_key(peer,registration.peer_udp_port)};
 }
 
 void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver accepted,bool reconnect)
@@ -469,6 +599,8 @@ void install_receiver_connection(ReceiverConnection &receiver,AcceptedReceiver a
     receiver.receiver_endpoint=accepted.receiver_endpoint;
     receiver.udp_destination=accepted.peer;
     receiver.udp_destination.sin_port=htons(accepted.registration.udp_port);
+    receiver.peer_destination=accepted.peer;
+    receiver.peer_destination.sin_port=htons(accepted.registration.peer_udp_port);
     receiver.recovery_state=accepted.registration.state;
     receiver.recovery_transfer_id=accepted.registration.current_transfer_id;
 
@@ -646,6 +778,7 @@ void reset_round_state(std::vector<ReceiverConnection>&receivers)
 }
 
 //最后一段等COMPLETE，中间段只需要缺块位图
+//优化不循环改统计O(1)
 bool round_responses_complete(const std::vector<ReceiverConnection>&receivers,bool final_section)
 {
     for(const auto &receiver:receivers)
@@ -658,8 +791,9 @@ bool round_responses_complete(const std::vector<ReceiverConnection>&receivers,bo
     return true;
 }
 
+//接收接收端tcp控制信息，更新状态
 //控制消息可能晚到，先按transfer/round过滤
-//收到COMPLETE时才回COMPLETE_ACK，receiver可以安全退出当前文件
+//收到complete时才回complete_ack，receiver可以安全退出文件
 void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::uint8_t>&frame,
                           std::uint64_t transfer_id,std::uint32_t section_id,std::uint32_t round_id,
                           std::uint64_t file_size,std::uint32_t section_blocks,
@@ -686,7 +820,7 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
         receiver.status_received=true;
         std::cout<<"section="<<section_id<<" round="<<round_id
                  <<" receiver="<<receiver.receiver_endpoint<<" status=";
-        if(status.status==srcast::SectionStatusCode::Complete)std::cout<<"COMPLETE";
+        if(status.status==srcast::SectionStatusCode::Complete)std::cout<<"COMPLETE";//文件
         else if(status.status==srcast::SectionStatusCode::Missing)
         std::cout<<"MISSING missing_blocks="<<status.missing_count;
         else std::cout<<"FAILED";
@@ -719,7 +853,8 @@ void handle_control_frame(ReceiverConnection &receiver,const std::vector<std::ui
     std::cerr<<"ignore unexpected control message from receiver="<<receiver.receiver_endpoint<<'\n';
 }
 
-template<typename Predicate>//临时建epoll
+//临时建epoll，返回发来控制信息接收端的下标
+template<typename Predicate>//是否监听判断函数不确定(等待发缺块，下一文件)
 std::vector<std::size_t>wait_for_receiver_events(std::vector<ReceiverConnection>&receivers,
      Predicate should_watch,int timeout_ms,const std::string &operation)
 {
@@ -762,7 +897,7 @@ std::vector<std::size_t>wait_for_receiver_events(std::vector<ReceiverConnection>
 
     std::vector<epoll_event>events(watched_count);
     int ready=0;
-    for(;;)
+    for(;;)//先监听全部再阻塞
     {
         ready=::epoll_wait(epoll_fd.get(),events.data(),static_cast<int>(events.size()),timeout_ms);
         if(ready>=0)break;
@@ -799,8 +934,7 @@ std::vector<std::size_t>wait_for_receiver_events(std::vector<ReceiverConnection>
     return indexes;
 }
 
-//使用epoll时等待所有接收端的本轮状态报告
-//超时不是失败，后面慢接收端逻辑会处理
+//等所有接收端本轮报告
 void collect_round_reports(std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id,
      std::uint32_t section_id,std::uint32_t round_id,std::uint64_t file_size,std::uint32_t total_blocks,
      std::uint32_t section_block_limit,const std::array<std::uint8_t,srcast::kSha256Size>&digest)
@@ -817,7 +951,7 @@ void collect_round_reports(std::vector<ReceiverConnection>&receivers,std::uint64
 
         const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
         const auto timeout_ms=static_cast<int>(std::max<std::int64_t>(1,remaining.count()));
-        const auto ready_indexes=wait_for_receiver_events(receivers,
+        const auto ready_indexes=wait_for_receiver_events(receivers,//阻塞
             [](const ReceiverConnection &receiver)
             {return !receiver.completed&&!receiver.isolated&&!receiver.abandoned;},
             timeout_ms,"receiver reports");
@@ -873,9 +1007,8 @@ void isolate_slow_receivers(std::vector<ReceiverConnection>&receivers,std::uint3
 }
 
 //block->receiver列表，修复时决定组播单播
-std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
-    const std::vector<ReceiverConnection>&receivers,std::uint32_t total_blocks,std::uint32_t section_id,
-    std::uint32_t section_block_limit)
+std::vector<std::vector<std::size_t>>aggregate_missing_blocks(const std::vector<ReceiverConnection>&receivers,
+            std::uint32_t total_blocks,std::uint32_t section_id,std::uint32_t section_block_limit)
 {
     const auto section_blocks=srcast::section_block_count(total_blocks,section_id,section_block_limit);
     std::vector<std::vector<std::size_t>>missing_by_block(section_blocks);
@@ -894,18 +1027,19 @@ std::vector<std::vector<std::size_t>>aggregate_missing_blocks(
     return missing_by_block;
 }
 
-//UDP END多发，真正的排上报靠TCP SECTION_END
 //receiver收到SECTION_END等quiet period，再计算缺块
 void send_end_round(int udp_fd,const sockaddr_in &multicast_destination,
      std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id,std::uint32_t section_id,
      std::uint32_t round_id,std::uint32_t total_blocks)
 {
+    static_cast<void>(udp_fd);
+    static_cast<void>(multicast_destination);
     const auto end_packet=srcast::encode_end(transfer_id,section_id,round_id,total_blocks);
-    for(int repetition=0;repetition<10;repetition++)
-    {
-        send_udp_packet(udp_fd,multicast_destination,end_packet);
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
+    // for(int repetition=0;repetition<10;repetition++)
+    // {
+    //     send_udp_packet(udp_fd,multicast_destination,end_packet);
+    //     std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // }
 
     const auto section_end=srcast::encode_section_end({transfer_id,section_id,round_id,total_blocks});
     for(auto &receiver:receivers)
@@ -929,9 +1063,12 @@ void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
         send_receiver_frame(receiver,repair_begin,"REPAIR_BEGIN");
     }
 
+    //1:a,b block i 接收端谁缺
     const auto missing_by_block=aggregate_missing_blocks(receivers,total_blocks,
                                                          section_id,section_block_limit);
     std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
+    std::uint64_t proxy_repair_payload_bytes=0;
+    std::uint64_t proxy_repair_pread_blocks=0;
     std::uint64_t multicast_packets=0;
     std::uint64_t unicast_packets=0;
     const auto first_block=srcast::section_first_block(section_id,section_block_limit);
@@ -944,17 +1081,22 @@ void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
         std::uint64_t offset{};
         std::uint16_t payload_size{};
         read_block(input_fd,file_path,file_size,block_id,buffer,offset,payload_size);
+        proxy_repair_pread_blocks++;
         const auto packet=srcast::encode_data(transfer_id,section_id,block_id,offset,buffer.data(),
                                               payload_size,srcast::crc32(buffer.data(),payload_size));
         if(targets.size()>=kMulticastRepairThreshold)
         {
             send_udp_packet(udp_fd,multicast_destination,packet);
             multicast_packets++;
+            proxy_repair_payload_bytes+=payload_size;
         }else
         {
-            const auto receiver_index=targets.front();
-            send_udp_packet(udp_fd,receivers[receiver_index].udp_destination,packet);
-            unicast_packets++;
+            for(const auto receiver_index:targets)
+            {
+                send_udp_packet(udp_fd,receivers[receiver_index].peer_destination,packet);
+                unicast_packets++;
+                proxy_repair_payload_bytes+=payload_size;
+            }
         }
 
         if(pace_us>0)
@@ -963,14 +1105,398 @@ void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
         }
     }
 
-    std::cout<<"repair round="<<round_id<<" multicast_packets="<<multicast_packets
-             <<" unicast_packets="<<unicast_packets<<'\n';
+    std::ostringstream metric;
+    metric<<"REPAIR_METRIC round="<<round_id
+          <<" mode=baseline"
+          <<" proxy_repair_payload_bytes="<<proxy_repair_payload_bytes
+          <<" proxy_repair_pread_blocks="<<proxy_repair_pread_blocks
+          <<" peer_blocks=0"
+          <<" multicast_packets="<<multicast_packets
+          <<" proxy_unicast_packets="<<unicast_packets;
+    std::cout<<metric.str()<<'\n'<<std::flush;
     send_end_round(udp_fd,multicast_destination,receivers,transfer_id,section_id,round_id,total_blocks);
 }
 
-//初 DATA的故障注入只给smoke，实际环境变量为空
+//接收端互传，多缺块组播->零散Peer->单播
+void re_to_re(int udp_fd,const sockaddr_in &multicast_destination,std::vector<ReceiverConnection>&receivers,int input_fd,
+              const std::string &file_path,std::uint64_t file_size,std::uint64_t transfer_id,std::uint32_t total_blocks,
+              std::uint32_t section_id,std::uint32_t round_id,int pace_us,std::uint32_t section_block_limit)
+{
+    constexpr std::size_t kMinPeerBlocks=16;
+    constexpr std::size_t kMaxPeerTargetsPerSource=2;
+
+    const auto repair_begin=srcast::encode_repair_begin({transfer_id,section_id,round_id});
+
+    for(auto &receiver:receivers)
+    {
+        if(!receiver.completed&&!receiver.isolated&&!receiver.abandoned)
+        {
+            send_receiver_frame(receiver,repair_begin,"REPAIR_BEGIN");
+        }
+    }
+
+    //mis[i(block)]:1,2,3...
+    const auto missing_by_block=aggregate_missing_blocks(receivers,total_blocks,section_id,section_block_limit);
+    const auto first_block=srcast::section_first_block(section_id,section_block_limit);
+    const auto section_blocks=srcast::section_block_count(total_blocks,section_id,section_block_limit);
+
+    // peer_plan[source][target] = source准备给target发送的block
+    std::vector<std::vector<std::vector<std::uint32_t>>>peer_plan(
+           receivers.size(),std::vector<std::vector<std::uint32_t>>(receivers.size()));
+
+    // fallback[target] = 最后由Proxy UDP单播的block
+    std::vector<std::vector<std::uint32_t>>fallback(receivers.size());
+    std::vector<std::size_t>source_target_count(receivers.size(),0);
+    std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
+
+    std::uint64_t multicast_packets=0;
+    std::uint64_t peer_blocks_count=0;
+    std::uint64_t unicast_packets=0;
+    std::uint64_t proxy_repair_payload_bytes=0;
+    std::uint64_t proxy_repair_pread_blocks=0;
+    std::uint64_t task_sequence=0;
+
+    //判断某个Receiver是否拥有这个block
+    auto source_has_block=
+    [&](std::size_t source_index,std::uint32_t local_block)
+    {
+        const auto &source=receivers[source_index];
+
+        if(source.completed||
+           source.isolated||
+           source.abandoned||
+           source.control_fd.get()<0||
+           !source.status_received||
+           !source.status)
+        {
+            return false;
+        }
+
+        if(source.status->transfer_id!=transfer_id||
+           source.status->section_id!=section_id||
+           source.status->round_id+1U!=round_id)
+        {
+            return false;
+        }
+
+        //Complete说明这个Section所有block都有
+        if(source.status->status==
+           srcast::SectionStatusCode::Complete)
+        {
+            return true;
+        }
+
+        if(source.status->status!=
+           srcast::SectionStatusCode::Missing)
+        {
+            return false;
+        }
+
+        //bitmap中为1表示它缺，因此取反就是拥有
+        return !srcast::bitmap_test(
+            source.status->missing_bitmap,
+            local_block);
+    };
+
+    //========================================================
+    //1.Proxy先处理公共缺块
+    //========================================================
+    for(std::uint32_t local_block=0;
+        local_block<section_blocks;
+        local_block++)
+    {
+        const auto &targets=
+            missing_by_block[local_block];
+
+        if(targets.empty())continue;
+
+        const auto block_id=
+            first_block+local_block;
+
+        //多人缺同一个block -> Proxy组播
+        if(targets.size()>=kMulticastRepairThreshold)
+        {
+            std::uint64_t offset{};
+            std::uint16_t payload_size{};
+
+            read_block(
+                input_fd,
+                file_path,
+                file_size,
+                block_id,
+                buffer,
+                offset,
+                payload_size);
+            proxy_repair_pread_blocks++;
+
+            const auto packet=
+                srcast::encode_data(
+                    transfer_id,
+                    section_id,
+                    block_id,
+                    offset,
+                    buffer.data(),
+                    payload_size,
+                    srcast::crc32(
+                        buffer.data(),
+                        payload_size));
+
+            send_udp_packet(
+                udp_fd,
+                multicast_destination,
+                packet);
+
+            multicast_packets++;
+            proxy_repair_payload_bytes+=payload_size;
+
+            if(pace_us>0)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(
+                        pace_us));
+            }
+
+            continue;
+        }
+
+        //====================================================
+        //2.零散缺块尝试Receiver互传
+        //====================================================
+        for(const auto target_index:targets)
+        {
+            std::size_t source_index=
+                receivers.size();
+
+            //优先继续使用已经给这个target服务的source
+            //这样尽量把多个block合成一个PeerRepairTask
+            for(std::size_t i=0;
+                i<receivers.size();
+                i++)
+            {
+                if(i==target_index)continue;
+
+                if(peer_plan[i][target_index].empty())
+                {
+                    continue;
+                }
+
+                if(source_has_block(
+                    i,local_block))
+                {
+                    source_index=i;
+                    break;
+                }
+            }
+
+            //没有旧source，再寻找新source
+            if(source_index==receivers.size())
+            {
+                for(std::size_t i=0;
+                    i<receivers.size();
+                    i++)
+                {
+                    if(i==target_index)continue;
+
+                    if(source_target_count[i]>=
+                       kMaxPeerTargetsPerSource)
+                    {
+                        continue;
+                    }
+
+                    if(!source_has_block(
+                        i,local_block))
+                    {
+                        continue;
+                    }
+
+                    source_index=i;
+                    source_target_count[i]++;
+                    break;
+                }
+            }
+
+            //没人拥有或者没人适合做source
+            if(source_index==receivers.size())
+            {
+                fallback[target_index].
+                    push_back(block_id);
+
+                continue;
+            }
+
+            peer_plan[source_index]
+                     [target_index]
+                     .push_back(block_id);
+        }
+    }
+
+    //========================================================
+    //3.Proxy通过TCP下发PeerRepairTask
+    //========================================================
+    for(std::size_t source=0;
+        source<receivers.size();
+        source++)
+    {
+        for(std::size_t target=0;
+            target<receivers.size();
+            target++)
+        {
+            auto &blocks=
+                peer_plan[source][target];
+
+            if(blocks.empty())continue;
+
+            //太少就不值得调度Peer
+            if(blocks.size()<kMinPeerBlocks)
+            {
+                fallback[target].insert(
+                    fallback[target].end(),
+                    blocks.begin(),
+                    blocks.end());
+
+                continue;
+            }
+
+            //一个task最多64个block
+            for(std::size_t begin=0;
+                begin<blocks.size();
+                begin+=srcast::kMaxPeerRepairBlocks)
+            {
+                const auto end=
+                    std::min(
+                        begin+
+                        srcast::kMaxPeerRepairBlocks,
+                        blocks.size());
+
+                srcast::PeerRepairTaskMessage task{};
+
+                task.transfer_id=transfer_id;
+                task.section_id=section_id;
+                task.round_id=round_id;
+                task.task_id=++task_sequence;
+
+                //udp_destination里面是网络字节序
+                //协议结构内部统一使用主机字节序
+                task.target_ipv4=
+                    ntohl(
+                        receivers[target].
+                        peer_destination.
+                        sin_addr.s_addr);
+
+                task.target_port=
+                    ntohs(
+                        receivers[target].
+                        peer_destination.
+                        sin_port);
+
+                task.block_ids.assign(
+                    blocks.begin()+begin,
+                    blocks.begin()+end);
+
+                const auto frame=
+                    srcast::
+                    encode_peer_repair_task(task);
+
+                //发送成功只表示任务下发成功
+                //真正是否收到DATA以后看target下一轮bitmap
+                if(send_receiver_frame(
+                    receivers[source],
+                    frame,
+                    "PEER_REPAIR_TASK"))
+                {
+                    peer_blocks_count+=
+                        end-begin;
+                }
+                else
+                {
+                    //连source的控制连接都失败了
+                    //直接交回Proxy单播
+                    fallback[target].insert(
+                        fallback[target].end(),
+                        blocks.begin()+begin,
+                        blocks.begin()+end);
+                }
+            }
+        }
+    }
+
+    //========================================================
+    //4.Peer没处理的block由Proxy UDP单播
+    //========================================================
+    for(std::size_t target=0;
+        target<receivers.size();
+        target++)
+    {
+        for(const auto block_id:
+            fallback[target])
+        {
+            std::uint64_t offset{};
+            std::uint16_t payload_size{};
+
+            read_block(
+                input_fd,
+                file_path,
+                file_size,
+                block_id,
+                buffer,
+                offset,
+                payload_size);
+            proxy_repair_pread_blocks++;
+
+            const auto packet=
+                srcast::encode_data(
+                    transfer_id,
+                    section_id,
+                    block_id,
+                    offset,
+                    buffer.data(),
+                    payload_size,
+                    srcast::crc32(
+                        buffer.data(),
+                        payload_size));
+
+            send_udp_packet(
+                udp_fd,
+                receivers[target].
+                peer_destination,
+                packet);
+
+            unicast_packets++;
+            proxy_repair_payload_bytes+=payload_size;
+
+            if(pace_us>0)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(
+                        pace_us));
+            }
+        }
+    }
+
+    std::ostringstream metric;
+    metric<<"REPAIR_METRIC round="<<round_id
+          <<" mode=peer"
+          <<" proxy_repair_payload_bytes="<<proxy_repair_payload_bytes
+          <<" proxy_repair_pread_blocks="<<proxy_repair_pread_blocks
+          <<" peer_blocks="<<peer_blocks_count
+          <<" multicast_packets="<<multicast_packets
+          <<" proxy_unicast_packets="<<unicast_packets;
+    std::cout<<metric.str()<<'\n'<<std::flush;
+
+    send_end_round(
+        udp_fd,
+        multicast_destination,
+        receivers,
+        transfer_id,
+        section_id,
+        round_id,
+        total_blocks);
+}
+
+//初DATA的故障注入只给smoke，实际环境变量为空
 bool all_receivers_completed(const std::vector<ReceiverConnection>&receivers);
 
+//一个section内的顺序
 DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destination,
     std::vector<ReceiverConnection>&receivers,int input_fd,const std::string &file_path,
     std::uint64_t file_size,std::uint64_t transfer_id,std::uint32_t total_blocks,
@@ -981,9 +1507,9 @@ DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destin
     const auto first_block=srcast::section_first_block(section_id,section_block_limit);
     const auto section_blocks=srcast::section_block_count(total_blocks,section_id,section_block_limit);
     const auto backfill_after_rounds=backfill_rounds(max_repair_rounds);
-    const auto duplicate_blocks=parse_block_set_env("SRCAST_DUPLICATE_DATA_BLOCKS");
-    const auto corrupt_blocks=parse_block_set_env("SRCAST_CORRUPT_DATA_BLOCKS");
-    const bool reverse_initial_data=env_flag_enabled("SRCAST_REVERSE_INITIAL_DATA");
+    const auto duplicate_blocks=parse_block_set_env("SRCAST_DUPLICATE_DATA_BLOCKS");//测试用幂等
+    const auto corrupt_blocks=parse_block_set_env("SRCAST_CORRUPT_DATA_BLOCKS");//测试用发坏包
+    const bool reverse_initial_data=env_flag_enabled("SRCAST_REVERSE_INITIAL_DATA");//测试用模拟乱序到达
     std::cout<<"sending section="<<section_id<<" blocks="<<section_blocks<<'\n';
     if(reverse_initial_data)std::cout<<"fault injection reversed DATA section="<<section_id<<'\n';
 
@@ -993,7 +1519,7 @@ DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destin
     local_blocks.push_back(local_block);
     if(reverse_initial_data)std::reverse(local_blocks.begin(),local_blocks.end());
 
-    for(const auto local_block:local_blocks)
+    for(const auto local_block:local_blocks)//发送block
     {
         const auto block_id=first_block+local_block;
         std::uint64_t offset{};
@@ -1022,13 +1548,11 @@ DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destin
 
     send_end_round(udp_fd,multicast_destination,receivers,transfer_id,section_id,0,total_blocks);
     std::cout<<"section="<<section_id<<" initial multicast finished; collecting round 0 reports\n";
-    collect_round_reports(receivers,transfer_id,section_id,0,
-                          file_size,total_blocks,section_block_limit,digest);
+    collect_round_reports(receivers,transfer_id,section_id,0,file_size,total_blocks,section_block_limit,digest);
     if(receiver_reported_sha_mismatch(receivers))return DeliveryResult::Sha256Mismatch;
-    isolate_slow_receivers(receivers,total_blocks,section_id,0,section_block_limit,
-                           backfill_after_rounds);
-    for(int repair_round=1;repair_round<=max_repair_rounds&&
-                           !all_receivers_completed(receivers);repair_round++)
+    //特殊，组播=0
+    isolate_slow_receivers(receivers,total_blocks,section_id,0,section_block_limit,backfill_after_rounds);
+    for(int repair_round=1;repair_round<=max_repair_rounds&&!all_receivers_completed(receivers);repair_round++)
     {
         const bool section_done=std::all_of(receivers.begin(),receivers.end(),
             [](const ReceiverConnection& receiver)
@@ -1038,25 +1562,37 @@ DeliveryResult distribute_section(int udp_fd,const sockaddr_in &multicast_destin
             });
         if(section_done)return DeliveryResult::Success;
 
-        send_repair_round(udp_fd,multicast_destination,receivers,input_fd,file_path,file_size,
-                          transfer_id,total_blocks,section_id,static_cast<std::uint32_t>(repair_round),
-                          pace_us,section_block_limit);
+        //修复并要求报告
+        if(active_repair_mode==RepairMode::Baseline)
+        {
+            send_repair_round(udp_fd,multicast_destination,receivers,input_fd,file_path,file_size,
+                transfer_id,total_blocks,section_id,static_cast<std::uint32_t>(repair_round),
+                pace_us,section_block_limit);
+        }else
+        {
+            re_to_re(udp_fd,multicast_destination,receivers,input_fd,file_path,file_size,transfer_id,
+                total_blocks,section_id,static_cast<std::uint32_t>(repair_round),pace_us,
+                section_block_limit);
+        }
+        //收集报告
         collect_round_reports(receivers,transfer_id,section_id,static_cast<std::uint32_t>(repair_round),
                               file_size,total_blocks,section_block_limit,digest);
+        //sha验证冲突退回重来，多次失败报错
         if(receiver_reported_sha_mismatch(receivers))return DeliveryResult::Sha256Mismatch;
-        isolate_slow_receivers(receivers,total_blocks,section_id,
-            static_cast<std::uint32_t>(repair_round),section_block_limit,backfill_after_rounds);
+        //慢节点隔离
+        isolate_slow_receivers(receivers,total_blocks,section_id,static_cast<std::uint32_t>(repair_round),
+                               section_block_limit,backfill_after_rounds);
     }
 
-    const bool section_delivered=std::all_of(receivers.begin(),receivers.end(),
-        [](const ReceiverConnection &receiver)
+    const bool section_delivered=std::all_of(receivers.begin(),receivers.end(),[](const ReceiverConnection &receiver)
         {
-            return receiver.completed||receiver.isolated||receiver.abandoned||(receiver.status&&
-                   receiver.status->status==srcast::SectionStatusCode::Complete);
+            return receiver.completed||receiver.isolated||receiver.abandoned||
+                  (receiver.status&&receiver.status->status==srcast::SectionStatusCode::Complete);
         });
     return section_delivered?DeliveryResult::Success:DeliveryResult::Failed;
 }
 
+//优化 要改成cnt O(1)统计
 bool all_receivers_completed(const std::vector<ReceiverConnection>&receivers)
 {
     return std::all_of(receivers.begin(),receivers.end(),
@@ -1367,8 +1903,7 @@ DeliveryResult send_file_attempt(int udp_fd,const sockaddr_in &multicast_destina
     begin_receiver_transfer(receivers,transfer_id,file_size,total_blocks,section_block_limit,digest);
     DeliveryResult result=DeliveryResult::Success;
     const auto section_count=srcast::section_count_for_blocks(total_blocks,section_block_limit);
-    for(std::uint32_t section_id=0;section_id<section_count&&!all_receivers_completed(receivers);
-                                   section_id++)
+    for(std::uint32_t section_id=0;section_id<section_count&&!all_receivers_completed(receivers);section_id++)
     {
         result=distribute_section(udp_fd,multicast_destination,receivers,input_fd,file_path,file_size,
             transfer_id,total_blocks,digest,section_id,pace_us,max_repair_rounds,section_block_limit);
@@ -1393,7 +1928,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     const std::string &cache_directory,int udp_fd,const sockaddr_in &multicast_destination,
     std::vector<ReceiverConnection>& receivers,int pace_us,int max_repair_rounds)
 {
-//中心可能发新文件，也可能只发 SESSION_END
+//中心可能发新文件，也可能只发SESSION_END
     const auto first_frame=receive_control_frame(central_fd);
     const auto first_type=srcast::peek_control_type(first_frame);
     if(first_type==srcast::ControlType::CentralSessionEnd)
@@ -1432,7 +1967,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     if(std::filesystem::exists(final_path))
     {
         const auto actual_digest=srcast::sha256_file(final_path);
-        if(actual_digest==meta.sha256)
+        if(actual_digest==meta.sha256)///文件存在不重传
         {
             accept_pending_receiver_reconnects(receivers);
             srcast::FileMetaMessage file_meta;
@@ -1466,7 +2001,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     }
     std::uint64_t existing_size=0;
     std::error_code existing_error;
-    if(std::filesystem::exists(temporary_path,existing_error))
+    if(std::filesystem::exists(temporary_path,existing_error))//存了一部分
     existing_size=std::filesystem::file_size(temporary_path,existing_error);
     if(existing_error)
     {
@@ -1474,8 +2009,8 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     }
     const auto additional=existing_size<meta.file_size?meta.file_size-existing_size:0;
     require_storage_limit(cache_directory,additional,
-                         "SRCAST_CACHE_LIMIT_BYTES","central cache directory");
-    require_disk_space(cache_directory,meta.file_size,"central cache directory");
+                         "SRCAST_CACHE_LIMIT_BYTES","central cache directory");//目录容量检查
+    require_disk_space(cache_directory,meta.file_size,"central cache directory");//磁盘容量检查
     const auto checkpoint_path=central_checkpoint_path(final_path);
     const auto section_count=srcast::
                              section_count_for_blocks(meta.total_blocks,meta.section_block_count);
@@ -1487,7 +2022,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     {
         system_error("open central cache temporary file");
     }
-    if(::ftruncate(output.get(),static_cast<off_t>(meta.file_size))!=0)
+    if(::ftruncate(output.get(),static_cast<off_t>(meta.file_size))!=0)//设置文件大小
     {
         system_error("ftruncate central cache");
     }
@@ -1508,25 +2043,173 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     std::cout<<"central transfer started transfer_id="<<meta.transfer_id<<" size="<<meta.file_size
              <<" blocks="<<meta.total_blocks<<" resume_section="
              <<resume_section<<'/'<<section_count<<'\n';
+    //开始接收端
     begin_receiver_transfer(receivers,meta.transfer_id,meta.file_size,meta.total_blocks,
                             meta.section_block_count,meta.sha256);
-    send_control_frame(central_fd,srcast::encode_central_resume({meta.transfer_id,resume_section,
-                       section_count,meta.file_size,std::array<std::uint8_t,srcast::kSha256Size>{}}));
-//之后只接收resume_section及后面的DATA
-    auto fail_after_meta=[&](const std::string &reason,
-                             const std::array<std::uint8_t,srcast::kSha256Size>&sha256)
+    std::deque<SectionDispatchTask>dispatch_queue;
+    std::mutex dispatch_mutex;
+    std::condition_variable dispatch_condition;
+    std::uint64_t pending_bytes=0;
+    bool producer_done=false;
+    bool cancel_dispatch=false;
+    bool worker_failed=false;
+    std::exception_ptr worker_exception;
+    DeliveryResult section_result=DeliveryResult::Success;
+    std::thread dispatch_thread;
+
+    const auto maximum_section_bytes=std::min<std::uint64_t>(meta.file_size,
+        static_cast<std::uint64_t>(meta.section_block_count)*meta.block_size);
+    const auto high_watermark=maximum_section_bytes*4U;
+    const auto low_watermark=maximum_section_bytes*2U;
+    const auto section_bytes=[&](std::uint32_t section_id)
     {
-        send_central_status(central_fd,meta.transfer_id,srcast::CentralStatusCode::Failed,
-                            meta.file_size,sha256);
-        notify_failed_receivers(receivers,meta.transfer_id);
-        wait_for_receivers_ready(receivers,meta.transfer_id);
+        const auto first_block=srcast::section_first_block(section_id,meta.section_block_count);
+        const auto section_blocks=srcast::section_block_count(meta.total_blocks,section_id,
+                                                              meta.section_block_count);
+        const auto offset=static_cast<std::uint64_t>(first_block)*meta.block_size;
+        return std::min<std::uint64_t>(static_cast<std::uint64_t>(section_blocks)*meta.block_size,
+                                      meta.file_size-offset);
+    };
+
+    //第二个线程proxy<->receivers
+    auto dispatch_worker=[&]
+    {
+        for(;;)
+        {
+            SectionDispatchTask task;
+            {
+                std::unique_lock<std::mutex>lock(dispatch_mutex);
+                dispatch_condition.wait(lock,[&]
+                {return cancel_dispatch||producer_done||!dispatch_queue.empty();});
+                if(cancel_dispatch)return;
+                if(dispatch_queue.empty())return;
+                task=dispatch_queue.front();
+                dispatch_queue.pop_front();
+            }
+
+            DeliveryResult result=DeliveryResult::Failed;
+            try
+            {
+                result=distribute_section(udp_fd,multicast_destination,receivers,
+                    output.get(),temporary_path,meta.file_size,meta.transfer_id,meta.total_blocks,
+                    meta.sha256,task.section_id,pace_us,max_repair_rounds,meta.section_block_count);
+            }catch(...)
+            {
+                {
+                    std::lock_guard<std::mutex>lock(dispatch_mutex);
+                    pending_bytes-=task.bytes;
+                    worker_failed=true;
+                    worker_exception=std::current_exception();
+                    cancel_dispatch=true;
+                }
+                dispatch_condition.notify_all();
+                return;
+            }
+
+            const bool failed=result==DeliveryResult::Failed;
+            {
+                std::lock_guard<std::mutex>lock(dispatch_mutex);
+                pending_bytes-=task.bytes;
+                section_result=result;
+                if(failed)
+                {
+                    worker_failed=true;
+                    worker_exception=std::make_exception_ptr
+                        (std::runtime_error("receiver repair failed for central section"));
+                    cancel_dispatch=true;
+                }
+            }
+            dispatch_condition.notify_all();
+            if(failed)return;
+        }
+    };
+    auto stop_dispatch=[&]
+    {
+        {
+            std::lock_guard<std::mutex>lock(dispatch_mutex);
+            cancel_dispatch=true;
+        }
+        dispatch_condition.notify_all();
+        if(dispatch_thread.joinable())dispatch_thread.join();
+    };
+
+    bool failure_status_requested=false;
+    std::array<std::uint8_t,srcast::kSha256Size>failure_sha256{};
+    bool dispatch_phase_complete=false;
+    auto fail_after_meta=[&](const std::string &reason,const std::array<std::uint8_t,srcast::kSha256Size>&sha256)
+    {
+        failure_status_requested=true;
+        failure_sha256=sha256;
         throw std::runtime_error(reason);
     };
+    auto throw_if_worker_failed=[&]
+    {
+        std::exception_ptr error;
+        {
+            std::lock_guard<std::mutex>lock(dispatch_mutex);
+            if(worker_failed)error=worker_exception;
+        }
+        if(!error)return;
+        failure_status_requested=true;
+        failure_sha256={};
+        std::rethrow_exception(error);
+    };
+    auto enqueue_section=[&](SectionDispatchTask task)
+    {
+        std::exception_ptr error;
+        {
+            std::unique_lock<std::mutex>lock(dispatch_mutex);
+            if(pending_bytes+task.bytes>high_watermark)
+            {
+                dispatch_condition.wait(lock,[&]
+                {return worker_failed||cancel_dispatch||pending_bytes<=low_watermark;});
+            }
+            if(worker_failed)error=worker_exception;
+            else if(cancel_dispatch)
+            error=std::make_exception_ptr(std::runtime_error("section dispatch cancelled"));
+            else
+            {
+                dispatch_queue.push_back(task);
+                pending_bytes+=task.bytes;
+            }
+        }
+        if(error)
+        {
+            failure_status_requested=true;
+            failure_sha256={};
+            std::rethrow_exception(error);
+        }
+        dispatch_condition.notify_one();
+    };
+    auto complete_dispatch=[&]
+    {
+        {
+            std::lock_guard<std::mutex>lock(dispatch_mutex);
+            producer_done=true;
+        }
+        dispatch_condition.notify_all();
+        if(dispatch_thread.joinable())dispatch_thread.join();
+        throw_if_worker_failed();
+    };
+
+    try
+    {
+
+        dispatch_thread=std::thread(dispatch_worker);
+        //续传初始位置
+        send_control_frame(central_fd,srcast::encode_central_resume({meta.transfer_id,resume_section,
+                           section_count,meta.file_size,std::array<std::uint8_t,srcast::kSha256Size>{}}));
+        for(std::uint32_t section_id=0;section_id<resume_section;section_id++)
+        enqueue_section({section_id,section_bytes(section_id)});//不管接收端，再发一遍
+
+        //之后只接收resume_section及后面的DATA
 
     std::uint32_t next_section_id=resume_section;
     for(;;)
     {
+        throw_if_worker_failed();
         const auto frame=receive_control_frame(central_fd);
+        throw_if_worker_failed();
         const auto type=srcast::peek_control_type(frame);
         if(type==srcast::ControlType::CentralData)
         {
@@ -1568,7 +2251,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             throw std::runtime_error("unexpected central control message during file transfer");
         }
 
-//中心声明section 结束后，proxy才检查这一段有没有收齐
+        //中心声明(tcp)section end，proxy检查这一段有没有收齐
         const auto end=srcast::decode_central_file_end(frame);
         if(end.transfer_id!=meta.transfer_id||end.total_blocks!=meta.total_blocks||
            end.section_id!=next_section_id||end.section_id>=section_count||rejected_count!=0)
@@ -1587,25 +2270,21 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
                 std::array<std::uint8_t,srcast::kSha256Size>{});
         }
 
-//proxy先本地分发已缓存section，再向中心ACK
-        const auto section_result=distribute_section(udp_fd,multicast_destination,receivers,
-            output.get(),temporary_path,meta.file_size,meta.transfer_id,meta.total_blocks,meta.sha256,
-            end.section_id,pace_us,max_repair_rounds,meta.section_block_count);
+        if(::fsync(output.get())!=0)
+        {
+            system_error("fsync central cache section");
+        }
         const bool final_section=end.section_id+1U==section_count;
-        if(section_result==DeliveryResult::Failed||
-           (section_result==DeliveryResult::Sha256Mismatch&&!final_section))
-        fail_after_meta("receiver repair failed for central section",
-                        std::array<std::uint8_t,srcast::kSha256Size>{});
-
+        const auto completed_section=end.section_id+1U;
         if(!final_section)
         {
-            const auto completed_section=end.section_id+1U;
-            if(::fsync(output.get())!=0)
-            {
-                system_error("fsync central cache section");
-            }
-//非最终section只记checkpoint，不SHA
+            //非最终section只记checkpoint，不SHA
             save_central_checkpoint(checkpoint_path,meta,completed_section);
+        }
+
+        enqueue_section({end.section_id,section_bytes(end.section_id)});
+        if(!final_section)
+        {
             send_central_status(central_fd,meta.transfer_id,srcast::CentralStatusCode::Cached,
                                 meta.file_size,std::array<std::uint8_t,srcast::kSha256Size>{});
             std::cout<<"central section cached section="<<end.section_id<<'\n';
@@ -1613,6 +2292,9 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             continue;
         }
 
+        //是结束
+        complete_dispatch();
+        dispatch_phase_complete=true;
         if(section_result==DeliveryResult::Sha256Mismatch)
         finish_failed_transfer(receivers,meta.transfer_id);
 
@@ -1625,7 +2307,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             system_error("fsync central cache");
         }
         output.reset(-1);
-//最后一段收完后文件校验，再rename成正式缓存
+        //最后一段收完后文件校验，再rename成正式缓存
         const auto actual_digest=srcast::sha256_file(temporary_path);
         if(actual_digest!=meta.sha256)
         fail_after_meta("central cached file SHA-256 mismatch",actual_digest);
@@ -1639,7 +2321,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
 
         std::error_code remove_error;
         std::filesystem::remove(checkpoint_path,remove_error);
-//正式缓存可读后，再给慢receiver TCP backfill
+        //正式缓存可读后，再给慢receiver TCP backfill
         FileDescriptor backfill_input(::open(final_path.c_str(),O_RDONLY|O_CLOEXEC));
         if(backfill_input.get()<0)
         {
@@ -1692,6 +2374,35 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
                  <<" rejected="<<rejected_count<<'\n';
         return CachedCentralFile{final_path,meta.transfer_id,meta.file_size,
                                  meta.total_blocks,actual_digest};
+    }
+    }catch(...)
+    {
+        const auto error=std::current_exception();
+        stop_dispatch();//关和接收端间新建的线程
+        if(failure_status_requested)//真坏非连接返回错误
+        {
+            try
+            {
+                send_central_status(central_fd,meta.transfer_id,srcast::CentralStatusCode::Failed,
+                                    meta.file_size,failure_sha256);
+            }catch(const std::exception &status_error)
+            {
+                std::cerr<<"failed to report central transfer failure: "<<status_error.what()<<'\n';
+            }
+        }
+        if(!dispatch_phase_complete||failure_status_requested)//接收端还没结束
+        {
+            try
+            {
+                notify_failed_receivers(receivers,meta.transfer_id);
+                wait_for_receivers_ready(receivers,meta.transfer_id);
+            }catch(const std::exception &receiver_error)
+            {
+                std::cerr<<"failed to finish receiver transfer after pipeline error: "
+                         <<receiver_error.what()<<'\n';
+            }
+        }
+        std::rethrow_exception(error);
     }
 }
 
@@ -1775,7 +2486,7 @@ void wait_for_meta_ready(std::vector<ReceiverConnection>&receivers,std::uint64_t
     }
 }
 
-//单文件流程 FILE_META 组播 修复 backfill READY
+//发文件->
 void send_file(int udp_fd,const sockaddr_in &multicast_destination,
     std::vector<ReceiverConnection>&receivers,const std::string &file_path,int pace_us,
     int max_repair_rounds,std::uint32_t section_block_limit)
@@ -1831,7 +2542,13 @@ void send_file(int udp_fd,const sockaddr_in &multicast_destination,
 
 int main(int argc,char**argv) try
 {
+    if(argc==2&&(std::string(argv[1])=="--help"||std::string(argv[1])=="-h"))
+    {
+        usage(std::cout,argv[0]);
+        return 0;
+    }
     const auto options=parse_options(argc,argv);
+    active_repair_mode=options.repair_mode;
     const auto &multicast_ip=options.multicast_ip;//组播地址
     const auto udp_port=options.udp_port;//udp端口
     const auto &interface_ip=options.interface_ip;//本机网卡ip
@@ -1844,6 +2561,44 @@ int main(int argc,char**argv) try
     const auto central_mode=options.central_mode;//中心模式？不启用园区内发
     const auto central_port=options.central_port;//中心端口
     const auto &cache_directory=options.cache_directory;//要发的文件
+
+    std::cout
+        <<"========================================\n"
+        <<"SiteRepairCast\n"
+        <<"ROLE: PROXY\n"
+        <<"========================================\n"
+        <<"multicast="<<multicast_ip<<':'<<udp_port<<'\n'
+        <<"interface_ip="<<interface_ip<<'\n'
+        <<"receiver_control_listen=0.0.0.0:"<<control_port<<'\n'
+        <<"expected_receivers="<<receiver_count<<'\n';
+    if(central_mode)
+    {
+        std::cout<<"central_listen=0.0.0.0:"<<central_port<<'\n'
+                 <<"cache_dir="<<cache_directory<<'\n';
+    }else
+    {
+        std::cout<<"central_listen=disabled\n"
+                 <<"files="<<options.files.size()<<'\n';
+    }
+    std::cout<<"pace_us="<<pace_us<<'\n'
+             <<"gap_ms="<<gap_ms<<'\n'
+             <<"section_blocks="<<section_block_limit<<'\n'
+             <<"max_repair_rounds="<<max_repair_rounds<<'\n'
+             <<"repair_mode="<<repair_mode_name(active_repair_mode)<<'\n'<<std::flush;
+
+    if(central_mode)
+    {
+        std::error_code directory_error;
+        std::filesystem::create_directories(cache_directory,directory_error);
+        if(directory_error)
+        {
+            throw std::runtime_error("create --cache-dir failed: "+directory_error.message());
+        }
+        if(!std::filesystem::is_directory(cache_directory))
+        {
+            throw std::runtime_error("--cache-dir is not a directory: "+cache_directory);
+        }
+    }
 
     FileDescriptor udp_fd(::socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0));
     if(udp_fd.get()<0)
@@ -1926,7 +2681,7 @@ int main(int argc,char**argv) try
                         central_session_finished=true;
                         break;
                     }
-                }catch(const std::exception& error)
+                }catch(const std::exception &error)
                 {
                     std::cerr<<"central session interrupted:"<<error.what()<<"; waiting for reconnect\n";
                     break;

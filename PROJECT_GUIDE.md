@@ -8,7 +8,7 @@
 
 ## 项目目录树
 
-使用 `tree -a -I '.git|build*|artifacts|__pycache__|*.pyc'` 生成；构建目录和 artifacts 未列入。
+使用 `tree -a -I '.git|build*|test-runs|__pycache__|*.pyc'` 生成；构建目录和 test-runs 未列入。
 
 ```text
 .
@@ -16,8 +16,20 @@
 ├── .gitignore
 ├── CMakeLists.txt
 ├── README.md
+├── config
+│   └── four-host
+│       ├── central.env.example
+│       ├── proxy.env.example
+│       ├── receiver1.env.example
+│       └── receiver2.env.example
+├── docs
+│   └── FOUR_HOST_TEST.md
 ├── benchmark
 │   ├── README.md
+│   ├── distributed_compare.py
+│   ├── distributed_config.json
+│   ├── plot_distributed.py
+│   ├── process_cpu.py
 │   ├── export_project_code.sh
 │   ├── profiles
 │   │   ├── smoke.json
@@ -26,6 +38,7 @@
 │   └── throughput.py
 ├── include
 │   ├── checksum.hpp
+│   ├── cli_utils.hpp
 │   ├── control_io.hpp
 │   ├── file_descriptor.hpp
 │   ├── file_io.hpp
@@ -43,6 +56,10 @@
 │   ├── fault_recovery_smoke_test.sh
 │   ├── local_repair_smoke_test.sh
 │   ├── multi_proxy_smoke_test.sh
+│   ├── role_cli_smoke_test.sh
+│   ├── run_central.sh
+│   ├── run_proxy.sh
+│   ├── run_receiver.sh
 │   ├── section_flow_smoke_test.sh
 │   └── tcp_backfill_smoke_test.sh
 └── src
@@ -60,12 +77,16 @@
 | `.gitignore` | Git 配置 | 排除构建目录、产物和本地运行文件。 | 覆盖 build、artifacts、缓存、接收目录等生成物。 |
 | `CMakeLists.txt` | 构建配置 | 定义 C++17 项目、公共库和三个可执行程序。 | 目标包括 central_sender、site_proxy_sender、receiver_agent、test、cleantest。 |
 | `README.md` | 项目说明 | 说明架构、运行顺序、测试和性能背景。 | 包含中心、代理、接收端的数据流和示例命令。 |
+| `config/four-host/*.env.example` | Shell 配置示例 | 提供四台物理主机的地址、端口和目录模板。 | 分别对应 Central、Proxy 和两个 Receiver。 |
+| `docs/FOUR_HOST_TEST.md` | 部署文档 | 四台 Linux 主机的构建、网络检查、启动和摘要验证手册。 | 说明真实 LAN IP、端口、防火墙和常见错误。 |
 | `benchmark/README.md` | Benchmark 文档 | 说明 benchmark 脚本的输入、输出和场景。 | 配合 profiles 和 run.py 生成测试数据。 |
 | `benchmark/profiles/smoke.json` | Benchmark 配置 | 小规模 benchmark smoke profile。 | 定义文件大小、接收端数量、轮次和 section_blocks。 |
 | `benchmark/profiles/standard.json` | Benchmark 配置 | 标准 benchmark profile。 | 定义更完整的吞吐场景参数。 |
 | `benchmark/run.py` | Python 脚本 | 自动构建、启动代理/接收端/中心并汇总 benchmark。 | BenchmarkRunner、ScenarioResult、main。 |
+| `benchmark/distributed_compare.py` | Python 脚本 | 通过 SSH 编排四台主机上的 Baseline/Peer 对比。 | 使用三个角色的 named CLI，并在每轮后清理远端传输文件。 |
 | `benchmark/throughput.py` | Python 脚本 | 解析 benchmark CSV 并输出吞吐摘要。 | median、load_rows、main。 |
 | `include/checksum.hpp` | C++ 头文件 | 声明 SHA-256、CRC32 和摘要十六进制工具。 | srcast::sha256_file、srcast::sha256_fd、srcast::crc32、srcast::hex_digest。 |
+| `include/cli_utils.hpp` | C++ 头文件 | 共用命令行数值、端口、IPv4 和组播地址验证。 | parse_port、parse_nonnegative_int、parse_positive_u32、parse_multicast_ipv4。 |
 | `include/control_io.hpp` | C++ 头文件 | TCP 控制帧收发工具。 | write_all、read_all、send_control_frame、receive_control_frame。 |
 | `include/file_descriptor.hpp` | C++ 头文件 | RAII 文件描述符封装。 | FileDescriptor 禁止拷贝、支持移动并在析构时 close。 |
 | `include/file_io.hpp` | C++ 头文件 | 块读取和定位写入工具。 | read_block、read_bytes_at、write_all_at。 |
@@ -82,6 +103,8 @@
 | `scripts/fault_recovery_smoke_test.sh` | Shell 测试 | 验证乱序、重复和损坏 DATA 的恢复行为。 | 使用 SRCAST_REVERSE_INITIAL_DATA、SRCAST_DUPLICATE_DATA_BLOCKS、SRCAST_CORRUPT_DATA_BLOCKS。 |
 | `scripts/local_repair_smoke_test.sh` | Shell 测试 | 验证代理本地文件分发和 UDP 修复。 | 使用 SRCAST_DROP_INITIAL_BLOCKS 注入接收端首轮缺块。 |
 | `scripts/multi_proxy_smoke_test.sh` | Shell 测试 | 验证 central_sender 的多代理 flag 模式。 | 使用多个 --proxy 和 --pace-us 启动中心。 |
+| `scripts/role_cli_smoke_test.sh` | Shell 测试 | 验证三个角色的 named CLI、帮助、错误诊断和端到端 SHA-256。 | 使用两 Receiver 的小型 loopback 传输。 |
+| `scripts/run_central.sh`、`run_proxy.sh`、`run_receiver.sh` | Shell 启动器 | 从任意当前目录启动对应角色，支持可信 `.env` 配置。 | 配置优先级为默认值、config、CLI。 |
 | `scripts/section_flow_smoke_test.sh` | Shell 测试 | 验证 section 级流程和可配置 section 大小。 | 结合 SRCAST_SECTION_BLOCKS 检查分段分发。 |
 | `scripts/tcp_backfill_smoke_test.sh` | Shell 测试 | 验证慢接收端隔离后的 TCP backfill。 | 使用 SRCAST_BACKFILL_ROUNDS 和大量初始丢块。 |
 | `src/central_sender.cpp` | C++ 源码 | 中心发送端，连接一个或多个代理并按 section 推送文件。 | ProxyEndpoint、ProxySession、parse_options、send_file、run_proxy_session、main。 |
@@ -96,7 +119,7 @@ central_sender 负责计算文件大小、总 block 数、SHA-256 和 transfer_i
 
 site_proxy_sender 是园区代理。普通模式下它从本地文件读取并发送，中心模式下它监听 --central-listen 端口接收中心数据，先写入缓存和 checkpoint，再向固定数量接收端发送 FILE_META、UDP DATA/END，并根据接收端状态执行 UDP 修复或 TCP backfill。
 
-receiver_agent 连接代理 TCP 控制端并注册自己的 UDP 端口，同时加入或绑定 UDP 接收地址。它把 DATA 按 block 偏移写入 .part，按 section 维护位图和状态，校验整文件 SHA-256 后把 .part 原子改名为最终 transfer-*.bin。
+receiver_agent 连接代理 TCP 控制端，加入 multicast，并在真实 `interface_ip` 上为 peer repair 绑定内核分配的随机 UDP 端口。它把 DATA 按 block 偏移写入 .part，按 section 维护位图和状态，校验整文件 SHA-256 后把 .part 原子改名为最终 transfer-*.bin。
 
 数据流为：中心到代理使用 TCP；代理到接收端初始数据和 UDP 修复使用组播或单播 UDP；代理与接收端的注册、状态、完成确认和 TCP backfill 使用 TCP 控制帧。
 
@@ -108,7 +131,7 @@ TCP 控制帧使用 kControlMagic、kVersion、ControlType 和长度前缀，最
 
 receiver ID 由代理侧的 receiver_endpoint_key 生成，使用接收端 TCP peer IP 和注册消息携带的 UDP port 组成 ip:port；源码没有单独的命令行 receiver identity 参数。
 
-section 由 section_blocks_from_env 或默认 kDefaultSectionBlockCount 控制。中心和代理使用 section_id、section_first_block、section_block_count 和 section_count_for_blocks 分段，中心每完成一个 section 等待代理缓存确认，接收端每轮 section drain 后报告状态。
+section 由 named CLI `--section-blocks`、`SRCAST_SECTION_BLOCKS` 或默认 kDefaultSectionBlockCount 控制，优先级依次降低。中心和代理使用 section_id、section_first_block、section_block_count 和 section_count_for_blocks 分段，中心每完成一个 section 等待代理缓存确认，接收端每轮 section drain 后报告状态。
 
 ACK/NACK 语义通过状态消息实现：接收端用 SectionStatusMessage 上报 Complete、Missing 或 Failed 以及缺块位图；代理用 CompleteAck 确认 ReceiverComplete，用 TransferResult 通知失败或完成，用 CentralStatus 向中心确认 section 缓存结果。源码没有名为 NACK 的独立 ControlType。
 
@@ -136,33 +159,39 @@ cmake --build build-debug -j "$(nproc)"
 代理普通模式：
 
 ```bash
-./build-debug/site_proxy_sender 239.255.42.99 5000 127.0.0.1 6000 2 200 0 3 input.bin
+./build-debug/site_proxy_sender --multicast-ip 239.255.42.99 --udp-port 5000 \
+  --interface-ip 127.0.0.1 --control-port 6000 --receiver-count 2 \
+  --pace-us 200 --gap-ms 0 --max-repair-rounds 3 --section-blocks 4096 \
+  --repair-mode peer --file input.bin
 ```
 
 代理中心模式：
 
 ```bash
-./build-debug/site_proxy_sender 239.255.42.99 5000 127.0.0.1 6000 2 200 0 3 --central-listen 7000 proxy-cache
+./build-debug/site_proxy_sender --multicast-ip 239.255.42.99 --udp-port 5000 \
+  --interface-ip 127.0.0.1 --control-port 6000 --receiver-count 2 \
+  --pace-us 200 --gap-ms 0 --max-repair-rounds 3 --section-blocks 4096 \
+  --repair-mode peer --central-listen 7000 --cache-dir proxy-cache
 ```
 
 接收端：
 
 ```bash
-./build-debug/receiver_agent 239.255.42.99 5000 received-1 127.0.0.1 6000 127.0.0.2
+./build-debug/receiver_agent --multicast-ip 239.255.42.99 --udp-port 5000 \
+  --output-dir received-1 --proxy-ip 127.0.0.1 --control-port 6000 \
+  --interface-ip 127.0.0.2
 ```
 
-central_sender 旧位置参数形式：
+中心端：
 
 ```bash
-./build-debug/central_sender 127.0.0.1 7000 0 input.bin
+./build-debug/central_sender --proxy 127.0.0.1 7000 --pace-us 0 \
+  --section-blocks 4096 --file input.bin
+./build-debug/central_sender --proxy 127.0.0.1 7000 --proxy 127.0.0.1 7001 \
+  --pace-us 0 --section-blocks 4096 --file input.bin
 ```
 
-central_sender flag 形式：
-
-```bash
-./build-debug/central_sender --proxy 127.0.0.1 7000 --pace-us 0 input.bin
-./build-debug/central_sender --proxy 127.0.0.1 7000 --proxy 127.0.0.1 7001 --pace-us 0 input.bin
-```
+三个程序都提供 `--help`，仓库内部脚本和 benchmark 使用 named CLI；程序仍兼容原有位置参数。四台物理主机的快速入口见 `scripts/run_*.sh` 和 `docs/FOUR_HOST_TEST.md`。
 
 测试：
 
@@ -179,6 +208,7 @@ cmake --build build-debug --target cleantest
 | 变量 | 使用位置 | 用途 |
 | --- | --- | --- |
 | SRCAST_SECTION_BLOCKS | include/transfer_options.hpp、脚本和 benchmark | 覆盖默认每个 section 的 block 数；空值使用默认值，非法值会报错。 |
+| SRCAST_REPAIR_MODE | src/sender.cpp、脚本和 benchmark | 选择 baseline 或 peer；`--repair-mode` 存在时由 CLI 覆盖。 |
 | SRCAST_STOP_AFTER_SECTIONS | src/central_sender.cpp、central_resume_smoke_test.sh、benchmark/run.py | 测试 hook：中心确认指定数量 section 后主动断开，用于验证续传。 |
 | SRCAST_BACKFILL_ROUNDS | src/sender.cpp、tcp_backfill_smoke_test.sh、benchmark | 控制 UDP 修复多少轮后切到 TCP backfill；未设置时使用 max_repair_rounds。 |
 | SRCAST_DUPLICATE_DATA_BLOCKS | src/sender.cpp、fault_recovery_smoke_test.sh、benchmark_report.sh | 测试 hook：代理对指定 block 发送重复 DATA。 |
@@ -190,7 +220,7 @@ cmake --build build-debug --target cleantest
 
 ## 运行时目录和状态文件
 
-build-debug、build-review、build-*-smoke 等 build* 目录是 CMake 生成物，不是源文件。artifacts/ 是测试和 benchmark 输出目录，也是生成物。
+build-debug 等 build* 目录是普通 CMake 生成物，不是源文件。测试和 benchmark 的构建、临时文件及结果统一保存在 test-runs/，也是生成物。
 
 代理缓存目录由 site_proxy_sender 参数指定；中心模式会保存最终缓存文件、同名 .part 临时文件和 .state checkpoint。.state 先写 .tmp 再 rename，用于只承认已提交 section。
 
@@ -200,6 +230,4 @@ README 示例中的 proxy-cache、received-1、received-2，以及脚本创建�
 
 ## 已知边界
 
-本次任务只修复 central_sender CLI 兼容性、注册日志刷新，并生成本地项目说明。
-
-TCP 回填期间代理退出的问题未在本次修复；空文件重连问题也未在本次修复。这里仅作为后续排查提醒，不声明已经解决。
+三个进程仍是独立 Linux 可执行程序，面向可信 LAN/VLAN，不提供 TLS、身份认证、服务发现或自动防火墙配置。物理四机环境是否允许 multicast 取决于实际交换网络，需按 `docs/FOUR_HOST_TEST.md` 在目标环境验证；本地 loopback smoke 不能替代真实网络验收。

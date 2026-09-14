@@ -2,8 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${1:-"$ROOT_DIR/build-local-repair-smoke"}"
-WORK_DIR="$(mktemp -d)"
+BUILD_DIR="${1:-"$ROOT_DIR/test-runs/builds/smoke/local-repair-smoke"}"
+TEST_TMP_DIR="${TMPDIR:-"$ROOT_DIR/test-runs/tmp/smoke"}"
+mkdir -p "$TEST_TMP_DIR"
+WORK_DIR="$(mktemp -d "$TEST_TMP_DIR/local-repair.XXXXXX")"
 
 SENDER_PID=""
 RECEIVER1_PID=""
@@ -26,9 +28,10 @@ dd if=/dev/urandom of="$WORK_DIR/input.bin" bs=1024 count=256 status=none
 mkdir -p "$WORK_DIR/receiver-1" "$WORK_DIR/receiver-2"
 
 "$BUILD_DIR/site_proxy_sender" \
-    239.255.42.99 5000 127.0.0.1 \
-    6000 2 100 0 3 \
-    "$WORK_DIR/input.bin" \
+    --multicast-ip 239.255.42.99 --udp-port 5000 \
+    --interface-ip 127.0.0.1 --control-port 6000 \
+    --receiver-count 2 --pace-us 100 --gap-ms 0 --max-repair-rounds 3 \
+    --file "$WORK_DIR/input.bin" \
     >"$WORK_DIR/sender.log" 2>&1 &
 SENDER_PID="$!"
 
@@ -53,14 +56,16 @@ if ! grep -q "waiting for 2 receiver control connections" \
 fi
 
 SRCAST_DROP_INITIAL_BLOCKS=3 "$BUILD_DIR/receiver_agent" \
-    239.255.42.99 5000 "$WORK_DIR/receiver-1" \
-    127.0.0.1 6000 127.0.0.2 \
+    --multicast-ip 239.255.42.99 --udp-port 5000 \
+    --output-dir "$WORK_DIR/receiver-1" --proxy-ip 127.0.0.1 \
+    --control-port 6000 --interface-ip 127.0.0.2 \
     >"$WORK_DIR/receiver-1.log" 2>&1 &
 RECEIVER1_PID="$!"
 
 SRCAST_DROP_INITIAL_BLOCKS=3 "$BUILD_DIR/receiver_agent" \
-    239.255.42.99 5000 "$WORK_DIR/receiver-2" \
-    127.0.0.1 6000 127.0.0.3 \
+    --multicast-ip 239.255.42.99 --udp-port 5000 \
+    --output-dir "$WORK_DIR/receiver-2" --proxy-ip 127.0.0.1 \
+    --control-port 6000 --interface-ip 127.0.0.3 \
     >"$WORK_DIR/receiver-2.log" 2>&1 &
 RECEIVER2_PID="$!"
 
@@ -85,7 +90,7 @@ fi
 [[ "$(sha256sum "$OUTPUT2" | awk '{print $1}')" == "$INPUT_SHA" ]]
 
 grep -q "MISSING missing_blocks=" "$WORK_DIR/sender.log"
-grep -q "repair round=1" "$WORK_DIR/sender.log"
+grep -q "REPAIR_METRIC round=1" "$WORK_DIR/sender.log"
 grep -q "test hook dropped initial DATA block_id=3" "$WORK_DIR/receiver-1.log"
 grep -q "test hook dropped initial DATA block_id=3" "$WORK_DIR/receiver-2.log"
 

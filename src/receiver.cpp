@@ -1,4 +1,5 @@
 #include"checksum.hpp"
+#include"cli_utils.hpp"
 #include"control_io.hpp"
 #include"file_descriptor.hpp"
 #include"file_io.hpp"
@@ -163,14 +164,29 @@ void remove_epoll_interest(int epoll_fd,int fd)
     }
 }
 
-void usage(const char *program)
+void usage(std::ostream &output,const char *program)
 {
-    std::cerr
-        <<"Usage: "<<program
-        <<" <multicast_ip> <udp_port> <output_directory>"
-        <<" <proxy_ip> <control_port> [interface_ip]\n"
-        <<"Example: "<<program
-        <<" 239.255.42.99 5000 received 127.0.0.1 6000 127.0.0.1\n";
+    output
+        <<"SiteRepairCast - ROLE: RECEIVER\n\n"
+        <<"Usage:\n"
+        <<"  "<<program<<" --interface-ip <IPv4> --proxy-ip <IPv4>"
+        <<" --output-dir <dir> [options]\n"
+        <<"  "<<program<<" <multicast_ip> <udp_port> <output_directory>"
+        <<" <proxy_ip> <control_port> [interface_ip]\n\n"
+        <<"Required options (named mode):\n"
+        <<"  --interface-ip <IPv4>  This Receiver machine's local IPv4 address;"
+        <<" required on physical hosts.\n"
+        <<"  --proxy-ip <IPv4>      Proxy control-plane IPv4 address.\n"
+        <<"  --output-dir <dir>     Receiver output directory.\n\n"
+        <<"Optional options and defaults:\n"
+        <<"  --multicast-ip <IPv4>  Multicast group, default 239.255.42.99.\n"
+        <<"  --udp-port <port>       Shared multicast UDP port, default 5000.\n"
+        <<"  --control-port <port>   Proxy Receiver-control TCP port, default 6000.\n"
+        <<"  -h, --help              Show this help.\n\n"
+        <<"Examples:\n"
+        <<"  "<<program<<" --multicast-ip 239.255.42.99 --udp-port 5000"
+        <<" --interface-ip 192.168.1.31 --proxy-ip 192.168.1.20"
+        <<" --control-port 6000 --output-dir ./received\n";
 }
 
 struct ReceiverOptions
@@ -185,24 +201,64 @@ struct ReceiverOptions
 
 ReceiverOptions parse_options(int argc,char**argv)
 {
-    if(argc<6||argc>7)
+    ReceiverOptions options;
+    options.multicast_ip="239.255.42.99";
+    options.udp_port=5000;
+    options.control_port=6000;
+    if(argc<2)throw std::runtime_error("missing arguments; use --help");
+
+    if(argv[1][0]=='-')
     {
-        usage(argv[0]);
-        throw std::runtime_error("invalid receiver arguments");
+        bool interface_set=false;
+        bool proxy_set=false;
+        bool output_set=false;
+        for(int index=1;index<argc;index++)
+        {
+            const std::string option=argv[index];
+            const auto value=[&]() -> std::string
+            {
+                if(++index>=argc)throw std::runtime_error("missing "+option+" value");
+                return argv[index];
+            };
+            if(option=="--multicast-ip")options.multicast_ip=value();
+            else if(option=="--udp-port")
+                options.udp_port=srcast::cli::parse_port(option,value());
+            else if(option=="--interface-ip")
+            {
+                options.interface_ip=value();
+                interface_set=true;
+            }
+            else if(option=="--proxy-ip")
+            {
+                options.proxy_ip=value();
+                proxy_set=true;
+            }
+            else if(option=="--control-port")
+                options.control_port=srcast::cli::parse_port(option,value());
+            else if(option=="--output-dir")
+            {
+                options.output_directory=value();
+                output_set=true;
+            }
+            else throw std::runtime_error("unknown option: "+option);
+        }
+        if(!interface_set)throw std::runtime_error("--interface-ip is required");
+        if(!proxy_set)throw std::runtime_error("--proxy-ip is required");
+        if(!output_set)throw std::runtime_error("--output-dir is required");
+    }else
+    {
+        if(argc<6||argc>7)throw std::runtime_error("invalid legacy receiver arguments");
+        options.multicast_ip=argv[1];
+        options.udp_port=srcast::cli::parse_port("udp_port",argv[2]);
+        options.output_directory=argv[3];
+        options.proxy_ip=argv[4];
+        options.control_port=srcast::cli::parse_port("control_port",argv[5]);
+        options.interface_ip=argc==7?argv[6]:"0.0.0.0";
     }
 
-    ReceiverOptions options;
-    options.multicast_ip=argv[1];
-    options.udp_port=std::stoi(argv[2]);
-    options.output_directory=argv[3];
-    options.proxy_ip=argv[4];
-    options.control_port=std::stoi(argv[5]);
-    options.interface_ip=argc==7?argv[6]:"0.0.0.0";
-    if(options.udp_port<1||options.udp_port>65535||
-       options.control_port<1||options.control_port>65535)
-    {
-        throw std::runtime_error("invalid command-line argument");
-    }
+    srcast::cli::parse_multicast_ipv4("--multicast-ip",options.multicast_ip);
+    srcast::cli::parse_ipv4("--interface-ip",options.interface_ip);
+    srcast::cli::parse_ipv4("--proxy-ip",options.proxy_ip);
     return options;
 }
 
@@ -268,20 +324,147 @@ struct TransferState
     std::unordered_set<std::uint32_t>intentionally_dropped_blocks;
 };
 
-srcast::RegisterMessage make_registration(std::uint16_t udp_port,const std::optional<TransferState>&transfer)
+bool send_peer_udp_packet(int udp_fd,const sockaddr_in &destination,
+                          const std::vector<std::uint8_t>&packet)
+{
+    for(;;)
+    {
+        const auto sent=::sendto(
+            udp_fd,
+            packet.data(),
+            packet.size(),
+            0,
+            reinterpret_cast<const sockaddr*>(&destination),
+            sizeof(destination));
+
+        if(sent<0)
+        {
+            if(errno==EINTR)continue;
+
+            if(errno==EAGAIN||errno==EWOULDBLOCK)
+            {
+                std::cerr<<"peer UDP send buffer temporarily full\n";
+                return false;
+            }
+
+            std::cerr<<"peer UDP send failed: "<<std::strerror(errno)<<'\n';
+            return false;
+        }
+
+        if(static_cast<std::size_t>(sent)!=packet.size())
+        {
+            std::cerr<<"peer UDP sent a partial datagram\n";
+            return false;
+        }
+
+        return true;
+    }
+}
+
+void execute_peer_repair_task(int udp_fd,TransferState &state,
+                              const srcast::PeerRepairTaskMessage &task)
+{
+    if(task.transfer_id!=state.meta.common.transfer_id||
+       state.awaiting_complete_ack||
+       state.final_sha_failed||
+       task.target_port==0)
+    {
+        return;
+    }
+
+    try
+    {
+        static_cast<void>(
+            srcast::section_block_count(
+                state.meta.total_blocks,
+                task.section_id,
+                state.meta.section_block_count));
+    }
+    catch(const std::exception&)
+    {
+        return;
+    }
+
+    sockaddr_in destination{};
+    destination.sin_family=AF_INET;
+    destination.sin_port=htons(task.target_port);
+    destination.sin_addr.s_addr=htonl(task.target_ipv4);
+
+    std::array<std::uint8_t,srcast::kPayloadSize>buffer{};
+
+    std::size_t sent_blocks=0;
+    std::size_t skipped_blocks=0;
+
+    for(const auto block_id:task.block_ids)
+    {
+        // Source自己没有这个Block，绝对不能帮别人发。
+        if(block_id>=state.meta.total_blocks||
+           state.received[block_id]==0||
+           srcast::section_id_for_block(
+               block_id,state.meta.section_block_count)!=task.section_id)
+        {
+            skipped_blocks++;
+            continue;
+        }
+
+        std::uint64_t offset{};
+        std::uint16_t payload_size{};
+
+        read_block(
+            state.output.get(),
+            state.temporary_path,
+            state.meta.file_size,
+            block_id,
+            buffer,
+            offset,
+            payload_size);
+
+        const auto packet=srcast::encode_data(
+            task.transfer_id,
+            task.section_id,
+            block_id,
+            offset,
+            buffer.data(),
+            payload_size,
+            srcast::crc32(buffer.data(),payload_size));
+
+        if(!send_peer_udp_packet(udp_fd,destination,packet))
+        {
+            skipped_blocks++;
+            continue;
+        }
+
+        sent_blocks++;
+    }
+
+    std::cout<<"peer repair task="<<task.task_id
+             <<" section="<<task.section_id
+             <<" round="<<task.round_id
+             <<" sent_blocks="<<sent_blocks
+             <<" skipped_blocks="<<skipped_blocks<<'\n';
+}
+
+srcast::RegisterMessage make_registration(std::uint16_t udp_port,std::uint16_t peer_udp_port,
+                                          const std::optional<TransferState>&transfer)
 {
     srcast::RegisterMessage registration;
+
     registration.udp_port=udp_port;
+    registration.peer_udp_port=peer_udp_port;
+
     if(transfer)
     {
         registration.current_transfer_id=transfer->meta.common.transfer_id;
-        registration.state=transfer->awaiting_complete_ack?srcast::ReceiverState::Completed:srcast::ReceiverState::Receiving;
+
+        registration.state=transfer->awaiting_complete_ack?srcast::ReceiverState::Completed:
+                                                           srcast::ReceiverState::Receiving;
     }
+
     return registration;
 }
 
 FileDescriptor connect_and_register(const std::string &proxy_ip,int control_port,
-    const std::string &interface_ip,std::uint16_t udp_port,
+    const std::string &interface_ip,std::uint16_t udp_port,std::uint16_t peer_udp_port,
     const std::optional<TransferState>&transfer)
 {
     for(;;)
@@ -290,9 +473,9 @@ FileDescriptor connect_and_register(const std::string &proxy_ip,int control_port
         {
             auto control_fd=connect_control(proxy_ip,control_port,interface_ip);
             send_control_frame(control_fd.get(),srcast::encode_register
-                              (make_registration(udp_port,transfer)));
+                              (make_registration(udp_port,peer_udp_port,transfer)));
             return control_fd;
-        }catch(const std::exception&error)
+        }catch(const std::exception &error)
         {
             std::cerr<<"proxy control reconnect failed: "<<error.what()<<"; retrying\n";
             std::this_thread::sleep_for(kReconnectDelay);
@@ -552,7 +735,8 @@ bool finalize_transfer(TransferState &state,std::array<std::uint8_t,srcast::kSha
     std::error_code remove_error;
     std::filesystem::remove(state.state_path,remove_error);
     std::cout<<"COMPLETED output="<<state.output_path<<" duplicates="<<state.duplicate_count
-        <<" intentional_drops="<<state.intentional_drop_count<<" rejected="<<state.rejected_count<<'\n';
+        <<" intentional_drops="<<state.intentional_drop_count<<" rejected="<<state.rejected_count
+        <<'\n'<<std::flush;
     return true;
 }
 
@@ -681,7 +865,7 @@ void begin_drain_for_round(TransferState &state,std::uint32_t section_id,std::ui
 }
 
 //proxy的TCP控制消息都从这里进，UDP DATA 只负责文件块
-void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd,
+void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd,int udp_fd,
     const std::string &output_directory,std::optional<TransferState>&transfer,int drain_timer_fd,
     bool &draining,std::uint32_t &draining_round,
     SteadyClock::time_point &hard_deadline,bool &stop_requested)
@@ -806,6 +990,22 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
             return;
         }
         std::cout<<"repair section "<<message.section_id<<" round "<<message.round_id<<" begins\n";
+        return;
+    }
+
+    if(type==srcast::ControlType::PeerRepairTask)
+    {
+        const auto message=srcast::decode_peer_repair_task(frame);
+
+        if(!transfer||
+        transfer->meta.common.transfer_id!=message.transfer_id||
+        transfer->awaiting_complete_ack||
+        transfer->final_sha_failed)
+        {
+            return;
+        }
+
+        execute_peer_repair_task(udp_fd,*transfer,message);
         return;
     }
 
@@ -938,6 +1138,11 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
 
 int main(int argc,char**argv) try
 {
+    if(argc==2&&(std::string(argv[1])=="--help"||std::string(argv[1])=="-h"))
+    {
+        usage(std::cout,argv[0]);
+        return 0;
+    }
     const auto options=parse_options(argc,argv);
     const auto &multicast_ip=options.multicast_ip;//组播ip
     const auto udp_port=options.udp_port;//udp端口
@@ -946,15 +1151,25 @@ int main(int argc,char**argv) try
     const auto control_port=options.control_port;//tcp端口
     const auto &interface_ip=options.interface_ip;//网卡ip
 
+    std::cout
+        <<"========================================\n"
+        <<"SiteRepairCast\n"
+        <<"ROLE: RECEIVER\n"
+        <<"========================================\n"
+        <<"multicast="<<multicast_ip<<':'<<udp_port<<'\n'
+        <<"interface_ip="<<interface_ip<<'\n'
+        <<"proxy_control="<<proxy_ip<<':'<<control_port<<'\n'
+        <<"output_dir="<<output_directory<<'\n'<<std::flush;
+
     std::error_code directory_error;
     std::filesystem::create_directories(output_directory,directory_error);
     if(directory_error)
     {
-        throw std::runtime_error("create output directory failed: "+directory_error.message());
+        throw std::runtime_error("create --output-dir failed: "+directory_error.message());
     }
     if(!std::filesystem::is_directory(output_directory))
     {
-        throw std::runtime_error("output path is not a directory");
+        throw std::runtime_error("--output-dir is not a directory: "+output_directory);
     }
 
     in_addr group_address{};
@@ -999,6 +1214,39 @@ int main(int argc,char**argv) try
         system_error("setsockopt IP_ADD_MEMBERSHIP");
     }
 
+    FileDescriptor peer_fd(::socket(AF_INET,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0));
+
+    if(peer_fd.get()<0)
+    {
+        system_error("socket peer UDP");
+    }
+
+    int peer_receive_buffer=32*1024*1024;
+    static_cast<void>(::setsockopt(
+        peer_fd.get(),SOL_SOCKET,SO_RCVBUF,
+        &peer_receive_buffer,sizeof(peer_receive_buffer)));
+
+    sockaddr_in peer_local{};
+    peer_local.sin_family=AF_INET;
+    peer_local.sin_port=0;
+    peer_local.sin_addr=interface_address;
+
+    if(::bind(peer_fd.get(),reinterpret_cast<sockaddr*>(&peer_local),sizeof(peer_local))!=0)
+    {
+        system_error("bind peer UDP");
+    }
+
+    socklen_t peer_local_size=sizeof(peer_local);
+
+    if(::getsockname(peer_fd.get(),reinterpret_cast<sockaddr*>(&peer_local),&peer_local_size)!=0)
+    {
+        system_error("getsockname peer UDP");
+    }
+
+    const auto peer_udp_port=ntohs(peer_local.sin_port);
+
+    std::cout<<"peer UDP port="<<peer_udp_port<<'\n';
+
     FileDescriptor drain_timer_fd(::timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK));
     if(drain_timer_fd.get()<0)
     {
@@ -1013,8 +1261,9 @@ int main(int argc,char**argv) try
 
     std::optional<TransferState>transfer;
     auto control_fd=connect_and_register(proxy_ip,control_port,interface_ip,
-                                         static_cast<std::uint16_t>(udp_port),transfer);
+                                         static_cast<std::uint16_t>(udp_port),peer_udp_port,transfer);
     add_epoll_interest(epoll_fd.get(),udp_fd.get());
+    add_epoll_interest(epoll_fd.get(),peer_fd.get());
     add_epoll_interest(epoll_fd.get(),drain_timer_fd.get());
     add_epoll_interest(epoll_fd.get(),control_fd.get());
     std::cout<<"receiver listening on "<<multicast_ip<<':'<<udp_port
@@ -1048,13 +1297,13 @@ int main(int argc,char**argv) try
         }
         control_reader=ControlStreamReader{};
         control_fd=connect_and_register(proxy_ip,control_port,interface_ip,
-                                        static_cast<std::uint16_t>(udp_port),transfer);
+                                        static_cast<std::uint16_t>(udp_port),peer_udp_port,transfer);
         add_epoll_interest(epoll_fd.get(),control_fd.get());
         std::cout<<"proxy control reconnected; REGISTER sent state="
                  <<(transfer?(transfer->awaiting_complete_ack?"COMPLETED":"RECEIVING"):"IDLE")
                  <<'\n';
     };
-    std::vector<epoll_event>ready_events(3);
+    std::vector<epoll_event>ready_events(4);
     while(!stop_requested)
     {
         const int event_count=::epoll_wait(epoll_fd.get(),ready_events.data(),
@@ -1066,6 +1315,7 @@ int main(int argc,char**argv) try
         }
 
         bool udp_ready=false;
+        bool peer_ready=false;
         bool timer_ready=false;
         bool control_ready=false;
         bool control_disconnected=false;
@@ -1094,6 +1344,7 @@ int main(int argc,char**argv) try
             }
 
             if(ready_fd==udp_fd.get())udp_ready=true;
+            else if(ready_fd==peer_fd.get())peer_ready=true;
             else if(ready_fd==drain_timer_fd.get())timer_ready=true;
             else if(ready_fd==control_fd.get())control_ready=true;
             else
@@ -1109,14 +1360,14 @@ int main(int argc,char**argv) try
             continue;
         }
 
-        if(udp_ready)
+        auto process_udp_ready=[&](int receive_fd)
         {
             std::size_t processed=0;
             const auto batch_start=SteadyClock::now();
 //一次 epoll 唤醒只处理一批，UDP不能抢控制面时间
             while(processed<kMaxUdpPacketsPerBatch&&SteadyClock::now()-batch_start<kUdpBatchTimeBudget)
             {
-                const auto packet_size=::recvfrom(udp_fd.get(),packet_buffer.data(),packet_buffer.size(),
+                const auto packet_size=::recvfrom(receive_fd,packet_buffer.data(),packet_buffer.size(),
                                                   0,nullptr,nullptr);
                 if(packet_size<0)
                 {
@@ -1202,7 +1453,10 @@ int main(int argc,char**argv) try
                     std::cerr<<"drop malformed packet: "<<error.what()<<'\n';
                 }
             }
-        }
+        };
+
+        if(udp_ready)process_udp_ready(udp_fd.get());
+        if(peer_ready)process_udp_ready(peer_fd.get());
 
         if(timer_ready)
         {
@@ -1229,7 +1483,7 @@ int main(int argc,char**argv) try
                 const auto frames=control_reader.read_frames(control_fd.get());
                 for(const auto& frame:frames)
                 {
-                    handle_control_message(frame,control_fd.get(),output_directory,transfer,
+                    handle_control_message(frame,control_fd.get(),peer_fd.get(),output_directory,transfer,
                         drain_timer_fd.get(),draining,draining_round,hard_deadline,stop_requested);
                 }
                 control_disconnected=control_disconnected||control_reader.peer_closed();
