@@ -346,7 +346,7 @@ class DistributedRunner:
             source_path = Path(central_base) / ("input-%d.bin" % file_size)
             deterministic_input(source_path, file_size)
             source_sha = sha256_file(source_path)
-            transfer_id = int(source_sha[:16], 16)
+            output_name = source_path.name
 
             proxy_arguments = [
                 proxy_binary,
@@ -443,22 +443,49 @@ class DistributedRunner:
                                                stdout=central_handle, stderr=subprocess.STDOUT,
                                                cwd=self.central.repo, text=True)
             deadline = start + self.timeout
+
+            def completed_total():
+                return sum(self.completed_count(host, base)
+                           for host, base, _ in receiver_paths)
+
+            def wait_final_completion(grace_seconds=2.0):
+                grace_deadline = time.monotonic() + grace_seconds
+                while time.monotonic() < grace_deadline:
+                    if completed_total() == receiver_count:
+                        return True
+                    time.sleep(0.05)
+                return completed_total() == receiver_count
+
+            def finish_success():
+                finish_time = time.monotonic()
+                try:
+                    cpu_result = json.loads(self.proxy.run(
+                        "python3 %s --pid %d" %
+                        (shlex.quote(cpu_script), proxy_pid)).stdout)
+                except (RuntimeError, json.JSONDecodeError):
+                    cpu_result = None
+                return finish_time, cpu_result
+
             while True:
-                counts = [self.completed_count(host, base)
-                          for host, base, _ in receiver_paths]
-                if sum(counts) == receiver_count:
-                    finish = time.monotonic()
-                    try:
-                        cpu_finish = json.loads(self.proxy.run(
-                            "python3 %s --pid %d" %
-                            (shlex.quote(cpu_script), proxy_pid)).stdout)
-                    except (RuntimeError, json.JSONDecodeError):
-                        cpu_finish = None
+                if completed_total() == receiver_count:
+                    finish, cpu_finish = finish_success()
                     break
-                if central_process.poll() not in (None, 0):
-                    raise RuntimeError("central sender failed before all receivers completed")
+
+                central_status = central_process.poll()
+                if central_status is not None:
+                    if wait_final_completion():
+                        finish, cpu_finish = finish_success()
+                        break
+                    if central_status != 0:
+                        raise RuntimeError("central sender failed before all receivers completed")
+                    raise RuntimeError("central sender exited before all receivers completed")
+
                 if not self.proxy.alive(proxy_pid):
+                    if wait_final_completion():
+                        finish, cpu_finish = finish_success()
+                        break
                     raise RuntimeError("proxy exited before all receivers completed")
+
                 if time.monotonic() >= deadline:
                     raise TimeoutError("timed out waiting for all receiver completions")
                 time.sleep(0.1)
@@ -471,7 +498,7 @@ class DistributedRunner:
 
             for host, base, indexes in receiver_paths:
                 outputs = [str(Path(base) / "receivers" / ("receiver-%03d" % index) /
-                               ("transfer-%d.bin" % transfer_id)) for index in indexes]
+                               output_name) for index in indexes]
                 command = "sha256sum -- %s" % shell_join(outputs)
                 lines = host.run(command, timeout=max(30, self.timeout)).stdout.splitlines()
                 if len(lines) != len(outputs) or any(line.split()[0] != source_sha for line in lines):

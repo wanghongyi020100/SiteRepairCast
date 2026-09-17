@@ -14,7 +14,7 @@ Options:
   --pace-us N           Per-block delay (default: 0).
   --section-blocks N    Blocks per section (default: 4096).
   --build-dir DIR       Binary directory (default: <repo>/build).
-  --config FILE         Trusted shell configuration file.
+  --config FILE         Trusted shell configuration file; may define FILE or FILES=(...).
   -h, --help            Show this help.
 EOF
 }
@@ -44,7 +44,15 @@ if [[ -n "$CONFIG_FILE" ]]; then
 fi
 
 files=()
-[[ -z "${FILE:-}" ]] || files+=("$FILE")
+if declare -p FILES >/dev/null 2>&1; then
+    if [[ "$(declare -p FILES)" != declare\ -a* ]]; then
+        echo "FILES must be a Bash array" >&2
+        exit 2
+    fi
+    files+=("${FILES[@]}")
+elif [[ -n "${FILE:-}" ]]; then
+    files+=("$FILE")
+fi
 cli_files=false
 while (($#)); do
     case "$1" in

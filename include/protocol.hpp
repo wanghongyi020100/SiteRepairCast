@@ -9,15 +9,17 @@
 #include<cstring>
 #include<limits>
 #include<stdexcept>
+#include<string>
 #include<utility>
 #include<vector>
 namespace srcast
 {
     constexpr std::uint32_t kMagic=0x53524331U;//UDP数据包魔数
     constexpr std::uint32_t kControlMagic=0x53524343U;//TCP控制帧魔数
-    constexpr std::uint16_t kVersion=9;//当前协议版本
+    constexpr std::uint16_t kVersion=10;//当前协议版本
     constexpr std::size_t kPayloadSize=1200;//单block的最大载荷
     constexpr std::size_t kSha256Size=32;//SHA-256摘要长度
+    constexpr std::size_t kMaxFileNameSize=255;//协议文件名最大长度
     constexpr std::uint32_t kSingleSectionId=0;//未分段流程使用的Section编号
     constexpr std::uint32_t kDefaultSectionBlockCount=64;//默认每个Section的block数量
 
@@ -119,6 +121,35 @@ namespace srcast
         std::size_t offset_{0};
     };
 
+    inline void validate_file_name_field(const std::string &file_name)
+    {
+        if(file_name.empty()||file_name.size()>kMaxFileNameSize)
+        {
+            throw std::runtime_error("invalid file name");
+        }
+    }
+
+    inline void write_file_name(PacketWriter &writer,const std::string &file_name)
+    {
+        validate_file_name_field(file_name);
+        writer.u16(static_cast<std::uint16_t>(file_name.size()));
+        writer.bytes(file_name.data(),file_name.size());
+    }
+
+    inline std::string read_file_name(PacketReader &reader)
+    {
+        const auto file_name_size=reader.u16();
+        if(file_name_size==0||file_name_size>kMaxFileNameSize||
+           reader.remaining()<file_name_size)
+        {
+            throw std::runtime_error("invalid file name");
+        }
+
+        std::string file_name(file_name_size,'\0');
+        reader.bytes(&file_name[0],file_name.size());
+        return file_name;
+    }
+
     //UDP数据包类型
     enum class PacketType:std::uint16_t
     {
@@ -141,6 +172,7 @@ namespace srcast
         std::uint32_t block_size{};
         std::uint32_t total_blocks{};
         std::uint32_t section_block_count{kDefaultSectionBlockCount};
+        std::string file_name;
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
@@ -378,6 +410,7 @@ namespace srcast
         std::uint32_t block_size{};
         std::uint32_t total_blocks{};
         std::uint32_t section_block_count{kDefaultSectionBlockCount};
+        std::string file_name;
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
@@ -446,6 +479,7 @@ namespace srcast
         std::uint32_t block_size{};
         std::uint32_t total_blocks{};
         std::uint32_t section_block_count{kDefaultSectionBlockCount};
+        std::string file_name;
         std::array<std::uint8_t,kSha256Size>sha256{};
     };
 
@@ -593,17 +627,20 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_file_meta(const FileMetaMessage &message)
     {
+        validate_file_name_field(message.file_name);
         //8字节控制头
         //magic 4+version 2+type 2
         ////消息体：
-        //transfer_id  8
-        //section_id   4
-        //file_size    8
-        //block_size   4
-        //total_blocks 4
-        //sha256       32
-        //72
-        PacketWriter writer(72);
+        //transfer_id       8
+        //section_id        4
+        //file_size         8
+        //block_size        4
+        //total_blocks      4
+        //section_blocks    4
+        //file_name_length  2
+        //file_name         N
+        //sha256            32
+        PacketWriter writer(74+message.file_name.size());
         write_control_header(writer,ControlType::FileMeta);
 
         writer.u64(message.transfer_id);
@@ -612,6 +649,7 @@ namespace srcast
         writer.u32(message.block_size);
         writer.u32(message.total_blocks);
         writer.u32(message.section_block_count);
+        write_file_name(writer,message.file_name);
 
         writer.bytes(message.sha256.data(),message.sha256.size());
         return writer.data();
@@ -619,7 +657,7 @@ namespace srcast
 
     inline FileMetaMessage decode_file_meta(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=72)
+        if(frame.size()<74)
         {
             throw std::runtime_error("invalid FILE_META size");
         }
@@ -639,8 +677,13 @@ namespace srcast
         message.block_size=reader.u32();
         message.total_blocks=reader.u32();
         message.section_block_count=reader.u32();
+        message.file_name=read_file_name(reader);
 
         reader.bytes(message.sha256.data(),message.sha256.size());
+        if(reader.remaining()!=0)
+        {
+            throw std::runtime_error("invalid FILE_META size");
+        }
         return message;
     }
 
@@ -921,20 +964,22 @@ namespace srcast
 
     inline std::vector<std::uint8_t>encode_central_file_meta(const CentralFileMetaMessage &message)
     {
-        PacketWriter writer(68);
+        validate_file_name_field(message.file_name);
+        PacketWriter writer(70+message.file_name.size());
         write_control_header(writer,ControlType::CentralFileMeta);
         writer.u64(message.transfer_id);
         writer.u64(message.file_size);
         writer.u32(message.block_size);
         writer.u32(message.total_blocks);
         writer.u32(message.section_block_count);
+        write_file_name(writer,message.file_name);
         writer.bytes(message.sha256.data(),message.sha256.size());
         return writer.data();
     }
 
     inline CentralFileMetaMessage decode_central_file_meta(const std::vector<std::uint8_t>&frame)
     {
-        if(frame.size()!=68)
+        if(frame.size()<70)
         {
             throw std::runtime_error("invalid CENTRAL_FILE_META size");
         }
@@ -950,7 +995,12 @@ namespace srcast
         message.block_size=reader.u32();
         message.total_blocks=reader.u32();
         message.section_block_count=reader.u32();
+        message.file_name=read_file_name(reader);
         reader.bytes(message.sha256.data(),message.sha256.size());
+        if(reader.remaining()!=0)
+        {
+            throw std::runtime_error("invalid CENTRAL_FILE_META size");
+        }
         return message;
     }
 

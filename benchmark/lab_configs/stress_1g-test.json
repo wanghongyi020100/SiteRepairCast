@@ -1,0 +1,33 @@
+{
+  "file": "/home/s/site-benchmark-data/t1024.txt",
+
+  "receiver_counts": [
+    100
+  ],
+
+  "loss_percent": [
+    0.01,
+    0.05,
+    0.1,
+    0.5,
+    1.0
+  ],
+
+  "modes": [
+    "baseline",
+    "peer"
+  ],
+
+  "target_success_runs": 3,
+  "max_attempts_per_case": 6,
+
+  "payload_size": 1200,
+
+  "udp_pace_us": 100,
+  "central_pace_us": 0,
+  "max_repair_rounds": 3,
+
+  "ready_timeout_seconds": 180,
+  "finish_timeout_seconds": 300,
+  "between_runs_seconds": 3
+}

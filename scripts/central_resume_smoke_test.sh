@@ -99,10 +99,10 @@ RECEIVER2_PID=""
 
 INPUT_SHA="$(sha256sum "$WORK_DIR/input.bin" | awk '{print $1}')"
 CACHED="$(find "$WORK_DIR/cache" -maxdepth 1 -name 'central-transfer-*.bin' -print -quit)"
-OUTPUT1="$(find "$WORK_DIR/receiver-1" -maxdepth 1 -name 'transfer-*.bin' -print -quit)"
-OUTPUT2="$(find "$WORK_DIR/receiver-2" -maxdepth 1 -name 'transfer-*.bin' -print -quit)"
+OUTPUT1="$WORK_DIR/receiver-1/input.bin"
+OUTPUT2="$WORK_DIR/receiver-2/input.bin"
 
-if [[ -z "$CACHED" || -z "$OUTPUT1" || -z "$OUTPUT2" ]]; then
+if [[ -z "$CACHED" || ! -f "$OUTPUT1" || ! -f "$OUTPUT2" ]]; then
     echo "expected output missing" >&2
     cat "$WORK_DIR/central-first.log" >&2
     cat "$WORK_DIR/central-resume.log" >&2

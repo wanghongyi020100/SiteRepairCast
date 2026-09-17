@@ -1,0 +1,25 @@
+{
+  "file": "/home/s/site-benchmark-data/t128.txt",
+  "receiver_counts": [
+    300,
+    325,
+    350,
+    375,
+    400
+  ],
+  "loss_percent": [
+    0
+  ],
+  "modes": [
+    "baseline"
+  ],
+  "target_success_runs": 5,
+  "max_attempts_per_case": 6,
+  "payload_size": 1200,
+  "udp_pace_us": 100,
+  "central_pace_us": 0,
+  "max_repair_rounds": 3,
+  "ready_timeout_seconds": 180,
+  "finish_timeout_seconds": 300,
+  "between_runs_seconds": 3
+}

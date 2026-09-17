@@ -77,10 +77,10 @@ wait "$RECEIVER2_PID"
 RECEIVER2_PID=""
 
 INPUT_SHA="$(sha256sum "$WORK_DIR/input.bin" | awk '{print $1}')"
-OUTPUT1="$(find "$WORK_DIR/receiver-1" -maxdepth 1 -name 'transfer-*.bin' -print -quit)"
-OUTPUT2="$(find "$WORK_DIR/receiver-2" -maxdepth 1 -name 'transfer-*.bin' -print -quit)"
+OUTPUT1="$WORK_DIR/receiver-1/input.bin"
+OUTPUT2="$WORK_DIR/receiver-2/input.bin"
 
-if [[ -z "$OUTPUT1" || -z "$OUTPUT2" ]]; then
+if [[ ! -f "$OUTPUT1" || ! -f "$OUTPUT2" ]]; then
     echo "receiver output missing" >&2
     cat "$WORK_DIR/sender.log" >&2
     exit 1

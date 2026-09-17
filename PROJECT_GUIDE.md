@@ -119,7 +119,7 @@ central_sender 负责计算文件大小、总 block 数、SHA-256 和 transfer_i
 
 site_proxy_sender 是园区代理。普通模式下它从本地文件读取并发送，中心模式下它监听 --central-listen 端口接收中心数据，先写入缓存和 checkpoint，再向固定数量接收端发送 FILE_META、UDP DATA/END，并根据接收端状态执行 UDP 修复或 TCP backfill。
 
-receiver_agent 连接代理 TCP 控制端，加入 multicast，并在真实 `interface_ip` 上为 peer repair 绑定内核分配的随机 UDP 端口。它把 DATA 按 block 偏移写入 .part，按 section 维护位图和状态，校验整文件 SHA-256 后把 .part 原子改名为最终 transfer-*.bin。
+receiver_agent 连接代理 TCP 控制端，加入 multicast，并在真实 `interface_ip` 上为 peer repair 绑定内核分配的随机 UDP 端口。它把 DATA 按 block 偏移写入 `<原始文件名>.part-<transfer_id>`，按 section 维护位图和状态，校验整文件 SHA-256 后把临时文件原子改名为源文件 basename，例如 `received/t128.txt`。
 
 数据流为：中心到代理使用 TCP；代理到接收端初始数据和 UDP 修复使用组播或单播 UDP；代理与接收端的注册、状态、完成确认和 TCP backfill 使用 TCP 控制帧。
 
@@ -224,7 +224,7 @@ build-debug 等 build* 目录是普通 CMake 生成物，不是源文件。测�
 
 代理缓存目录由 site_proxy_sender 参数指定；中心模式会保存最终缓存文件、同名 .part 临时文件和 .state checkpoint。.state 先写 .tmp 再 rename，用于只承认已提交 section。
 
-接收端输出目录由 receiver_agent 参数指定；最终文件名形如 transfer-<transfer_id>.bin，接收过程中使用 .part，恢复状态使用 .state，状态提交时会先写 .tmp 再 rename。这些都是运行生成物，不属于源码清单。
+接收端输出目录由 receiver_agent 参数指定；最终文件名使用 Central 源文件 basename，例如 `received/t128.txt`。接收过程中使用 `received/t128.txt.part-<transfer_id>`，恢复状态使用 `received/t128.txt.part-<transfer_id>.state`，状态提交时会先写 `.tmp` 再 rename。这些都是运行生成物，不属于源码清单。
 
 README 示例中的 proxy-cache、received-1、received-2，以及脚本创建的临时 work 目录都是运行目录；.gitignore 会排除常见构建和产物路径。
 

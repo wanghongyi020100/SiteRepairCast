@@ -302,14 +302,15 @@ class BenchmarkRunner:
         return processes.spawn("central" + suffix, command,
                                logs / ("central%s.log" % suffix), self.env(**(extra_env or {})))
 
-    def monitor(self, items, receiver_dirs, started_ns, timeout, allow_codes=None):
+    def monitor(self, items, receiver_dirs, input_path, started_ns, timeout, allow_codes=None):
         allow_codes = allow_codes or {}
+        output_name = Path(input_path).name
         completion_ns = [None] * len(receiver_dirs)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             now = time.monotonic_ns()
             for index, directory in enumerate(receiver_dirs):
-                if completion_ns[index] is None and any(directory.glob("transfer-*.bin")):
+                if completion_ns[index] is None and (directory / output_name).is_file():
                     completion_ns[index] = now
             if all(item["process"].poll() is not None for item in items):
                 break
@@ -324,7 +325,7 @@ class BenchmarkRunner:
                                    (item["name"], code, item["log"]))
             ProcessSet.close(item)
         for index, directory in enumerate(receiver_dirs):
-            if completion_ns[index] is None and any(directory.glob("transfer-*.bin")):
+            if completion_ns[index] is None and (directory / output_name).is_file():
                 completion_ns[index] = ended_ns
         return ended_ns, [None if value is None else (value - started_ns) / 1e6
                           for value in completion_ns]
@@ -332,10 +333,11 @@ class BenchmarkRunner:
     def verify(self, input_path, cache, receiver_dirs):
         expected = sha256_file(input_path)
         cached = list(cache.glob("central-transfer-*.bin"))
-        outputs = [list(directory.glob("transfer-*.bin")) for directory in receiver_dirs]
-        if len(cached) != 1 or any(len(paths) != 1 for paths in outputs):
+        output_name = Path(input_path).name
+        outputs = [directory / output_name for directory in receiver_dirs]
+        if len(cached) != 1 or any(not path.is_file() for path in outputs):
             raise RuntimeError("expected exactly one cache file and one file per receiver")
-        actual = [sha256_file(cached[0])] + [sha256_file(paths[0]) for paths in outputs]
+        actual = [sha256_file(cached[0])] + [sha256_file(path) for path in outputs]
         if any(value != expected for value in actual):
             raise RuntimeError("SHA-256 mismatch")
         return expected
@@ -418,7 +420,7 @@ class BenchmarkRunner:
         central = self.central(processes, input_path, component["central_port"], logs)
         ended_ns, completion_ms = self.monitor(
             [central, component["proxy"], *component["receivers"]],
-            component["receiver_dirs"], started_ns, self.timeout)
+            component["receiver_dirs"], input_path, started_ns, self.timeout)
         metrics = self.base_metrics(scenario, repeat, logs, input_path, component,
                                     started_ns, ended_ns, completion_ms)
         metrics["configured_dropped_blocks_per_receiver"] = len(dropped)
@@ -459,7 +461,7 @@ class BenchmarkRunner:
         second = self.central(processes, input_path, component["central_port"], logs, "-resume")
         ended_ns, completion_ms = self.monitor(
             [second, component["proxy"], *component["receivers"]],
-            component["receiver_dirs"], started_ns, self.timeout)
+            component["receiver_dirs"], input_path, started_ns, self.timeout)
         metrics = self.base_metrics(scenario, repeat, logs, input_path, component,
                                     started_ns, ended_ns, completion_ms)
         resume_text = read_text(logs / "central-resume.log")
@@ -504,7 +506,7 @@ class BenchmarkRunner:
         second = self.central(processes, input_path, resumed["central_port"], logs, "-resume")
         ended_ns, completion_ms = self.monitor(
             [second, resumed["proxy"], *resumed["receivers"]], resumed["receiver_dirs"],
-            started_ns, self.timeout)
+            input_path, started_ns, self.timeout)
         metrics = self.base_metrics(scenario, repeat, logs, input_path, resumed,
                                     started_ns, ended_ns, completion_ms)
         resume_text = read_text(logs / "central-resume.log")

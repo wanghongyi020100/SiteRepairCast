@@ -25,6 +25,7 @@
 #include<cstring>
 #include<filesystem>
 #include<fstream>
+#include<iomanip>
 #include<iostream>
 #include<limits>
 #include<optional>
@@ -482,8 +483,34 @@ FileDescriptor connect_and_register(const std::string &proxy_ip,int control_port
         }
     }
 }
-//正式文件旁边放 .state，重启时和 .part 一起校验
-std::string received_state_path(const std::string &output_path){return output_path+".state";}
+std::string safe_received_file_name(const std::string &file_name)
+{
+    const auto safe_name=std::filesystem::path(file_name).filename().string();
+    if(safe_name.empty()||safe_name=="."||safe_name=="..")
+    {
+        throw std::runtime_error("invalid received file name");
+    }
+    if(safe_name!=file_name)
+    {
+        throw std::runtime_error("file name contains path components");
+    }
+    return safe_name;
+}
+
+std::string received_output_path(const std::string &output_directory,const std::string &file_name)
+{
+    return (std::filesystem::path(output_directory)/file_name).string();
+}
+
+std::string received_temporary_path(const std::string &output_directory,
+    const std::string &file_name,std::uint64_t transfer_id)
+{
+    return (std::filesystem::path(output_directory)/
+            (file_name+".part-"+std::to_string(transfer_id))).string();
+}
+
+//state跟transfer-specific临时文件放一起，重启时和 .part-<transfer_id> 一起校验
+std::string received_state_path(const std::string &temporary_path){return temporary_path+".state";}
 
 //位图
 std::string hex_bytes(const std::vector<std::uint8_t>&bytes)
@@ -542,14 +569,16 @@ bool load_receiver_state(TransferState &state,const srcast::MetaPacket &meta)
     std::uint32_t total_blocks=0;
     std::uint32_t section_block_count=0;
     std::uint32_t received_count=0;
+    std::string file_name;
     std::string digest_hex;
     std::string received_hex;
-    input>>magic>>version>>transfer_id>>file_size>>total_blocks>>section_block_count>>digest_hex
-         >>received_count>>received_hex;
+    input>>magic>>version>>transfer_id>>file_size>>total_blocks>>section_block_count
+         >>std::quoted(file_name)>>digest_hex>>received_count>>received_hex;
     auto received=parse_hex_bytes(received_hex);
-    if(!input||!received||magic!="SRC_RECEIVER_STATE"||version!=2||transfer_id!=meta.common.transfer_id||
+    if(!input||!received||magic!="SRC_RECEIVER_STATE"||version!=3||transfer_id!=meta.common.transfer_id||
         file_size!=meta.file_size||total_blocks!=meta.total_blocks||
-        section_block_count!=meta.section_block_count||digest_hex!=srcast::hex_digest(meta.sha256)||
+        section_block_count!=meta.section_block_count||file_name!=meta.file_name||
+        digest_hex!=srcast::hex_digest(meta.sha256)||
         received->size()!=meta.total_blocks)return false;
 
     const auto counted=static_cast<std::uint32_t>(std::count(received->begin(),received->end(),1));
@@ -570,9 +599,10 @@ void save_receiver_state(const TransferState &state)
         {
             throw std::runtime_error("open receiver state failed: "+temporary_state_path);
         }
-        output<<"SRC_RECEIVER_STATE 2\n"<<state.meta.common.transfer_id<<'\n'<<state.meta.file_size<<'\n'
+        output<<"SRC_RECEIVER_STATE 3\n"<<state.meta.common.transfer_id<<'\n'<<state.meta.file_size<<'\n'
         <<state.meta.total_blocks<<'\n'<<state.meta.section_block_count<<'\n'
-        <<srcast::hex_digest(state.meta.sha256)<<'\n'<<state.received_count<<'\n'
+        <<std::quoted(state.meta.file_name)<<'\n'<<srcast::hex_digest(state.meta.sha256)<<'\n'
+        <<state.received_count<<'\n'
         <<hex_bytes(state.received)<<'\n';
         output.flush();
         if(!output)
@@ -649,10 +679,10 @@ bool initialize_transfer(TransferState &state,const srcast::MetaPacket &meta,
     }
 
     state.meta=meta;
-    const auto generated_name=std::string("transfer-")+std::to_string(meta.common.transfer_id)+".bin";
-    state.output_path=(std::filesystem::path(output_directory)/generated_name).string();
-    state.temporary_path=state.output_path+".part";
-    state.state_path=received_state_path(state.output_path);
+    state.output_path=received_output_path(output_directory,meta.file_name);
+    state.temporary_path=received_temporary_path(output_directory,meta.file_name,
+                                                 meta.common.transfer_id);
+    state.state_path=received_state_path(state.temporary_path);
     state.received.assign(meta.total_blocks,0);
     state.received_count=0;
     state.duplicate_count=0;
@@ -678,6 +708,7 @@ bool initialize_transfer(TransferState &state,const srcast::MetaPacket &meta,
     }
 
     std::cout<<"accepted transfer_id="<<meta.common.transfer_id<<'\n'
+    <<"file_name="<<meta.file_name<<'\n'
     <<"sections="<<srcast::section_count_for_blocks(meta.total_blocks,meta.section_block_count)<<'\n'
     <<"file_size="<<meta.file_size<<" bytes\n"<<"blocks="<<meta.total_blocks<<'\n'
     <<"recovered_blocks="<<state.received_count<<'\n'
@@ -901,12 +932,17 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         {
             throw std::runtime_error("inconsistent FILE_META block count");
         }
+        const auto safe_name=safe_received_file_name(message.file_name);
 
 //重复FILE_META直接回READY，避免重建 .part
         if(transfer)
         {
             if(transfer->meta.common.transfer_id==message.transfer_id)
             {
+                if(transfer->meta.file_name!=safe_name)
+                {
+                    throw std::runtime_error("FILE_META file name mismatch");
+                }
                 if(transfer->awaiting_complete_ack)
                 {
                     srcast::ReceiverCompleteMessage complete;
@@ -931,12 +967,12 @@ void handle_control_message(const std::vector<std::uint8_t>&frame,int control_fd
         meta.block_size=message.block_size;
         meta.total_blocks=message.total_blocks;
         meta.section_block_count=message.section_block_count;
+        meta.file_name=safe_name;
         meta.sha256=message.sha256;
-        const auto output_name=(std::filesystem::path(output_directory)/
-                   ("transfer-"+std::to_string(meta.common.transfer_id)+".bin")).string();
         std::uint64_t existing_size=0;
         std::error_code existing_error;
-        const auto temporary_name=output_name+".part";
+        const auto temporary_name=received_temporary_path(output_directory,meta.file_name,
+                                                         meta.common.transfer_id);
         if(std::filesystem::exists(temporary_name,existing_error))
         {
             existing_size=std::filesystem::file_size(temporary_name,existing_error);

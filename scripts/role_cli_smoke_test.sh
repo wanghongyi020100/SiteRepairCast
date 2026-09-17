@@ -145,8 +145,8 @@ RECEIVER2_PID=""
 
 input_sha="$(sha256sum "$WORK_DIR/input.bin" | awk '{print $1}')"
 for output in "$WORK_DIR/cache"/central-transfer-*.bin \
-    "$WORK_DIR/receiver-1"/transfer-*.bin \
-    "$WORK_DIR/receiver-2"/transfer-*.bin; do
+    "$WORK_DIR/receiver-1/input.bin" \
+    "$WORK_DIR/receiver-2/input.bin"; do
     [[ -f "$output" ]]
     [[ "$(sha256sum "$output" | awk '{print $1}')" == "$input_sha" ]]
 done

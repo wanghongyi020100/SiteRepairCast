@@ -31,6 +31,8 @@ proxy-cache/
 *.part
 *.state
 *.state.tmp
+t128.txt
+t256.txt
 
 # logs
 *.log
@@ -51,10 +53,16 @@ __pycache__/
 
 # temporary source dump
 site_all_code.txt
+site_code.txt
 
-# Python cache
-__pycache__/
-*.py[cod]
+# temporary backup files
+*.before-*
+*.bak
 
-# temporary source dump
-site_all_code.txt
+# local/generated files
+/gen_file
+/benchmark/lab_configs/hosts.json
+*.full
+/benchmark/lab_configs/hosts.json
+/benchmark/lab_configs/hosts.json.example
+*.full

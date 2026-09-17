@@ -9,6 +9,7 @@
 #include<arpa/inet.h>
 #include<fcntl.h>
 #include<netinet/in.h>
+#include<openssl/evp.h>
 #include<sys/socket.h>
 #include<sys/stat.h>
 #include<unistd.h>
@@ -19,8 +20,10 @@
 #include<cstdint>
 #include<cstdlib>
 #include<cstring>
+#include<filesystem>
 #include<iostream>
 #include<limits>
+#include<memory>
 #include<stdexcept>
 #include<string>
 #include<thread>
@@ -66,11 +69,31 @@ FileDescriptor connect_proxy(const std::string &proxy_ip,int central_port)
     }
 }
 
-//transfer_id用文件摘要生成，重试同文件时id稳定
-std::uint64_t create_transfer_id(const std::array<std::uint8_t,srcast::kSha256Size>&digest)
+//transfer_id由文件摘要和basename共同生成，重试同名同内容文件时id稳定
+std::uint64_t create_transfer_id(const std::array<std::uint8_t,srcast::kSha256Size>&digest,
+    const std::string &file_name)
 {
+    using ContextPtr=std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)>;
+    ContextPtr context(EVP_MD_CTX_new(),&EVP_MD_CTX_free);
+    if(!context||EVP_DigestInit_ex(context.get(),EVP_sha256(),nullptr)!=1)
+    {
+        throw std::runtime_error("EVP_DigestInit_ex failed");
+    }
+    if(EVP_DigestUpdate(context.get(),digest.data(),digest.size())!=1||
+       EVP_DigestUpdate(context.get(),file_name.data(),file_name.size())!=1)
+    {
+        throw std::runtime_error("EVP_DigestUpdate failed");
+    }
+    std::array<std::uint8_t,srcast::kSha256Size>combined_digest{};
+    unsigned int digest_size=0;
+    if(EVP_DigestFinal_ex(context.get(),combined_digest.data(),&digest_size)!=1||
+       digest_size!=combined_digest.size())
+    {
+        throw std::runtime_error("EVP_DigestFinal_ex failed");
+    }
+
     std::uint64_t value=0;
-    for(std::size_t index=0;index<sizeof(value);index++)value=(value<<8U)|digest[index];
+    for(std::size_t index=0;index<sizeof(value);index++)value=(value<<8U)|combined_digest[index];
     return value;
 }
 
@@ -206,8 +229,10 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
     }
 
     const auto total_blocks=static_cast<std::uint32_t>(total_blocks64);
+    const auto file_name=std::filesystem::path(file_path).filename().string();
+    srcast::validate_file_name_field(file_name);
     const auto digest=srcast::sha256_file(file_path);
-    const auto transfer_id=create_transfer_id(digest);
+    const auto transfer_id=create_transfer_id(digest,file_name);
     FileDescriptor input(::open(file_path.c_str(),O_RDONLY|O_CLOEXEC));
     if(input.get()<0)
     {
@@ -220,8 +245,9 @@ bool send_file(int central_fd,const std::string &file_path,int pace_us,std::uint
     meta.block_size=srcast::kPayloadSize;
     meta.total_blocks=total_blocks;
     meta.section_block_count=section_blocks;
+    meta.file_name=file_name;
     meta.sha256=digest;
-    std::cout<<"central sending file="<<file_path<<" transfer_id="<<transfer_id
+    std::cout<<"central sending file="<<file_name<<" transfer_id="<<transfer_id
              <<" size="<<file_size<<" blocks="<<total_blocks<<'\n';
 
     send_control_frame(central_fd,srcast::encode_central_file_meta(meta));

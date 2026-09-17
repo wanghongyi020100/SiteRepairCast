@@ -123,11 +123,13 @@ assert_sha() {
     [[ -n "$cached" ]]
     [[ "$(sha256sum "$cached" | awk '{print $1}')" == "$input_sha" ]]
 
+    local output_name
+    output_name="$(basename "$input")"
     local receiver_dir
     for receiver_dir in "$@"; do
         local output
-        output="$(find "$receiver_dir" -maxdepth 1 -name 'transfer-*.bin' -print -quit)"
-        [[ -n "$output" ]]
+        output="$receiver_dir/$output_name"
+        [[ -f "$output" ]]
         [[ "$(sha256sum "$output" | awk '{print $1}')" == "$input_sha" ]]
     done
 }

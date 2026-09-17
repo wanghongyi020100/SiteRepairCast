@@ -10,6 +10,7 @@ tests=(
     role_cli_smoke_test.sh
     local_repair_smoke_test.sh
     central_cache_smoke_test.sh
+    file_name_smoke_test.sh
     section_flow_smoke_test.sh
     central_resume_smoke_test.sh
     tcp_backfill_smoke_test.sh

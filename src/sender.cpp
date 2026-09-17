@@ -29,6 +29,7 @@
 #include<exception>
 #include<filesystem>
 #include<fstream>
+#include<iomanip>
 #include<iostream>
 #include<limits>
 #include<mutex>
@@ -160,6 +161,17 @@ std::uint64_t create_transfer_id(const std::unordered_set<std::uint64_t>&used_tr
     return transfer_id;
 }
 
+std::string source_file_name(const std::string &file_path)
+{
+    const auto file_name=std::filesystem::path(file_path).filename().string();
+    if(file_name.empty())
+    {
+        throw std::runtime_error("source file has no valid file name");
+    }
+    srcast::validate_file_name_field(file_name);
+    return file_name;
+}
+
 void send_udp_packet(int socket_fd,const sockaddr_in &destination,const std::vector<std::uint8_t>&packet)
 {
     const auto sent=::sendto(socket_fd,packet.data(),packet.size(),0,
@@ -208,13 +220,15 @@ std::uint32_t load_central_checkpoint(const std::string &checkpoint_path,
     std::uint32_t total_blocks=0;
     std::uint32_t section_block_count=0;
     std::uint32_t next_section_id=0;
+    std::string file_name;
     std::string digest_hex;
     input>>magic>>version>>transfer_id>>file_size >>total_blocks
-         >>section_block_count>>digest_hex>>next_section_id;
+         >>section_block_count>>std::quoted(file_name)>>digest_hex>>next_section_id;
     const auto section_count=srcast::section_count_for_blocks(meta.total_blocks,meta.section_block_count);
-    if(!input||magic!="SRC_PROXY_CHECKPOINT" ||version!=2||transfer_id!=meta.transfer_id||
+    if(!input||magic!="SRC_PROXY_CHECKPOINT" ||version!=3||transfer_id!=meta.transfer_id||
         file_size!=meta.file_size||total_blocks!=meta.total_blocks||
-        section_block_count!=meta.section_block_count||digest_hex!=srcast::hex_digest(meta.sha256)||
+        section_block_count!=meta.section_block_count||file_name!=meta.file_name||
+        digest_hex!=srcast::hex_digest(meta.sha256)||
         next_section_id>=section_count)return 0;
     return next_section_id;
 }
@@ -230,8 +244,9 @@ void save_central_checkpoint(const std::string &checkpoint_path,const srcast::Ce
         {
             throw std::runtime_error("open central checkpoint failed: "+temporary_checkpoint);
         }
-        output<<"SRC_PROXY_CHECKPOINT 2\n"<<meta.transfer_id<<'\n'<<meta.file_size<<'\n'
-        <<meta.total_blocks<<'\n'<<meta.section_block_count<<'\n'<<srcast::hex_digest(meta.sha256)<<'\n'
+        output<<"SRC_PROXY_CHECKPOINT 3\n"<<meta.transfer_id<<'\n'<<meta.file_size<<'\n'
+        <<meta.total_blocks<<'\n'<<meta.section_block_count<<'\n'
+        <<std::quoted(meta.file_name)<<'\n'<<srcast::hex_digest(meta.sha256)<<'\n'
         <<next_section_id<<'\n';
         output.flush();
         if(!output)
@@ -1841,7 +1856,7 @@ void wait_for_receivers_ready(std::vector<ReceiverConnection>&receivers,std::uin
 
 void begin_receiver_transfer(std::vector<ReceiverConnection>&receivers,std::uint64_t transfer_id,
     std::uint64_t file_size,std::uint32_t total_blocks,std::uint32_t section_block_limit,
-    const std::array<std::uint8_t,srcast::kSha256Size>&digest)
+    const std::string &file_name,const std::array<std::uint8_t,srcast::kSha256Size>&digest)
 {
     accept_pending_receiver_reconnects(receivers);
     reset_transfer_state(receivers);
@@ -1852,6 +1867,7 @@ void begin_receiver_transfer(std::vector<ReceiverConnection>&receivers,std::uint
     file_meta.block_size=srcast::kPayloadSize;
     file_meta.total_blocks=total_blocks;
     file_meta.section_block_count=section_block_limit;
+    file_meta.file_name=file_name;
     file_meta.sha256=digest;
     const auto file_meta_frame=srcast::encode_file_meta(file_meta);
     for(auto &receiver:receivers)
@@ -1897,10 +1913,11 @@ void finish_failed_transfer(std::vector<ReceiverConnection>&receivers,std::uint6
 DeliveryResult send_file_attempt(int udp_fd,const sockaddr_in &multicast_destination,
     std::vector<ReceiverConnection>&receivers,int input_fd,const std::string &file_path,
     std::uint64_t file_size,std::uint64_t transfer_id,std::uint32_t total_blocks,
-    const std::array<std::uint8_t,srcast::kSha256Size>&digest,int pace_us,int max_repair_rounds,
-    std::uint32_t section_block_limit)
+    const std::string &file_name,const std::array<std::uint8_t,srcast::kSha256Size>&digest,
+    int pace_us,int max_repair_rounds,std::uint32_t section_block_limit)
 {
-    begin_receiver_transfer(receivers,transfer_id,file_size,total_blocks,section_block_limit,digest);
+    begin_receiver_transfer(receivers,transfer_id,file_size,total_blocks,section_block_limit,
+                            file_name,digest);
     DeliveryResult result=DeliveryResult::Success;
     const auto section_count=srcast::section_count_for_blocks(total_blocks,section_block_limit);
     for(std::uint32_t section_id=0;section_id<section_count&&!all_receivers_completed(receivers);section_id++)
@@ -1977,6 +1994,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             file_meta.block_size=meta.block_size;
             file_meta.total_blocks=meta.total_blocks;
             file_meta.section_block_count=meta.section_block_count;
+            file_meta.file_name=meta.file_name;
             file_meta.sha256=meta.sha256;
             for(auto &receiver:receivers)
             {
@@ -1994,7 +2012,8 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
                                                                       meta.section_block_count);
             send_control_frame(central_fd,srcast::encode_central_resume({meta.transfer_id,section_count,
                             section_count,meta.file_size,actual_digest}));
-            std::cout<<"central transfer already cached path="<<final_path<<'\n';
+            std::cout<<"central transfer already cached file="<<meta.file_name
+                     <<" path="<<final_path<<'\n';
             return CachedCentralFile{final_path,meta.transfer_id,
                                      meta.file_size,meta.total_blocks,actual_digest};
         }
@@ -2041,11 +2060,11 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
     std::uint64_t duplicate_count=0;
     std::uint64_t rejected_count=0;
     std::cout<<"central transfer started transfer_id="<<meta.transfer_id<<" size="<<meta.file_size
-             <<" blocks="<<meta.total_blocks<<" resume_section="
+             <<" file="<<meta.file_name<<" blocks="<<meta.total_blocks<<" resume_section="
              <<resume_section<<'/'<<section_count<<'\n';
     //开始接收端
     begin_receiver_transfer(receivers,meta.transfer_id,meta.file_size,meta.total_blocks,
-                            meta.section_block_count,meta.sha256);
+                            meta.section_block_count,meta.file_name,meta.sha256);
     std::deque<SectionDispatchTask>dispatch_queue;
     std::mutex dispatch_mutex;
     std::condition_variable dispatch_condition;
@@ -2351,7 +2370,7 @@ std::optional<CachedCentralFile>receive_cached_file_from_central(int central_fd,
             used_transfer_ids.insert(retry_transfer_id);
             delivery_result=send_file_attempt(udp_fd,multicast_destination,receivers,
                 backfill_input.get(),final_path,meta.file_size,retry_transfer_id,meta.total_blocks,
-                actual_digest,pace_us,max_repair_rounds,meta.section_block_count);
+                meta.file_name,actual_digest,pace_us,max_repair_rounds,meta.section_block_count);
         }
         if(delivery_result!=DeliveryResult::Success)
         {
@@ -2510,6 +2529,7 @@ void send_file(int udp_fd,const sockaddr_in &multicast_destination,
 
     const auto total_blocks=static_cast<std::uint32_t>(total_blocks64);
     const auto digest=srcast::sha256_file(file_path);
+    const auto file_name=source_file_name(file_path);
     FileDescriptor input(::open(file_path.c_str(),O_RDONLY|O_CLOEXEC));
     if(input.get()<0)
     {
@@ -2523,7 +2543,8 @@ void send_file(int udp_fd,const sockaddr_in &multicast_destination,
         const auto transfer_id=create_transfer_id(used_transfer_ids);
         used_transfer_ids.insert(transfer_id);
         result=send_file_attempt(udp_fd,multicast_destination,receivers,input.get(),file_path,
-            file_size,transfer_id,total_blocks,digest,pace_us,max_repair_rounds,section_block_limit);
+            file_size,transfer_id,total_blocks,file_name,digest,pace_us,max_repair_rounds,
+            section_block_limit);
         if(result!=DeliveryResult::Sha256Mismatch)break;
     }
 

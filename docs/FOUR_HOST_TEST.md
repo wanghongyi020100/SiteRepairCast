@@ -143,10 +143,10 @@ sha256sum input.bin
 sha256sum proxy-cache/central-transfer-*.bin
 
 # Machine C / D
-sha256sum received/transfer-*.bin
+sha256sum received/input.bin
 ```
 
-源文件、Proxy 缓存和两个 Receiver 最终文件的四个摘要必须完全一致。完成确认后，可以删除本次测试的 `input.bin`、`proxy-cache/central-transfer-*` 和 `received/transfer-*`；`.part`/`.state` 是未完成传输的恢复数据，确认不再恢复该测试时也可一起清理。
+源文件、Proxy 缓存和两个 Receiver 最终文件的四个摘要必须完全一致。Receiver 最终文件使用 Central 源文件 basename；例如 Central 发送 `/home/a/t128.txt`，Receiver 应得到 `received/t128.txt`，传输中的临时文件和状态文件分别是 `received/t128.txt.part-<transfer_id>` 和 `received/t128.txt.part-<transfer_id>.state`。完成确认后，可以删除本次测试的 `input.bin`、`proxy-cache/central-transfer-*` 和 `received/input.bin`；`.part-*`/`.state` 是未完成传输的恢复数据，确认不再恢复该测试时也可一起清理。
 
 ## 8. 常见错误
 

@@ -69,12 +69,14 @@ assert_sha() {
     input_sha="$(sha256sum "$input" | awk '{print $1}')"
     local cached
     cached="$(find "$cache_dir" -maxdepth 1 -name 'central-transfer-*.bin' -print -quit)"
+    local output_name
+    output_name="$(basename "$input")"
     local output1
-    output1="$(find "$receiver1" -maxdepth 1 -name 'transfer-*.bin' -print -quit)"
+    output1="$receiver1/$output_name"
     local output2
-    output2="$(find "$receiver2" -maxdepth 1 -name 'transfer-*.bin' -print -quit)"
+    output2="$receiver2/$output_name"
 
-    [[ -n "$cached" && -n "$output1" && -n "$output2" ]]
+    [[ -n "$cached" && -f "$output1" && -f "$output2" ]]
     [[ "$(sha256sum "$cached" | awk '{print $1}')" == "$input_sha" ]]
     [[ "$(sha256sum "$output1" | awk '{print $1}')" == "$input_sha" ]]
     [[ "$(sha256sum "$output2" | awk '{print $1}')" == "$input_sha" ]]
