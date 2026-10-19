@@ -55,6 +55,11 @@ __pycache__/
 site_all_code.txt
 site_code.txt
 
+# local-only project inspection / source export helpers
+/PROJECT_GUIDE.md
+/export_project_code.sh
+/gen_file.cpp
+
 # temporary backup files
 *.before-*
 *.bak
