@@ -130,7 +130,7 @@ build-debug/receiver_agent
 ./scripts/run_central.sh --proxy-ip 192.168.1.20 --file ./input.bin
 ```
 
-也可复制 `config/four-host/*.env.example` 后使用各脚本的 `--config`。真实主机必须填写各自 LAN IPv4，不能使用本机 smoke test 的 `127.0.0.x`。端口、防火墙、连通性检查和 SHA-256 验证见 [四台物理主机测试指南](docs/FOUR_HOST_TEST.md)。
+真实主机必须填写各自 LAN IPv4，不能使用本机 smoke test 的 `127.0.0.x`。也可在本机自建 `.env` 配置并用脚本的 `--config` 参数加载，但不要提交测试配置。端口、防火墙、连通性检查和 SHA-256 验证见 [四台物理主机测试指南](docs/FOUR_HOST_TEST.md)。
 
 ## 运行顺序
 

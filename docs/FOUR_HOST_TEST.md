@@ -46,18 +46,9 @@ ip route
 ping 192.168.1.20
 ```
 
-## 4. 准备配置
+## 4. 准备本地配置
 
-在对应机器复制示例并按实际地址、路径修改：
-
-```bash
-cp config/four-host/central.env.example config/four-host/central.env
-cp config/four-host/proxy.env.example config/four-host/proxy.env
-cp config/four-host/receiver1.env.example config/four-host/receiver1.env
-cp config/four-host/receiver2.env.example config/four-host/receiver2.env
-```
-
-每台机器只需要自己的配置文件。启动脚本的优先级是：脚本默认值 < config 文件 < 命令行参数。配置文件由本地用户维护，并作为可信 Shell 配置通过 `source` 加载。
+仓库不包含四台物理主机的测试配置样例。可以直接使用第 6 节的命令行参数；如需 `.env` 文件，请在本机创建并确保不会提交到仓库。
 
 ## 5. 端口与防火墙检查
 
@@ -87,47 +78,31 @@ nc -vz 192.168.1.20 6000
 
 ## 6. 按顺序启动
 
-推荐顺序是 Proxy、Receiver 1、Receiver 2、Central。Proxy 会先监听控制端口并等待固定数量 Receiver 注册，然后处理 Central 的文件。
+推荐顺序是 Proxy、Receiver 1、Receiver 2、Central。Proxy 会先监听控制端口并等待固定数量的 Receiver 注册，然后处理 Central 的文件。
 
 Machine B（Proxy）：
 
 ```bash
-./scripts/run_proxy.sh --config config/four-host/proxy.env
+./scripts/run_proxy.sh --interface-ip 192.168.1.20 --receivers 2
 ```
 
 Machine C（Receiver 1）：
 
 ```bash
-./scripts/run_receiver.sh --config config/four-host/receiver1.env
+./scripts/run_receiver.sh --interface-ip 192.168.1.31 \
+  --proxy-ip 192.168.1.20 --output-dir ./received
 ```
 
 Machine D（Receiver 2）：
 
 ```bash
-./scripts/run_receiver.sh --config config/four-host/receiver2.env
+./scripts/run_receiver.sh --interface-ip 192.168.1.32 \
+  --proxy-ip 192.168.1.20 --output-dir ./received
 ```
 
 确认 Proxy 日志已经出现两个 `registered receiver=` 后，在 Machine A 启动 Central：
 
 ```bash
-./scripts/run_central.sh --config config/four-host/central.env
-```
-
-也可以不使用配置文件：
-
-```bash
-# Machine B
-./scripts/run_proxy.sh --interface-ip 192.168.1.20 --receivers 2
-
-# Machine C
-./scripts/run_receiver.sh --interface-ip 192.168.1.31 \
-  --proxy-ip 192.168.1.20 --output-dir ./received
-
-# Machine D
-./scripts/run_receiver.sh --interface-ip 192.168.1.32 \
-  --proxy-ip 192.168.1.20 --output-dir ./received
-
-# Machine A（最后启动）
 ./scripts/run_central.sh --proxy-ip 192.168.1.20 --file ./input.bin
 ```
 
