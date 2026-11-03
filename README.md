@@ -17,7 +17,7 @@ SiteRepairCast 是一个面向多园区静态文件分发的 Linux/C++17 系统�
                +-----------------+------------------+
                |                                    |
   UDP 组播：初始数据、公共缺块修复                TCP：注册、缺块位图、接收端互传任务、
-               |                             传输完毕确认、慢节点独立补传
+               |                               传输完毕确认、慢节点独立补传
                v                                    v
          receiver_agent a  <---------------->  receiver_agent b
                       UDP 单播：代理调度的接收端互传
@@ -97,9 +97,7 @@ TCP Backfill 路径不同：收到待补传 Block 后，会对临时文件执行
 │   ├── sender.cpp            园区代理（含 Peer 调度逻辑）
 │   ├── receiver.cpp          接收端（含 Peer UDP 数据发送/接收）
 │   └── checksum.cpp          摘要实现
-├── scripts/                  启动脚本、测试兼容入口和正确性测试总入口
-├── real_test/                多机器真实部署说明、配置模板和正确性测试脚本
-├── benchmark/                多机 Baseline/Peer 性能实验控制器
+├── real_test/                多机器真实部署说明、配置模板和实验脚本
 └── real_test/README.md                   多机器测试文档导航
 ```
 
@@ -112,7 +110,7 @@ sudo apt-get update
 sudo apt-get install -y build-essential cmake libssl-dev python3
 ```
 
-**常规运行及四机脚本统一使用 `build/`**，与 `scripts/run_*.sh` 的默认路径一致：
+**常规构建使用 `build/`**：
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -190,29 +188,9 @@ dd if=/dev/urandom of=input.bin bs=1024 count=256 status=none
 10. 每个 Section 接收完整后同步数据和状态；整文件完成后执行 SHA-256 校验、正式文件改名和完成确认。
 11. 代理处理隔离接收端的补传，向中心报告结果；多文件模式继续下一个文件。
 
-## 测试与结果
-
-### 自动化测试入口
-
-```bash
-bash scripts/all_smoke_test.sh
-```
-
-也可使用 CMake 目标：
-
-```bash
-cmake -S . -B test-runs/builds/cmake-test -DCMAKE_BUILD_TYPE=Debug
-cmake --build test-runs/builds/cmake-test --target test
-cmake --build test-runs/builds/cmake-test --target cleantest
-```
-
-当前 `all_smoke_test.sh` 调用的用例包括命令行/角色、局部修复、中心缓存、文件名、Section 流程、中心续传、TCP 补传、Peer 修复屏障、故障恢复和多代理场景。Benchmark smoke 在本机回环下检查分发、修复、补传和 SHA-256 正确性，不输出性能结论。测试脚本源码位于 `scripts/`，多机器性能实验脚本位于 `benchmark/lab/`。
-
 ## 多机环境与基准配置
 
-多机器的网络、构建、端口、防火墙与手动启动步骤见 [real_test/README.md](real_test/README.md)。跨机器 Baseline/Peer 校准的主机配置、SSH 关系和运行命令见 [benchmark/README.md](benchmark/README.md)。
-
-基准控制器默认最多运行 20 个 Receiver、128 MiB 文件和 1 轮；扩大规模或增加轮数前，需显式传入 `--allow-large-run`。
+多机器的网络、构建、端口、防火墙与手动启动步骤见 [real_test/README.md](real_test/README.md)。跨机器 Baseline/Peer 校准的主机配置、SSH 关系和运行命令见 [real_test/README.md](real_test/README.md)。
 
 ## 当前边界
 

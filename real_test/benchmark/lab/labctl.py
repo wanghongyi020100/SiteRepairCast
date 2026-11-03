@@ -26,8 +26,8 @@ except ImportError:
     )
 
 
-DEFAULT_HOSTS = Path("benchmark/lab_configs/hosts.json")
-DEFAULT_EXPERIMENT = Path("benchmark/lab_configs/experiment.json")
+DEFAULT_HOSTS = Path("real_test/config/hosts.json")
+DEFAULT_EXPERIMENT = Path("real_test/config/experiment.json")
 EXCLUDES = [
     "/.git/", "/build/", "/proxy-cache/", "/received/", "/artifacts/",
     "/test-runs/", "/config/", "/real_test/config/*.env",

@@ -24,23 +24,3 @@ target_compile_options(receiver_agent PRIVATE -Wall -Wextra -Wpedantic -Wconvers
 add_executable(central_sender src/central_sender.cpp)
 target_link_libraries(central_sender PRIVATE srcast_common Threads::Threads)
 target_compile_options(central_sender PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-
-find_program(BASH_EXECUTABLE bash)
-if(BASH_EXECUTABLE)
-    set(SMOKE_TEST_ROOT ${CMAKE_BINARY_DIR}/test-runs)
-
-    add_custom_target(test
-        COMMAND ${BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/all_smoke_test.sh
-                ${SMOKE_TEST_ROOT}
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        USES_TERMINAL
-    )
-
-    add_custom_target(cleantest
-        COMMAND ${CMAKE_COMMAND} -E rm -rf ${SMOKE_TEST_ROOT}
-        COMMAND ${BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/all_smoke_test.sh
-                ${SMOKE_TEST_ROOT}
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        USES_TERMINAL
-    )
-endif()

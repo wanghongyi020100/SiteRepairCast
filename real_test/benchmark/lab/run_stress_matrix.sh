@@ -44,8 +44,8 @@ trap 'exit 143' TERM
 ROOT="$HOME/share/site"
 cd "$ROOT" || exit 1
 
-STRESS_CONFIG="benchmark/lab_configs/stress_1g.json"
-EXPERIMENT_CONFIG="benchmark/lab_configs/experiment.json"
+STRESS_CONFIG="real_test/config/stress_1g.json"
+EXPERIMENT_CONFIG="real_test/config/experiment.json"
 RUNS_CSV="test-runs/lab/history/runs.csv"
 STRESS_CSV="test-runs/lab/history/stress_runs.csv"
 
@@ -655,7 +655,7 @@ run_one()
     echo "===== EXPERIMENT ====="
     python3 - <<'PY'
 import json
-d=json.load(open("benchmark/lab_configs/experiment.json"))
+d=json.load(open("real_test/config/experiment.json"))
 for k in [
     "receiver_count",
     "mode",

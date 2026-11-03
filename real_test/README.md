@@ -34,10 +34,10 @@ Central: real_test/benchmark/lab/run_stress_matrix.sh
 在 Central 仓库根目录复制并编辑主机配置：
 
 ```bash
-cp real_test/config/hosts.lab.template.json benchmark/lab_configs/hosts.json
+cp real_test/config/hosts.lab.template.json real_test/config/hosts.json
 ```
 
-填写 Proxy 信息，并在 `receiver_hosts` 中按 Receiver 主机数量增删条目。再编辑 `benchmark/lab_configs/stress_1g.json` 中的输入文件和接收端数量。
+填写 Proxy 信息，并在 `receiver_hosts` 中按 Receiver 主机数量增删条目。再编辑 `real_test/config/stress_1g.json` 中的输入文件和接收端数量。
 
 > 当前压力脚本及清理脚本仍含维护者的仓库路径、SSH 和主机设置。给其他环境使用前，还需将这些值改成目标环境；仅修改 `hosts.json` 不够。
 
@@ -64,14 +64,6 @@ bash real_test/benchmark/lab/run_stress_matrix.sh
 | `real_test/benchmark/lab/trim_run_large_files.sh` | 删除指定实验目录中的大文件。 |
 | `real_test/benchmark/lab/monitor_all_hosts.sh`、`real_test/benchmark/lab/monitor_bottleneck.sh` | 可选监控脚本；前者监控 Proxy 和两台 Receiver，后者监控本机。 |
 
-配置模板：`real_test/config/hosts.lab.template.json` 用于生成主机列表；`real_test/config/experiment.lab.template.json` 是直接使用 `labctl.py` 的小规模示例，矩阵脚本实际读取 `benchmark/lab_configs/stress_1g.json` 和 `experiment.json`。
-
-## 正确性测试
-
-`scripts/all_smoke_test.sh` 汇总运行本机正确性用例；单项脚本分别检查修复、续传、故障恢复、Section 流程、TCP Backfill 等功能。运行方式：
-
-```bash
-bash scripts/all_smoke_test.sh
-```
+配置模板：`real_test/config/hosts.lab.template.json` 用于生成主机列表；`real_test/config/experiment.lab.template.json` 是直接使用 `labctl.py` 的小规模示例，矩阵脚本实际读取 `real_test/config/stress_1g.json` 和 `real_test/config/experiment.json`。
 
 实验日志保存在 `test-runs/lab/`。

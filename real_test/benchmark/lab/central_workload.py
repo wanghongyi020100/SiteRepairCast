@@ -117,8 +117,8 @@ def summarize_resources(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hosts", default=Path("benchmark/lab_configs/hosts.json"), type=Path)
-    parser.add_argument("--experiment", default=Path("benchmark/lab_configs/experiment.json"),
+    parser.add_argument("--hosts", default=Path("real_test/config/hosts.json"), type=Path)
+    parser.add_argument("--experiment", default=Path("real_test/config/experiment.json"),
                         type=Path)
     parser.add_argument("--run-id")
     parser.add_argument("--timeout", type=int, default=1800)
