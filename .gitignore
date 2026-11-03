@@ -68,6 +68,8 @@ site_code.txt
 # local/generated files
 /gen_file
 /benchmark/lab_configs/hosts.json
-/config/four-host/
+/benchmark/lab_configs/experiment.local.json
+/real_test/config/*.env
+!/real_test/config/*.env.example
 *.full
 /benchmark/lab_configs/hosts.json.example

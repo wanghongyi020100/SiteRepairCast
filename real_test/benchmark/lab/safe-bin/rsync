@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+exec /usr/bin/rsync \
+    --max-size=16m \
+    "$@"

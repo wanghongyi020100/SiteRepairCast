@@ -1,0 +1,22 @@
+{
+  "_comment": "Central 在本机运行 labctl。receiver_hosts 可按实际 Receiver 主机数量增加或删除条目。",
+  "proxy": {
+    "host": "user@PROXY_SSH_HOST",
+    "repo": "/home/user/share/site",
+    "interface_ip": "PROXY_LAN_IPV4"
+  },
+  "receiver_hosts": [
+    {
+      "_comment": "Receiver 主机 1；按需复制此对象添加其他主机。",
+      "host": "user@RECEIVER1_SSH_HOST",
+      "repo": "/home/user/share/site",
+      "interface_ip": "RECEIVER1_LAN_IPV4"
+    },
+    {
+      "_comment": "Receiver 主机 2",
+      "host": "user@RECEIVER2_SSH_HOST",
+      "repo": "/home/user/share/site",
+      "interface_ip": "RECEIVER2_LAN_IPV4"
+    }
+  ]
+}
