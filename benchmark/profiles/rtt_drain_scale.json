@@ -1,0 +1,24 @@
+{
+  "name": "rtt-drain-scale",
+  "description": "Fixed 200 ms versus application-RTT drain comparison on local loopback.",
+  "file_size_bytes": 262144,
+  "repetitions": 3,
+  "section_blocks": 64,
+  "udp_pace_us": 100,
+  "central_pace_us": 0,
+  "max_repair_rounds": 3,
+  "receiver_ready_timeout_seconds": 90,
+  "timeout_seconds": 300,
+  "scenarios": [
+    {"id": "fixed-clean-100", "kind": "transfer", "drain_mode": "fixed", "receivers": 100, "deterministic_initial_data_drop_percent": 0},
+    {"id": "rtt-clean-100", "kind": "transfer", "drain_mode": "rtt", "receivers": 100, "deterministic_initial_data_drop_percent": 0},
+    {"id": "fixed-clean-200", "kind": "transfer", "drain_mode": "fixed", "receivers": 200, "deterministic_initial_data_drop_percent": 0},
+    {"id": "rtt-clean-200", "kind": "transfer", "drain_mode": "rtt", "receivers": 200, "deterministic_initial_data_drop_percent": 0},
+    {"id": "fixed-clean-300", "kind": "transfer", "drain_mode": "fixed", "receivers": 300, "deterministic_initial_data_drop_percent": 0},
+    {"id": "rtt-clean-300", "kind": "transfer", "drain_mode": "rtt", "receivers": 300, "deterministic_initial_data_drop_percent": 0},
+    {"id": "fixed-clean-400", "kind": "transfer", "drain_mode": "fixed", "receivers": 400, "deterministic_initial_data_drop_percent": 0},
+    {"id": "rtt-clean-400", "kind": "transfer", "drain_mode": "rtt", "receivers": 400, "deterministic_initial_data_drop_percent": 0},
+    {"id": "fixed-clean-500", "kind": "transfer", "drain_mode": "fixed", "receivers": 500, "deterministic_initial_data_drop_percent": 0},
+    {"id": "rtt-clean-500", "kind": "transfer", "drain_mode": "rtt", "receivers": 500, "deterministic_initial_data_drop_percent": 0}
+  ]
+}

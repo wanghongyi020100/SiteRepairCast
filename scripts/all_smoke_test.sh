@@ -14,6 +14,8 @@ tests=(
     section_flow_smoke_test.sh
     central_resume_smoke_test.sh
     tcp_backfill_smoke_test.sh
+    peer_repair_barrier_smoke_test.sh
+    rtt_drain_smoke_test.sh
     fault_recovery_smoke_test.sh
 )
 

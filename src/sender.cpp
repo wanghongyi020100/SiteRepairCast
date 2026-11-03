@@ -1132,7 +1132,8 @@ void send_repair_round(int udp_fd,const sockaddr_in &multicast_destination,
     send_end_round(udp_fd,multicast_destination,receivers,transfer_id,section_id,round_id,total_blocks);
 }
 
-//接收端互传，多缺块组播->零散Peer->单播
+//本轮先由 Proxy 聚合同一 Block 的缺失情况，再依次尝试组播、Receiver 互传和 Proxy 单播。
+//Receiver 互传只执行 Proxy 下发的任务；任务下发成功不代表数据已到达，最终以目标 Receiver 的下一轮位图为准。
 void re_to_re(int udp_fd,const sockaddr_in &multicast_destination,std::vector<ReceiverConnection>&receivers,int input_fd,
               const std::string &file_path,std::uint64_t file_size,std::uint64_t transfer_id,std::uint32_t total_blocks,
               std::uint32_t section_id,std::uint32_t round_id,int pace_us,std::uint32_t section_block_limit)
@@ -1346,7 +1347,7 @@ void re_to_re(int udp_fd,const sockaddr_in &multicast_destination,std::vector<Re
     }
 
     //========================================================
-    //3.Proxy通过TCP下发PeerRepairTask
+    //3. Proxy 通过 TCP 下发 PeerRepairTask；失败或过小的任务留给下方单播兜底。
     //========================================================
     for(std::size_t source=0;
         source<receivers.size();

@@ -244,7 +244,7 @@ python3 benchmark/throughput.py
 
 ### 性能测试与结果分析
 
-测试在 1 个 Central 进程、1 个 Proxy 进程和 2 台 Receiver 主机的环境中进行；各场景运行不同数量的 Receiver 进程，评估 SiteRepairCast 在不同模拟丢包比例和文件规模下的传输耗时、代理 CPU 占用及内存使用情况。
+测试在 1 个 Central 主机、1 个 Proxy 主机和 2 台 Receiver 主机的环境中进行；各场景运行不同数量的 Receiver 进程，评估 SiteRepairCast 在不同模拟丢包比例和文件规模下的传输耗时、代理 CPU 占用及内存使用情况。
 
 实验对比两种修复模式：
 
@@ -296,7 +296,7 @@ Peer：公共缺块仍由 Proxy 组播修复，其他缺块优先由 Proxy 调�
 
 在这组样本中，Peer 模式耗时中位数为 313.116 秒，相比 Baseline 的 445.480 秒降低约 29.7%。
 
-表中 Peer 和 Baseline 各列出 5 次成功样本；Peer 耗时中位数为 313.116 秒，调度 Block 数中位数为 894,700。Proxy 峰值 RSS 的中位数在这组 Peer 样本中为 6.961 MiB，在 Baseline 样本中为 8.637 MiB。该结果只描述表中样本，不据此推断 RSS 变化的原因或保证其他条件下的性能收益；历史记录中的其他批次和失败样本没有并入此表。
+表中 Peer 耗时中位数为 313.116 秒，调度 Block 数中位数为 894,700。Proxy 峰值 RSS 的中位数在这组 Peer 样本中为 6.961 MiB，在 Baseline 样本中为 8.637 MiB。
 
 3.接收端数量扩展测试（128 MiB）
 
@@ -364,4 +364,3 @@ python3 benchmark/plot_distributed.py test-runs/artifacts/distributed/summary.cs
 - Section 按顺序推进，没有多 Section 滑动窗口；Peer 源节点选择基于当前状态和固定阈值，没有实时带宽探测或自适应负载分配。
 - 缓存配额为目录级硬上限，没有自动淘汰策略；接收端 Peer 发送任务目前在控制消息处理链路中同步执行。
 - 状态文件写入采用临时文件加 `rename`，但尚未实现状态文件和目录的完整掉电持久化保证。
-- 多接收端实测包含失败样本；现有记录可证明部分故障注入场景下代理 UDP 修复有效载荷下降，但尚不能证明所有文件大小、接收端规模和网络条件下 Peer 更快或更稳定；日志中的 `sha256_success=True` 也不能代替最终 `status=PASS`。

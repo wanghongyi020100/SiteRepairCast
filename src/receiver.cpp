@@ -1456,15 +1456,10 @@ int main(int argc,char**argv) try
                             continue;
                         }
 
-//数据先落盘，fsync后再改位图和state
+// Block 写入临时文件后先更新内存位图；整段收齐后再 fdatasync 并保存状态，避免重启跳过未持久化数据。
                         write_all_at(state.output.get(),data.payload,data.payload_size,data.offset);
                         state.received[data.block_id]=1;
                         state.received_count++;
-                        // if(::fsync(state.output.get())!=0)
-                        // {
-                        //     system_error("fsync received block");
-                        // }
-                        // save_receiver_state(state);
                         if(draining)arm_drain_timer(drain_timer_fd.get(),hard_deadline);
                         if(state.received_count%1000U==0U||state.received_count==state.meta.total_blocks)
                         {

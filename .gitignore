@@ -16,6 +16,7 @@ compile_commands.json
 *.d
 
 # generated binaries
+/central_sender
 site_proxy_sender
 receiver_agent
 sender
@@ -69,6 +70,4 @@ site_code.txt
 /benchmark/lab_configs/hosts.json
 /config/four-host/
 *.full
-/benchmark/lab_configs/hosts.json
 /benchmark/lab_configs/hosts.json.example
-*.full
