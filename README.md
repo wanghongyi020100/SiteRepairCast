@@ -1,148 +1,160 @@
 # SiteRepairCast
 
-SiteRepairCast 是一个面向多园区静态文件分发的 Linux 系统。对于每个待分发文件，中心只向每个园区代理发送一份副本，代理缓存已校验数据，再通过 UDP 组播分发给园区内的接收端。接收端发生局部丢包时，由代理使用本地缓存修复，不让同一批修复数据重新穿过跨园区链路。
+SiteRepairCast 是一个面向多园区静态文件分发的 Linux/C++17 系统。中心端通过 TCP 向每个园区代理传输一份文件，代理缓存并校验数据，再通过 UDP 组播向园区内多个接收端分发。接收端发生缺块时，代理汇总缺块位图并优先修复公共缺块；Peer 模式下，代理按当前接收状态和固定阈值安排接收端互传，不满足条件时回退到代理修复。传输性能和跨园区流量取决于文件、网络及丢包等实际条件，具体结果以对应测试记录为准。
 
-借鉴边缘缓存的思路，但采用中心主动推送、固定园区代理和固定接收端集合，重点解决多接收端分发、局部修复、慢节点隔离和异常恢复。
+系统采用固定园区代理和固定接收端集合，关注跨园区重复流量控制、Section 级背压、局部修复、慢节点隔离及异常退出恢复。Peer 修复由代理统一决策和下发任务。
 
 ## 架构
 
 ```text
-central_sender
-      |
-      | TCP，跨园区可靠传输
-      v
-site_proxy_sender
-      |
-      |-- UDP 组播或单播数据 --> receiver_agent 1..N
-      `-- TCP 控制与补传 -----> receiver_agent 1..N
+                           central_sender
+                                 |
+                                 | TCP：文件元数据、Section、checkpoint 续传
+                                 v
+                          site_proxy_sender
+                          (园区代理 / 缓存)
+                                 |
+               +-----------------+------------------+
+               |                                    |
+  UDP 组播：初始数据、公共缺块修复                TCP：注册、缺块位图、接收端互传任务、
+               |                             传输完毕确认、慢节点独立补传
+               v                                    v
+         receiver_agent a  <---------------->  receiver_agent b
+                      UDP 单播：代理调度的接收端互传
+
+代理自身也可经 UDP 组播、单播修复无法互传的零散缺块，并在修复轮次后通过 TCP 为隔离接收端补传。
 ```
 
-三个层次的职责：
+三类进程的职责：
 
-- `central_sender`：计算文件摘要和 Transfer ID，按 Section 向一个或多个代理发送文件，并根据代理 checkpoint 续传。
-- `site_proxy_sender`：接收并缓存中心数据，聚合接收端缺块位图，选择组播、单播或 TCP 补传。
-- `receiver_agent`：使用 `epoll` 同时处理 UDP、TCP 和定时器事件，按 Block 偏移写入临时文件，并以 Section 为提交粒度持久化数据与接收状态。
+- `central_sender`：计算文件哈希值和传输ID，按 Section 向一个或多个园区代理推送文件，并根据代理 checkpoint 续传；不同代理使用独立线程。
+- `site_proxy_sender`：接收并缓存中心数据，收集接收端缺块报告，在启用与不启用接收端互传两种修复模式间切换，负责接收端互传任务调度、代理 UDP 修复和隔离节点 TCP 补传。
+- `receiver_agent`：使用 `epoll` 处理组播 UDP、Peer UDP、TCP 控制和 `timerfd`；按 Block 偏移写临时文件，向代理报告接收状态，也可在收到接收端互传修复任务后向其他接收端发送自己已有的 Block。
 
-通道划分：
-
-| 链路 | 协议 | 内容 |
+| 链路 | 协议 | 作用 |
 | --- | --- | --- |
-| 中心到代理 | TCP | 元数据、Section 数据、checkpoint 和结果确认 |
-| 代理到接收端 | UDP 组播或单播 | 初始数据和修复数据 |
-| 代理与接收端 | TCP | 注册、状态、缺块位图、完成确认和 TCP 补传 |
+| 中心 → 代理 | TCP | 文件元数据、Section 数据、断点续传、结果确认 |
+| 代理 → 接收端 | UDP 组播 | 初始数据及多个接收端共有的缺块修复 |
+| 代理 → 接收端 | UDP 单播 | Baseline 修复，以及 Peer 模式下无法互传的缺块 |
+| 代理 ↔ 接收端 | TCP | 注册、状态上报、缺块位图、Peer 任务、完成确认及 TCP 补传 |
+| 接收端 → 接收端 | UDP 单播 | 代理下发任务后的 Peer 修复数据；使用接收端动态绑定的 UDP 端口 |
 
 ## 核心设计
 
-### Section 级背压
+### Section 级背压与代理缓存
 
-文件先按 1200 字节的 Block 划分，再按 Section 组织。中心发送完一个 Section 后等待代理确认；代理只有在数据校验、落盘、`fsync` 和 checkpoint 提交完成后才回复。中心不会一直领先于代理，异常恢复也只从已提交 Section 继续。
+文件按 **1200 字节有效载荷的 Block** 划分，再按 Section 组织。`central_sender` 与 `site_proxy_sender` 启动时默认每段 **64 Blocks**（可由环境变量或 `--section-blocks` 覆盖）。
 
-### 局部修复
+中心发送完一个 Section 后等待代理确认；代理校验并写入本地缓存，执行 `fsync`，对非最终 Section 保存 checkpoint，然后向中心确认。中心只重发尚未确认缓存的 Section；代理接收缓存的线程与向接收端分发的工作线程并行，队列按未完成任务字节数进行高/低水位控制（分别为一个最大 Section 字节数的约 **4 倍 / 2 倍**），避免接收和分发速率长期失衡。
 
-接收端在每轮结束后上报缺块位图。代理按同一 Block 的缺失接收端数量选择策略：
+每个文件具有独立的 Transfer ID、SHA-256、缓存临时文件和恢复状态；同一园区内多个文件按输入顺序处理，不同园区代理的中心传输可并行进行。中心对代理的 Section 确认表示**代理缓存已提交**，不是所有园区接收端都已经收齐。
 
-- 多个接收端缺少同一 Block：组播一次；
-- 只有一个接收端缺块：向该接收端 UDP 单播；
-- 某个接收端达到配置修复轮数后仍缺块：从主修复轮隔离，文件缓存完成后通过 TCP 补传。
+### Baseline 与 Peer 两种修复模式
 
-`SRCAST_BACKFILL_ROUNDS=N` 表示允许 N 轮 UDP 修复后再切换到 TCP 补传；未设置时跟随 `max_repair_rounds`，设为 `0` 则在初始上报缺块后立即切换。
+代理通过 `--repair-mode baseline|peer` 选择模式，**默认 `peer`**。`SRCAST_REPAIR_MODE` 环境变量也可指定模式，优先级为 **命令行 > 环境变量 > 默认值**。代理启动日志会输出实际 `repair_mode`。
 
-### 崩溃一致性
+接收端在初始分发和每轮修复结束后报告当前 Section 的缺块位图。代理按 Block 汇总缺失目标：
 
-代理和接收端都先写临时文件，再保存状态。关键顺序是：
+1. **公共缺块**：至少两个接收端缺少同一 Block 时，代理组播修复一次。这部分在两种模式下均由代理完成。
+2. **零散缺块（Baseline）**：只有一个接收端缺少该 Block 时，代理使用缓存进行 UDP 单播。
+3. **零散缺块（Peer）**：代理寻找当前持有该 Block 且符合状态条件的其他接收端，通过 TCP 下发 `PeerRepairTask`，由源接收端读取本地 Block 并向目标接收端发送 UDP 数据。
+4. **回退**：找不到合适源节点、任务规模过小或任务下发失败时，当前轮由代理 UDP 单播。Peer 数据发出后仍需依赖目标接收端下一轮缺块位图确认是否补齐，并不是“下发任务即修复成功”。
+5. **TCP 补传**：达到配置轮数后仍未完成的接收端可从主修复组隔离，由代理在缓存可用后执行 TCP 补传。
+
+当前 Peer 调度策略具有明确限制：同一源接收端每轮最多承担 **2 个目标**；源到目标累计不足 **16 个 Block** 时回退代理单播；一条 `PeerRepairTask` 最多携带 **64 个 Block**。这些是当前实现中的调度阈值，不代表动态负载均衡或带宽最优调度。
+
+`SRCAST_BACKFILL_ROUNDS=N` 控制允许多少轮 UDP 修复后切换 TCP 补传；未设置时跟随 `--max-repair-rounds`，设为 `0` 表示初次缺块上报后即可切换。
+
+### 接收端数据写入和恢复状态
+
+UDP 数据（包括初始组播及接收端互传）通过 CRC、Transfer ID、Section、Block、偏移和长度校验后，按 Block 偏移写入 `.part-<transfer_id>` 临时文件。收到 Block 时先执行写入，再更新**内存中的** `received[]` 和 `received_count`；这一步**不会对每个 Block 执行 `fsync`**。
+
+当前普通 UDP/Peer 数据路径的 Section 完成顺序为：
 
 ```text
-pwrite -> fsync 数据 -> 写临时状态 -> rename 状态 -> 对外确认
+Block 到达：校验 -> pwrite -> 更新内存接收位图
+Section 收齐：fdatasync(临时文件) -> 保存 .state.tmp 并 rename 为 .state
+             -> 向代理报告 Section Complete
+最终文件收齐：fsync(临时文件) -> SHA-256 -> rename 为正式文件
 ```
 
-整文件 SHA-256 校验通过后才把 `.part` 原子改名为正式文件。进程在中间被杀死时，正式文件保持不变，重启后从持久化状态继续。
+TCP Backfill 路径不同：收到待补传 Block 后，会对临时文件执行 `fsync` 并保存接收状态。临时状态文件采用 `flush`、关闭文件及 `rename`，**没有显式对状态文件及父目录执行 `fsync`**；所以本项目的恢复能力主要面向进程异常退出（例如 `kill -9`），不承诺断电后的每次状态提交都永久保留。重启时检查 Transfer ID、文件大小、摘要、Section 参数及位图计数后恢复；整个文件须通过 SHA-256 校验才会改名为正式文件。
 
-### 事件饥饿防护
+### 事件循环与故障隔离
 
-接收端的一个 `epoll` 循环同时管理 UDP 套接字、TCP 控制连接和 `timerfd`。每次 UDP 就绪只处理最多 256 个包，并限制在 2 ms 内，避免持续到达的数据包长期占用事件循环，使控制消息和定时器得不到处理。
+接收端的 `epoll` 循环管理组播 UDP、Peer UDP、TCP 控制连接及 `timerfd`。组播和 Peer UDP 的接收处理每次最多处理 **256 包 / 2 ms**，避免持续 UDP 输入长期独占事件循环；`SECTION_END` 后等待约 **200 ms** 的 UDP 安静期，最长等待 **1 s** 再生成本轮缺块报告。当前 Peer 发送任务在接收端控制消息处理过程中**同步执行**，未单独实现 Peer 专用发送线程池。
 
-### 故障隔离
-
-中心为每个园区代理创建独立线程，一个代理断线不会阻塞其他代理。代理使用最多 4 个工作线程并发处理被隔离接收端的 TCP 补传，慢节点不会无限拖住主组。
+中心为不同园区代理使用独立线程；代理最多使用 **4 个工作线程**并发处理被隔离接收端的 TCP 补传。缓存有目录级容量上限，但不实现自动淘汰策略。
 
 ## 目录结构
 
 ```text
 .
-|-- CMakeLists.txt
-|-- include/                    协议、I/O、校验、存储和线程池
-|-- src/
-|   |-- central_sender.cpp      中心发送端
-|   |-- sender.cpp              园区代理
-|   |-- receiver.cpp            接收端
-|   `-- checksum.cpp            摘要实现
-`-- scripts/                    冒烟、故障注入和 benchmark
+├── CMakeLists.txt
+├── include/                  协议、控制帧 I/O、文件 I/O、存储辅助和线程池
+├── src/
+│   ├── central_sender.cpp    中心发送端
+│   ├── sender.cpp            园区代理（含 Peer 调度逻辑）
+│   ├── receiver.cpp          接收端（含 Peer UDP 数据发送/接收）
+│   └── checksum.cpp          摘要实现
+├── scripts/                  启动脚本及冒烟、故障注入测试
+├── benchmark/                单机吞吐与多主机 Baseline/Peer 对照工具
+└── docs/                     四台物理主机测试说明
 ```
 
 ## 环境与构建
 
-项目依赖 Linux、CMake 3.16、C++17、OpenSSL Crypto、POSIX Threads 和 IPv4 multicast。Ubuntu 或 Debian 可安装：
+依赖 Linux、CMake ≥ 3.16、C++17、OpenSSL Crypto、POSIX Threads 和 IPv4 multicast。Ubuntu/Debian 可安装：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake libssl-dev python3
 ```
 
+**常规运行及四机脚本统一使用 `build/`**，与 `scripts/run_*.sh` 的默认路径一致：
 
-吞吐测试前建议提高 Linux UDP 接收缓冲区上限：
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 4
+```
+
+生成 `build/central_sender`、`build/site_proxy_sender` 和 `build/receiver_agent`。需要 Debug 时可以另建 `build-debug/`；使用启动脚本时相应添加 `--build-dir ./build-debug`。
+
+进行吞吐测试前，可根据网卡和系统配置调整 UDP 接收缓冲上限（此命令立即修改当前内核参数）：
 
 ```bash
 sudo sysctl -w net.core.rmem_max=33554432
 ```
 
-构建：
+## 四台物理主机快速启动
+
+四台机器须使用同一版本源码，且 Proxy 与 Receiver 所在局域网络需要支持组播。示例：A=Central `192.168.1.10`、B=Proxy `192.168.1.20`、C/D=Receiver `192.168.1.31` / `192.168.1.32`。在四台机器分别完成上面的 Release 构建后，按 **B → C → D → A** 启动：
 
 ```bash
-cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-debug -j 4
-```
+# Machine B：Proxy
+./scripts/run_proxy.sh --interface-ip 192.168.1.20 --receivers 2 --repair-mode peer
 
-生成三个程序：
-
-```text
-build-debug/central_sender
-build-debug/site_proxy_sender
-build-debug/receiver_agent
-```
-
-## Quick Start: Four Physical Hosts
-
-四台主机需要位于支持组播的同一 LAN/VLAN。示例地址：Machine A Central `192.168.1.10`、Machine B Proxy `192.168.1.20`、Machine C/D Receiver `192.168.1.31`/`192.168.1.32`。按 B、C、D、A 的顺序启动：
-
-```bash
-# Machine B: Proxy
-./scripts/run_proxy.sh --interface-ip 192.168.1.20 --receivers 2
-
-# Machine C: Receiver 1
+# Machine C：Receiver 1
 ./scripts/run_receiver.sh --interface-ip 192.168.1.31 \
   --proxy-ip 192.168.1.20 --output-dir ./received
 
-# Machine D: Receiver 2
+# Machine D：Receiver 2
 ./scripts/run_receiver.sh --interface-ip 192.168.1.32 \
   --proxy-ip 192.168.1.20 --output-dir ./received
 
-# Machine A: Central（最后启动）
+# Machine A：Central（最后启动，需提前准备 input.bin）
 ./scripts/run_central.sh --proxy-ip 192.168.1.20 --file ./input.bin
 ```
 
-真实主机必须填写各自 LAN IPv4，不能使用本机 smoke test 的 `127.0.0.x`。也可在本机自建 `.env` 配置并用脚本的 `--config` 参数加载，但不要提交测试配置。端口、防火墙、连通性检查和 SHA-256 验证见 [四台物理主机测试指南](docs/FOUR_HOST_TEST.md)。
+真实机器需填写各自 IPv4。Receiver 会自动绑定动态 Peer UDP 端口，代理通过接收端 TCP 来源 IP 和注册的 Peer 端口识别进程；**同一主机可以运行多个 Receiver**。Peer 模式需要确保接收端之间的动态 UDP 端口可达。完整端口、防火墙及 SHA-256 检查见 [四台物理主机测试指南](docs/FOUR_HOST_TEST.md)。
 
-## 运行顺序
-
-中心模式按代理、接收端、中心的顺序启动。
-
-中心支持一次传入多个文件。同一个园区内按命令行顺序串行处理文件；多个园区代理之间由中心使用独立线程并行传输。每个文件都有独立的 Transfer ID、SHA-256、临时文件和 checkpoint。
+## 本机运行示例
 
 ### 1. 启动园区代理
 
 ```bash
 mkdir -p proxy-cache received-1 received-2
-./build-debug/site_proxy_sender \
+./build/site_proxy_sender \
   --multicast-ip 239.255.42.99 --udp-port 5000 \
   --interface-ip 127.0.0.1 --control-port 6000 \
   --receiver-count 2 --pace-us 200 --gap-ms 0 \
@@ -150,71 +162,60 @@ mkdir -p proxy-cache received-1 received-2
   --repair-mode peer --central-listen 7000 --cache-dir proxy-cache
 ```
 
-`--central-listen 7000` 是一个开关加端口，表示代理进入中心模式并在 TCP `7000` 端口等待中心连接。不写会退回普通发送模式：代理拿本地文件直接往接收端发。
+`--central-listen 7000` 表示代理进入中心模式，在 TCP `7000` 端口等待中心连接。不加这个参数时，代理可按普通发送模式从本地文件向接收端分发。
 
-代理默认使用 Peer-assisted Repair。可用 `--repair-mode baseline` 切换到 Proxy Repair baseline；未传 CLI 时仍兼容 `SRCAST_REPAIR_MODE=baseline|peer`，优先级是 CLI、环境变量、默认值。
-代理启动日志会打印 `repair_mode=baseline` 或 `repair_mode=peer`。
-
-### 2. 启动接收端
+### 2. 启动两个接收端
 
 ```bash
-./build-debug/receiver_agent --multicast-ip 239.255.42.99 --udp-port 5000 \
+./build/receiver_agent --multicast-ip 239.255.42.99 --udp-port 5000 \
   --interface-ip 127.0.0.2 --proxy-ip 127.0.0.1 \
   --control-port 6000 --output-dir received-1
-./build-debug/receiver_agent --multicast-ip 239.255.42.99 --udp-port 5000 \
+
+./build/receiver_agent --multicast-ip 239.255.42.99 --udp-port 5000 \
   --interface-ip 127.0.0.3 --proxy-ip 127.0.0.1 \
   --control-port 6000 --output-dir received-2
 ```
-
-同一台 Receiver Host 上的所有进程使用相同组播端口；每个进程还会在指定网卡地址上
-自动绑定一个随机 Peer UDP 端口。代理以 TCP 来源 IP 和该 `peer_udp_port` 组成唯一身份，
-所以同机多个 Receiver 可以使用同一个真实网卡 IP，不需要伪造不同的 loopback 地址。
 
 ### 3. 启动中心
 
 ```bash
 dd if=/dev/urandom of=input.bin bs=1024 count=256 status=none
-./build-debug/central_sender --proxy 127.0.0.1 7000 \
+./build/central_sender --proxy 127.0.0.1 7000 \
   --pace-us 0 --section-blocks 4096 --file input.bin
 ```
 
-这里 `7000` 要和代理启动时的 `--central-listen 7000` 对上。`--file` 和 `--proxy` 都可重复。
-
-多园区时重复使用 `--proxy`：
+`--file` 和 `--proxy` 都允许重复。多园区时可使用：
 
 ```bash
-./build-debug/central_sender --pace-us 0 --section-blocks 4096 \
+./build/central_sender --pace-us 0 --section-blocks 4096 \
   --proxy 127.0.0.1 7000 --proxy 127.0.0.1 7001 --file input.bin
 ```
 
-`--pace-us 0` 表示中心向代理发送数据时不额外 sleep 限速；每个 `--proxy <ip> <port>` 表示一个园区代理。多个代理会并行接收中心数据，每个园区内部仍由自己的代理负责组播、修复和缓存。
+每个 `--proxy <ip> <port>` 代表一个园区代理。每个代理独立进行组播、修复和本地缓存。
 
-## 完整传输流程
+## 一次文件传输的主要流程
 
-1. 先启动代理再启动接收端连接代理并发送 `REGISTER`，代理按 `ip:port` 标识确认接收端数量。
-2. 启动中心连接代理，计算文件大小、Block 数量、SHA-256 和 Transfer ID。
-3. 中心发送 `CENTRAL_FILE_META`。
-4. 代理检查正式缓存、`.part` 和 checkpoint，返回 `CENTRAL_RESUME`。
-5. 代理向接收端发送 `FILE_META`；接收端建立或恢复临时文件和接收状态，回复 `META_READY`。
-6. 中心从恢复位置开始发送 `CENTRAL_DATA`，完成一个 Section 后发送 `CENTRAL_FILE_END`。
-7. 代理检查传输 ID、Section、Block、偏移、长度和 CRC，写入缓存临时文件。
-8. 代理确认 Section 完整后落盘并更新 checkpoint，再把该 Section 分发到园区内。
-9. 接收端按 Block 偏移写入文件；重复 Block 幂等忽略，损坏或越界数据拒绝。
-10. 接收端收到结束通知后等待 UDP 安静期，再通过 TCP 上报完整状态或缺块位图。
-11. 代理聚合位图并进行有限轮组播或单播修复，达到配置修复轮数后仍缺块的接收端转入 TCP 补传。
-12. 接收端收齐全部 Block 后执行 SHA-256 校验，原子提交最终文件并发送完成消息。
-13. 代理在整文件缓存完成后处理隔离接收端，并向中心返回最终缓存状态。
-14. 中心完成当前文件；传入多个文件时，继续处理下一个文件；多代理模式下，各代理会话独立结束。
+1. 代理监听控制端口，接收端注册，提供自己的 Peer UDP 端口；代理等待预期数量的接收端。
+2. 中心计算文件 SHA-256、大小、Block 数、Transfer ID，发送 `CENTRAL_FILE_META`。
+3. 代理检查本地缓存、`.part` 与 checkpoint，回应 `CENTRAL_RESUME`。
+4. 代理向接收端下发 `FILE_META`，接收端创建/恢复临时文件并回复 `META_READY`。
+5. 中心分 Section 发送 `CENTRAL_DATA` / `CENTRAL_FILE_END`；代理检验并提交缓存 Section，确认后推进下一 Section。
+6. 代理将该 Section 数据组播到接收端；接收端校验并写入临时文件。
+7. 结束通知后接收端等待 UDP 安静期，报告 Section 完成或缺块位图。
+8. 代理聚合缺块：公共缺块组播；在 `peer` 模式下调度接收端互传零散缺块，不满足条件时代理单播；在 `baseline` 模式下零散缺块直接由代理单播。
+9. 下一轮根据目标接收端的新位图判断缺块是否已修复。达到配置轮次的慢接收端进入后续 TCP 补传。
+10. 每个 Section 接收完整后同步数据和状态；整文件完成后执行 SHA-256 校验、正式文件改名和完成确认。
+11. 代理处理隔离接收端的补传，向中心报告结果；多文件模式继续下一个文件。
 
-## 测试
+## 测试与结果
 
-运行全部冒烟、故障注入、多代理测试和 benchmark：
+### 自动化测试入口
 
 ```bash
 bash scripts/all_smoke_test.sh
 ```
 
-可以通过 CMake 目标执行：
+也可使用 CMake 目标：
 
 ```bash
 cmake -S . -B test-runs/builds/cmake-test -DCMAKE_BUILD_TYPE=Debug
@@ -222,22 +223,11 @@ cmake --build test-runs/builds/cmake-test --target test
 cmake --build test-runs/builds/cmake-test --target cleantest
 ```
 
-所有测试构建、临时文件和结果统一放在 `test-runs/`。`cleantest` 会删除其中的
-smoke 构建、临时目录和 benchmark smoke 结果，再运行完整测试。测试覆盖：
+当前 `all_smoke_test.sh` 调用的用例包括命令行/角色、局部修复、中心缓存、文件名、Section 流程、中心续传、TCP 补传、故障恢复、benchmark smoke 和多代理场景。
 
-- 初始丢包与缺块位图；
-- 组播修复、UDP 单播修复和 TCP 补传；
-- Section 背压和可配置 Section 大小；
-- 中心断线续传、代理 `kill -9` 恢复和接收端状态恢复；
-- 乱序、重复、CRC 损坏和非法控制帧；
-- 一个中心并发连接两个园区代理；
-- 正常、混合丢包和慢接收端三类 benchmark 场景。
+###单机吞吐测试
 
-### 性能测试
-
-性能测试使用 Release 构建，在 2 核、4 GiB Linux 单机回环环境下进行。
-测试文件大小为 256 MiB，Section 大小为 4096 Blocks，UDP 和中心发送均不额外 sleep 限速。
-1 / 2 / 4 / 8 Receiver 各运行 5 轮，结果取端到端吞吐中位数。
+在 **2 核、4 GiB Linux 单机回环环境** 使用 Release 构建，测试 **256 MiB** 文件、4096 Blocks/Section、默认不额外 sleep 限速。每组 5 轮、结果取端到端吞吐中位数：
 
 | Receiver 数量 | 端到端吞吐中位数 |
 | ---: | ---: |
@@ -246,42 +236,132 @@ smoke 构建、临时目录和 benchmark smoke 结果，再运行完整测试。
 | 4 | 13.283 MiB/s |
 | 8 | 10.791 MiB/s |
 
-20 轮测试全部完成并通过 SHA-256 校验。Receiver 从 1 扩展至 8 时，
-端到端吞吐保持单 Receiver 的 70.6%。
-
-性能排查过程中使用 `top` 和 `nstat` 定位到 UDP 突发发送导致 Receiver
-Socket 接收队列溢出；调整 `SO_RCVBUF` 和系统 `net.core.rmem_max` 后，
-测试期间 `UdpRcvbufErrors` 不再增长，8 Receiver 吞吐由约
-0.49 MiB/s 提升至 10.79 MiB/s。
-
-运行：
+历史记录显示这 20 轮通过 SHA-256 校验。调整 UDP 接受队列大小后，测试期间 `UdpRcvbufErrors` 不再增长；8 Receiver 吞吐由约 0.49 MiB/s 提升至 10.79 MiB/s。。
 
 ```bash
 python3 benchmark/throughput.py
 ```
 
-四机 Baseline/Peer 校准前，先在各机器的仓库中构建，再在 Central 机器运行控制器：
+### 性能测试与结果分析
+
+测试在 1 个 Central 进程、1 个 Proxy 进程和 2 台 Receiver 主机的环境中进行；各场景运行不同数量的 Receiver 进程，评估 SiteRepairCast 在不同模拟丢包比例和文件规模下的传输耗时、代理 CPU 占用及内存使用情况。
+
+实验对比两种修复模式：
+
+Baseline：缺块由 Proxy 通过 UDP 组播或单播修复。
+
+Peer：公共缺块仍由 Proxy 组播修复，其他缺块优先由 Proxy 调度接收端之间进行 UDP 互传，不满足互传条件时回退至 Proxy UDP 单播。
+
+以下耗时、CPU 和 RSS 数据均为成功运行样本的中位数。CPU 表示 Proxy 进程平均 CPU 占用率，RSS 表示 Proxy 进程峰值常驻内存。表中的模拟丢包率为代码控制丢包的几率。
+
+1.不同丢包比例下的性能对比（128 MiB）
+
+使用 128 MiB 文件和 100 个 Receiver 进程，设置 0%～1% 的初始 Block 丢弃比例，比较两种修复模式的传输表现。
+
+| 模拟丢包率 | Baseline 次数 | Baseline 耗时 | Baseline CPU | Baseline RSS | Peer 次数 | Peer 耗时 | Peer CPU | Peer RSS | Peer 调度 Block |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.0% | 11 | 28.503 s | 6.76% | 5.609 MiB | 6 | 29.302 s | 6.66% | 5.543 MiB | 0 |
+| 0.1% | 5 | 37.090 s | 5.11% | 5.664 MiB | 5 | 37.015 s | 5.17% | 5.918 MiB | 0 |
+| 0.3% | 5 | 40.952 s | 5.08% | 5.617 MiB | 5 | 40.477 s | 5.22% | 5.926 MiB | 0 |
+| 0.5% | 5 | 43.870 s | 5.08% | 5.793 MiB | 5 | 36.397 s | 5.30% | 5.973 MiB | 55,272 |
+| 1.0% | 5 | 53.049 s | 4.94% | 5.793 MiB | 6 | 35.463 s | 5.29% | 6.043 MiB | 110,544 |
+
+从测试结果可以看出，丢包比例较低时，两种模式的传输耗时基本接近。0.1% 和 0.3% 场景下，Peer 调度 Block 数为 0，修复主要由 Proxy 组播完成。
+
+当模拟丢包比例增加到 0.5% 时，Peer 模式的耗时中位数从 Baseline 的 43.870 秒降至 36.397 秒，降低约 17.0%。在 1.0% 场景下，耗时从 53.049 秒降至 35.463 秒，降低约 33.2%。
+
+与此同时，Peer 模式下代理 CPU 占用及峰值 RSS 与 Baseline 整体接近，未出现明显的代理内存开销增长。
+
+当缺块足以形成较大的互传任务时，接收端辅助修复能够减少代理直接参与修复的数据量，并缩短成功运行的传输耗时；在低丢包比例下，两种模式表现接近。
+
+2.大文件传输性能对比（1 GiB）
+
+将文件规模增加至 1 GiB，保持 100 个 Receiver 进程，并使用 1.0% 初始 Block 丢弃比例，进一步观察大文件场景下两种修复模式的性能。
+
+
+2.1 运行详细数据
+
+| 模式 | 耗时 (s) | 代理 CPU | 代理峰值 RSS (MiB) | Peer 调度 Block |
+|---|---:|---:|---:|---:|
+| Baseline | 445.098 | 4.92% | 7.793 | 0 |
+| Baseline | 444.694 | 4.98% | 8.637 | 0 |
+| Baseline | 446.083 | 5.03% | 6.645 | 0 |
+| Baseline | 445.480 | 4.90% | 8.672 | 0 |
+| Baseline | 445.855 | 4.98% | 8.672 | 0 |
+| Peer | 316.717 | 5.33% | 6.961 | 894,676 |
+| Peer | 312.236 | 5.51% | 6.941 | 894,700 |
+| Peer | 313.116 | 5.81% | 6.957 | 894,700 |
+| Peer | 314.399 | 5.62% | 8.664 | 894,700 |
+| Peer | 311.622 | 5.44% | 8.617 | 894,399 |
+
+在这组样本中，Peer 模式耗时中位数为 313.116 秒，相比 Baseline 的 445.480 秒降低约 29.7%。
+
+表中 Peer 和 Baseline 各列出 5 次成功样本；Peer 耗时中位数为 313.116 秒，调度 Block 数中位数为 894,700。Proxy 峰值 RSS 的中位数在这组 Peer 样本中为 6.961 MiB，在 Baseline 样本中为 8.637 MiB。该结果只描述表中样本，不据此推断 RSS 变化的原因或保证其他条件下的性能收益；历史记录中的其他批次和失败样本没有并入此表。
+
+3.接收端数量扩展测试（128 MiB）
+
+使用 128 MiB 文件，在不丢失的情况下，将 Receiver 进程数量从 100 增至 500，观察代理向更多接收端分发文件时的性能变化。
+
+该组实验采用 Baseline 模式，主要评估接收端规模增加对传输耗时、代理 CPU 和峰值 RSS 的影响。
+
+| Receiver 数量 | 模式 | 次数 | 耗时中位数 | 代理 CPU 中位数 | 代理峰值 RSS 中位数 |
+|---:|---|---:|---:|---:|---:|
+| 100 | Baseline | 11 | 28.503 s | 6.76% | 5.609 MiB |
+| 200 | Baseline | 6 | 34.039 s | 7.20% | 5.686 MiB |
+| 300 | Baseline | 6 | 47.543 s | 5.87% | 5.734 MiB |
+| 400 | Baseline | 6 | 65.275 s | 7.75% | 6.152 MiB |
+| 500 | Baseline | 6 | 83.568 s | 7.83% | 6.236 MiB |
+
+随着 Receiver 数量从 100 增加至 500，运行耗时中位数由 28.503 秒增至 83.568 秒，约为原来的 2.93 倍。
+
+代理峰值 RSS 中位数从 5.609 MiB 增加至 6.236 MiB，增幅约 11.2%。CPU 占用率存在一定波动，但没有随着 Receiver 数量增加而相同比例线性增长。
+
+4. 实验结论
+
+综合测试结果，接收端辅助修复的主要收益体现在存在一定缺块量时减少 Proxy 直接承担的 UDP 修复任务，将修复下放到接收端，通过先组播再接收端互传的方式避免接收端均衡大量增加。
+
+### 分布式校准工具
+
+`benchmark/distributed_compare.py` 使用 Central 机器上的控制器，通过 SSH 启动 Proxy 与两个 Receiver Host 上的多个进程，输出 `raw.csv`、`summary.csv` 和日志。正式对照前，四台主机应使用相同版本构建，并将配置里的 `host`、`repo`、`interface_ip`、`ssh_options` 等替换为实际环境。
 
 ```bash
-cmake -S . -B test-runs/builds/distributed -DCMAKE_BUILD_TYPE=Release
-cmake --build test-runs/builds/distributed -j 4
+# 四台机器分别执行
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 4
+
+# 在 Central 机器创建私有配置副本（配置文件中的主机信息需自行检查和编辑）
+mkdir -p test-runs
+cp benchmark/distributed_config.json test-runs/distributed_config.local.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+p = Path('test-runs/distributed_config.local.json')
+cfg = json.loads(p.read_text(encoding='utf-8'))
+cfg['build_dir'] = 'build'
+cfg['drop_blocks_per_receiver'] = 128
+p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+PY
+
+# 检查/编辑 test-runs/distributed_config.local.json 中的主机和 SSH 配置后，在 Central 运行
 python3 benchmark/distributed_compare.py \
-  --config benchmark/distributed_config.json \
+  --config test-runs/distributed_config.local.json \
   --receivers 20 --modes baseline peer --repetitions 1 \
   --file-size 134217728
 python3 benchmark/plot_distributed.py test-runs/artifacts/distributed/summary.csv
 ```
 
-先把配置文件中的 SSH Host 和真实 LAN IP 替换为实际值。控制器应在 Central 机器运行；
-默认命令只允许 20 Receiver、128 MiB、单轮校准。每轮会验证所有 Receiver 的 SHA-256，
-保存 `raw.csv`、`summary.csv` 和日志，然后删除四台机器上的源文件、cache、Receiver 输出及
-`.part/.state`。大于这个范围的测试必须显式传 `--allow-large-run`。
+绘图脚本需要额外安装 Python 的 `matplotlib`；只运行 `distributed_compare.py` 不依赖该绘图库。
+
+**配置注意事项：** 当前仓库中 `benchmark/distributed_config.json` 的 `build_dir` 是 `build`，因此构建目录需要一致。其 `drop_blocks_per_receiver=1024` **不适合** `--receivers 20`、`section_blocks=4096` 的默认校准：`distributed_compare.py` 要求 `receiver_count × drop_blocks_per_receiver <= section_blocks - 17`，即 `20×1024 > 4079` 不成立；上面私有副本改为 `128` 后才满足这个约束。此改动只用于使该默认校准场景符合脚本输入条件，**不是对上传的 136 条实验记录进行重新测试**。
+
+大于 **20 Receiver / 128 MiB / 1 轮** 的任务，需要在确认实验资源后显式传 `--allow-large-run`。控制器会清理它自己生成的运行目录；不要把 `work_root` 指向含个人数据的路径。真实部署参数和实验环境信息不要直接提交到公共仓库。
 
 ## 当前边界
 
-- 仅支持 Linux 和可信实验网络；控制面没有 TLS、认证和授权。
-- 每个代理对应一个园区和启动时固定的接收端集合。
-- Section 顺序推进，尚未实现多 Section 滑动窗口。
-- 缓存配额是目录级硬上限，没有淘汰策略。
-- 没有 FEC、QUIC、P2P、动态成员、目录同步和 Web 管理界面。
-- benchmark 为单机回环结果，真实部署仍需独立主机和网络故障注入验证。
+- 仅支持 Linux、IPv4 和可信实验网络；控制面没有 TLS、用户认证与授权。
+- 每个代理负责一个园区及启动时固定的接收端集合；没有动态发现、成员自动增减或全局多代理协同调度。
+- 已实现 **代理集中调度的接收端互传**；未实现去中心化 P2P、跨园区 Peer 传输、FEC、QUIC、目录同步或 Web 管理界面。
+- Section 按顺序推进，没有多 Section 滑动窗口；Peer 源节点选择基于当前状态和固定阈值，没有实时带宽探测或自适应负载分配。
+- 缓存配额为目录级硬上限，没有自动淘汰策略；接收端 Peer 发送任务目前在控制消息处理链路中同步执行。
+- 状态文件写入采用临时文件加 `rename`，但尚未实现状态文件和目录的完整掉电持久化保证。
+- 多接收端实测包含失败样本；现有记录可证明部分故障注入场景下代理 UDP 修复有效载荷下降，但尚不能证明所有文件大小、接收端规模和网络条件下 Peer 更快或更稳定；日志中的 `sha256_success=True` 也不能代替最终 `status=PASS`。
